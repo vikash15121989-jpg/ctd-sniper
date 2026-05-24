@@ -11,7 +11,7 @@ print("=== CTD SNIPER: SPRING + DRY UP SCANNER START ===")
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
-sh = gc.open("creek_scanner")
+sh = gc.open("CTD_Sniper")
 
 ws_watchlist = sh.worksheet("Watchlist")
 date_str = str(ws_watchlist.acell('A1').value).split(' ')[0]
