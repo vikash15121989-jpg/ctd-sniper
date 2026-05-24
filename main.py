@@ -26,60 +26,61 @@ for i, stock in enumerate(stocks):
     try:
         df = yf.download(f"{stock}.NS", start="2023-01-01", end=end_date, interval="1d", progress=False, auto_adjust=True)
 
-        # FIX: yfinance MultiIndex columns hatao
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
 
-        if len(df) < 200: continue
+        if len(df) < 60: continue
 
         df['Vol_50'] = df['Volume'].rolling(50).mean()
-        df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
         df['Body'] = abs(df['Close'] - df['Open'])
         df['Range'] = df['High'] - df['Low']
         df['Range'] = df['Range'].replace(0, 0.01)
         df['BodyRatio'] = df['Body'] / df['Range']
         df['IsGreen'] = df['Close'] > df['Open']
 
-        df_sig = df.iloc[-60:].copy()
+        # FIX 1: BO candle hata ke creek nikalo - No lookahead bug
+        df_past = df.iloc[:-1] # Last candle = BO candle, use hatao
+        if len(df_past) < 60: continue
+        df_sig = df_past.iloc[-60:].copy() # Pichle 60 din ka range
 
-        # CTD Logic
-        base_condition = df_sig.iloc[-1]['Close'] > df_sig.iloc[-1]['EMA200']
-        vol_condition = df_sig.iloc[-1]['Volume'] < df_sig.iloc[-1]['Vol_50'] * 0.5
-
-        creek_high = df_sig['High'].max()
-        last_close = df_sig.iloc[-1]['Close']
+        creek_high = df_sig['High'].max() # Ab ye BO candle se pehle ka max hai
         spring_low = df_sig['Low'].min()
 
+        # BO Candle = Backtest date wali candle
+        bo_candle = df.iloc[-1]
+        last_close = bo_candle['Close']
+        last_vol = bo_candle['Volume']
+        last_vol_50 = bo_candle['Vol_50']
+
+        # Spring Candle Logic
         spring_candle = df_sig.loc[df_sig['Low'] == spring_low].iloc[-1]
-        is_spring = spring_candle['IsGreen'] and spring_candle['BodyRatio'] < 0.3
+        is_spring = spring_candle['IsGreen'] # Bas green close chahiye, body ratio hata diya
 
-        dryup_condition = False
-        if is_spring:
-            spring_idx = df_sig.index.get_loc(spring_candle.name)
-            if spring_idx < len(df_sig) - 2:
-                test_candles = df_sig.iloc[spring_idx+1:]
-                dryup_condition = (test_candles['Volume'] < test_candles['Vol_50']).all()
+        # FIX 2: Volume Dry Logic Dheela kiya - 90% tak allow
+        vol_condition = last_vol < last_vol_50 * 0.9
 
-        breakout = last_close > creek_high * 1.01
+        # FIX 3: EMA200 Hata Diya - CTD me zarurat nahi
 
-        if base_condition and vol_condition and is_spring and dryup_condition and breakout:
+        # FIX 4: BO Logic - 0.5% bhi chalega, 1% zaruri nahi
+        breakout = last_close > creek_high * 1.005
+
+        # FIX 5: Dryup condition hata di - Real CTD me zaruri nahi
+        if is_spring and vol_condition and breakout:
             signals.append({
                 'Stock': stock,
                 'Status': 'READY',
                 'SpringLow': round(spring_low, 2),
                 'CreekHigh': round(creek_high, 2),
                 'Close': round(last_close, 2),
-                'Volume': int(df_sig.iloc[-1]['Volume']),
-                'Vol_50': int(df_sig.iloc[-1]['Vol_50'])
+                'Volume': int(last_vol),
+                'Vol_50': int(last_vol_50)
             })
             print(f"[PASS] ✅ {stock}: READY")
         else:
             reason = []
-            if not base_condition: reason.append("EMA200 ke neeche")
+            if not is_spring: reason.append("Spring green nahi")
             if not vol_condition: reason.append("Volume dry nahi")
-            if not is_spring: reason.append("Spring nahi bana")
-            if not dryup_condition: reason.append("Test me volume aaya")
-            if not breakout: reason.append(f"BO nahi: {last_close} < {round(creek_high*1.01,2)}")
+            if not breakout: reason.append(f"BO nahi: {last_close:.2f} < {round(creek_high*1.005,2)}")
             print(f"[FAIL] ❌ {stock}: {', '.join(reason)}")
 
     except Exception as e:
