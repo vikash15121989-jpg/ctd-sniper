@@ -1,7 +1,7 @@
 name: EOD CTD Scan From Sheet
 on:
   schedule:
-    - cron: '15 10 * * 1-5' # Roz 4:00 PM IST, Mon-Fri
+    - cron: '30 13 * * 1-5' # Roz 7:00 PM IST, Mon-Fri
   workflow_dispatch: # Manual chalane ke liye
 
 jobs:
@@ -10,7 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
+        with:
+          python-version: '3.11'
       - run: pip install yfinance pandas lxml
       - name: Run Scan From Your Sheet
         run: |
@@ -18,7 +19,7 @@ jobs:
           import yfinance as yf, pandas as pd
           from datetime import datetime
 
-          # TERA SHEET KA LINK YAHI HAI
+          # TERA SHEET KA LINK
           sheet_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS7zjzUB789rZP6lIdnpC5o-kJqMvibj4wdLyXL0IMrbQjBJQZChwySK-efW9ERj2T7yyTNbVxHhQeU/pub?gid=0&single=true&output=csv"
 
           # Column A se stocks uthao
@@ -40,7 +41,7 @@ jobs:
                       results.append([s, round(yest_h,2), round(today_h,2), round(today_c,2), 'READY', round(today_h,2), round(today_h*0.99,2), round(today_h*1.02,2), datetime.now().strftime('%Y-%m-%d')])
               except: pass
 
-          pd.DataFrame(results, columns=['Stock','Prev_High','Today_High','Today_Close','Signal','Entry','SL','TGT','Date']).to_csv('ctd_signals.csv', index=False)
+          pd.DataFrame(results, columns=['Stock','Prev_High','Today_Close','Signal','Entry','SL','TGT','Date']).to_csv('ctd_signals.csv', index=False)
           print(f"DONE: {len(results)} stocks ready for tomorrow")
           EOF
       - run: |
