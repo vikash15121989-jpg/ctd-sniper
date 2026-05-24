@@ -1,55 +1,76 @@
 import yfinance as yf
 import pandas as pd
+import gspread
+import json
+import os
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# TERA WATCHLIST SHEET KA LINK - YEHI SE STOCK UTHEGA
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS7zjzUB789rZP6lIdnpC5o-kJqMvibj4wdLyXL0IMrbQjBJQZChwySK-efW9ERj2T7yyTNbVxHhQeU/pub?gid=0&single=true&output=csv"
+print("=== CTD SNIPER: SPRING + DRY UP SCANNER START ===")
 
-# 1. Seedha Google Sheet se Watchlist uthao
-df_watchlist = pd.read_csv(SHEET_CSV_URL, header=None)
-stocks = df_watchlist[0].dropna().astype(str).str.strip().str.upper().tolist()
-# Header 'COFORGE' hai to skip mat karo, 'A' hota to karte
-if stocks[0] == 'A': stocks = stocks[1:]
-print(f"Watchlist Sheet se {len(stocks)} stocks mile: {stocks[:3]}...")
+gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
+gc = gspread.service_account_from_dict(gcp_json_creds)
+sh = gc.open("creek_scanner")
+
+ws_watchlist = sh.worksheet("Watchlist")
+date_str = str(ws_watchlist.acell('A1').value).split(' ')[0]
+end_date = datetime.strptime(date_str, '%d/%m/%Y').strftime('%Y-%m-%d')
+print(f"Backtest Date: {end_date}")
+
+stocks = ws_watchlist.col_values(1)[1:]
+stocks = [s.strip().upper() for s in stocks if s.strip()]
 
 signals = []
 for i, stock in enumerate(stocks):
-    if i % 10 == 0: print(f"Scanning {i}/{len(stocks)}... {stock}")
+    print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
     try:
-        df = yf.download(f"{stock}.NS", period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if len(df) < 100: continue
+        df = yf.download(f"{stock}.NS", start="2023-01-01", end=end_date, interval="1d", progress=False, auto_adjust=True)
+        if len(df) < 200: continue
+
+        df['Vol_50D'] = df['Volume'].rolling(50).mean()
+        if df['Vol_50D'].iloc[-1] < 100000: continue
 
         df['EMA200'] = df['Close'].ewm(span=200).mean()
-        df['Vol_50D'] = df['Volume'].rolling(50).mean()
 
-        for j in range(-30, -5):
+        for j in range(-60, -5):
             candle = df.iloc[j]
-            support = min(candle['EMA200'], df.iloc[j-10:j]['Low'].min())
+            support = min(candle['EMA200'], df.iloc[j-20:j]['Low'].min())
+            is_spring = candle['Low'] < support * 0.99 and candle['Close'] > support
 
-            # Spring Condition
-            if candle['Low'] < support * 0.99 and candle['Close'] > support:
-                post = df.iloc[j:]
-                rng_high, rng_low = post['High'].max(), post['Low'].min()
+            if is_spring:
+                spring_date = df.index[j].date()
+                post_spring = df.iloc[j+1:]
+                if len(post_spring) < 5: continue
 
-                # Tight Range + Absorption Check
-                if (rng_high - rng_low) / rng_low * 100 < 12:
-                    if candle['Volume'] > candle['Vol_50D'] * 1.2: # Spring pe volume spike
-                        if post['Volume'].tail(10).mean() < candle['Vol_50D'] * 0.6: # Ab dead
-                            signals.append({
-                                'Stock': stock,
-                                'Entry': round(rng_high, 2),
-                                'SL': round(support * 0.98, 2),
-                                'TGT1': round(rng_high * 1.10, 2),
-                                'TGT2': round(rng_high * 1.20, 2),
-                                'Time': datetime.now().strftime("%d-%m %H:%M")
-                            })
-                            break
-    except Exception as e: continue
+                last_swing_high = post_spring['High'].max()
+                current_close = df['Close'].iloc[-1]
+                current_vol_avg = post_spring['Volume'].tail(5).mean()
+                spring_vol = candle['Volume']
+                spring_vol_50d = df['Vol_50D'].iloc[j]
 
-# 2. Output CSV - LiveSignals me jayega
-df_out = pd.DataFrame(signals)
-df_out.to_csv("spring_breakout_signals.csv", index=False)
-print(f"\nTotal {len(df_out)} Spring signals mile. CSV ready.")
-if not df_out.empty: print(df_out.to_string(index=False))
+                cmp_below_swing = current_close < last_swing_high * 1.01 # 1% buffer
+                is_dry = current_vol_avg < spring_vol * 0.4
+                current_range = (last_swing_high - candle['Low']) / candle['Low'] * 100
+                is_tight = current_range < 15
+
+                status = "READY" if cmp_below_swing else "BREAKOUT"
+
+                if is_dry and is_tight:
+                    signals.append([
+                        stock, str(spring_date), end_date,
+                        round(last_swing_high, 2), round(candle['Low'] * 0.98, 2),
+                        round(last_swing_high * 1.08, 2), round(current_close, 2),
+                        round(current_range, 1), int(current_vol_avg / spring_vol_50d * 100),
+                        status, f"Spring:{spring_date} | Dry:{is_dry} | Tight:{is_tight}"
+                    ])
+                    print(f"[PASS] ✅ {stock}: {status}")
+                    break
+
+    except Exception as e: print(f"[ERROR] {stock}: {e}")
+
+ws_live = sh.worksheet("LiveSignals")
+ws_live.clear()
+header = ['Stock','Spring_Date','Scan_Date','Entry_BO','SL','TGT1','CMP','Range%','Dry%','Status','Reason']
+ws_live.update('A1', [header] + signals)
+print(f"\n=== DONE === {len(signals)} signals mile.")
