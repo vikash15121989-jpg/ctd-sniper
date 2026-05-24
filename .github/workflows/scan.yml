@@ -1,0 +1,51 @@
+name: EOD CTD Scan From Sheet
+on:
+  schedule:
+    - cron: '15 10 * * 1-5' # Roz 4:00 PM IST, Mon-Fri
+  workflow_dispatch: # Manual chalane ke liye
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install yfinance pandas lxml
+      - name: Run Scan From Your Sheet
+        run: |
+          python << 'EOF'
+          import yfinance as yf, pandas as pd
+          from datetime import datetime
+
+          # TERA SHEET KA LINK YAHI HAI
+          sheet_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS7zjzUB789rZP6lIdnpC5o-kJqMvibj4wdLyXL0IMrbQjBJQZChwySK-efW9ERj2T7yyTNbVxHhQeU/pub?gid=0&single=true&output=csv"
+
+          # Column A se stocks uthao
+          df_sheet = pd.read_csv(sheet_url)
+          stocks = df_sheet.iloc[:,0].dropna().tolist()
+          if stocks[0] == 'A': stocks = stocks[1:] # Header hatao
+
+          print(f"Sheet se total stocks: {len(stocks)}")
+          results = []
+
+          data = yf.download([s+'.NS' for s in stocks], period='5d', interval='1d', group_by='ticker', threads=True)
+
+          for s in stocks:
+              try:
+                  df = data[s]
+                  if len(df) < 2: continue
+                  yest_h, today_h, today_c = df['High'].iloc[-2], df['High'].iloc[-1], df['Close'].iloc[-1]
+                  if today_c >= yest_h * 0.995:
+                      results.append([s, round(yest_h,2), round(today_h,2), round(today_c,2), 'READY', round(today_h,2), round(today_h*0.99,2), round(today_h*1.02,2), datetime.now().strftime('%Y-%m-%d')])
+              except: pass
+
+          pd.DataFrame(results, columns=['Stock','Prev_High','Today_High','Today_Close','Signal','Entry','SL','TGT','Date']).to_csv('ctd_signals.csv', index=False)
+          print(f"DONE: {len(results)} stocks ready for tomorrow")
+          EOF
+      - run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add ctd_signals.csv
+          git commit -m "EOD Scan $(date +'%Y-%m-%d')" || echo "No changes"
+          git push
