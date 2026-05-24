@@ -24,19 +24,19 @@ signals = []
 for i, stock in enumerate(stocks):
     print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
     try:
-        df = yf.download(f"{stock}.NS", start="2023-01-01", end=end_date, interval="1d", progress=False, auto_adjust=True)
+        # FIX 1: auto_adjust=False -> Tera CSV wala raw data milega
+        df = yf.download(f"{stock}.NS", start="2023-01-01", end=end_date, interval="1d", progress=False, auto_adjust=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         if len(df) < 60: continue
 
         df['Vol_50'] = df['Volume'].rolling(50).mean()
-        df['IsGreen'] = df['Close'] > df['Open']
 
-        bo_candle = df.iloc[-1] # Backtest date
-        df_past = df.iloc[:-1] # BO se pehle ka data
+        bo_candle = df.iloc[-1]
+        df_past = df.iloc[:-1]
 
-        # FIX: Pehle Spring dhoondo, phir Creek
-        df_90d = df_past.iloc[-90:].copy() # 90 din me dhoondo
+        # FIX 2: Spring = lowest low, color check hata diya. Sirf low chahiye
+        df_90d = df_past.iloc[-90:].copy()
         spring_low = df_90d['Low'].min()
         spring_candle = df_90d.loc[df_90d['Low'] == spring_low].iloc[-1]
         spring_idx = df_90d.index.get_loc(spring_candle.name)
@@ -47,11 +47,11 @@ for i, stock in enumerate(stocks):
 
         print(f"DEBUG: Creek={creek_high:.2f} | Spring={spring_low:.2f} on {spring_candle.name.date()} | BO Close={bo_candle['Close']:.2f}")
 
-        is_spring = spring_candle['IsGreen']
-        vol_condition = bo_candle['Volume'] < bo_candle['Vol_50'] * 1.1 # 10% relaxation
+        # FIX 3: is_spring condition hata di. Spring = lowest low, color not imp
+        vol_condition = bo_candle['Volume'] < bo_candle['Vol_50'] * 1.2 # 20% relaxation
         breakout = bo_candle['Close'] > creek_high
 
-        if is_spring and vol_condition and breakout:
+        if vol_condition and breakout:
             signals.append({
                 'Stock': stock, 'Status': 'READY',
                 'SpringLow': round(spring_low, 2), 'CreekHigh': round(creek_high, 2),
@@ -61,8 +61,7 @@ for i, stock in enumerate(stocks):
             print(f"[PASS] ✅ {stock}: READY")
         else:
             reason = []
-            if not is_spring: reason.append("Spring red")
-            if not vol_condition: reason.append(f"Vol high: {int(bo_candle['Volume'])} > {int(bo_candle['Vol_50']*1.1)}")
+            if not vol_condition: reason.append(f"Vol high: {int(bo_candle['Volume'])} > {int(bo_candle['Vol_50']*1.2)}")
             if not breakout: reason.append(f"BO nahi: {bo_candle['Close']:.2f} < {creek_high:.2f}")
             print(f" ❌ {stock}: {', '.join(reason)}")
 
