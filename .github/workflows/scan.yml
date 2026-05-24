@@ -1,26 +1,27 @@
-name: Spring Scanner Auto
+name: CTD Sniper Scanner
+
 on:
-  schedule:
-    - cron: '30 13 * * 1-5' # 7:00 PM IST Mon-Fri
   workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * 1-5' # 9:00 AM IST Mon-Fri
 
 jobs:
-  scan:
+  run-scanner:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - run: pip install yfinance pandas numpy
-      - run: python main.py
 
-      - name: Commit CSV
+      - name: Install dependencies
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add spring_breakout_signals.csv
-          git commit -m "Update signals: $(date)" || exit 0
-          git push
+          pip install yfinance pandas gspread google-auth
+
+      - name: Run Python Scanner
+        env:
+          GSHEET_KEY: ${{ secrets.GSHEET_KEY }} # YE LINE SABSE IMPORTANT HAI
+        run: python main.py
