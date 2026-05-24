@@ -1,20 +1,26 @@
-name: Spring Breakout Scanner
+name: Spring Scanner Auto
 on:
   schedule:
-    - cron: '30 13 * * 1-5'  # 7 PM IST, Mon-Fri
+    - cron: '30 13 * * 1-5' # 7:00 PM IST Mon-Fri
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      - run: pip install yfinance pandas
+          python-version: '3.10'
+      - run: pip install yfinance pandas numpy
       - run: python main.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spring-breakout-signals
-          path: spring_breakout_signals.csv
+
+      - name: Commit CSV
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add spring_breakout_signals.csv
+          git commit -m "Update signals: $(date)" || exit 0
+          git push
