@@ -7,7 +7,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== SPRING FINDER V2: UNBROKEN SPRING + LIQUIDITY ===")
+print("=== SPRING FINDER V3: RECENT UNBROKEN SPRING + CREEK FIXED ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -19,7 +19,7 @@ ws_watchlist = sh.worksheet("Watchlist")
 date_str = str(ws_watchlist.acell('A1').value).split(' ')[0]
 end_date = datetime.strptime(date_str, "%d/%m/%Y")
 end_date_str = end_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str} | Spring kabhi toota nahi + Liquidity 5Cr")
+print(f"Reference Date: {date_str} | Recent Unbroken Spring + Liquidity 5Cr")
 
 # 3. STOCK LIST
 stocks = ws_watchlist.col_values(1)[1:]
@@ -46,26 +46,57 @@ for i, stock in enumerate(stocks):
             print(f" ❌ {stock}: Liquidity low - {avg_turnover/10000000:.1f}Cr")
             continue
 
-        # 5. SPRING DHOONDO - LAST 90 DIN KA LOWEST
+        # 5. SPRING DHOONDO - RECENT UNBROKEN LOW ← YAHI MAIN FIX HAI
         df_90d = df.tail(90).copy()
-        spring_low = df_90d['Low'].min()
-        spring_candle = df_90d.loc[df_90d['Low'] == spring_low].iloc[-1]
-        spring_date = spring_candle.name
+        df_90d_rev = df_90d.iloc[::-1] # Ulta kar diya - naya wala upar
+        
+        spring_low = None
+        spring_date = None
+        spring_candle = None
+        
+        for idx, row in df_90d_rev.iterrows():
+            current_low = row['Low']
+            # Is candle ke BAAD ka data nikalo
+            after_spring_idx = df.index.get_loc(idx) + 1
+            df_after = df.iloc[after_spring_idx:]
+            
+            if df_after.empty: # Agar ye last candle hai to wahi spring
+                spring_low = current_low
+                spring_date = idx
+                spring_candle = row
+                break
+                
+            lowest_close_after = df_after['Close'].min()
+            
+            # Agar iske baad kabhi close me nahi toota
+            if lowest_close_after > current_low:
+                spring_low = current_low
+                spring_date = idx
+                spring_candle = row
+                break # Pehla jo mile, ruk jao. Wahi Recent hai.
+        
+        if spring_low is None:
+            print(f" ❌ {stock}: Koi Unbroken Spring nahi mila")
+            continue
+
         spring_idx = df.index.get_loc(spring_date)
 
-        # 6. SPRING KE BAAD LOW TOOTI YA NAHI? ← MAIN FILTER
-        df_after_spring = df.iloc[spring_idx:] # Spring se aaj tak
-        lowest_close_after_spring = df_after_spring['Close'].min()
+        # 6. DOUBLE CHECK: SPRING KE BAAD LOW TOOTI YA NAHI?
+        df_after_spring = df.iloc[spring_idx + 1:] # Spring ke agle din se
+        if not df_after_spring.empty:
+            lowest_close_after_spring = df_after_spring['Close'].min()
+            if lowest_close_after_spring <= spring_low:
+                print(f" ❌ {stock}: Spring FAIL. Low toota: {lowest_close_after_spring:.2f} <= {spring_low:.2f}")
+                continue
+        else:
+            lowest_close_after_spring = df.iloc[spring_idx]['Close']
 
-        if lowest_close_after_spring <= spring_low:
-            print(f" ❌ {stock}: Spring FAIL. Low toota: {lowest_close_after_spring:.2f} <= {spring_low:.2f}")
+        # 7. CREEK DHOONDO - SPRING SE PEHLE KA HIGH ← DUSRA FIX
+        df_before_spring = df.iloc[:spring_idx] # +1 HATA DIYA. Spring ka din nahi lena
+        if len(df_before_spring) < 20:
+            print(f" ❌ {stock}: Spring se pehle data kam hai")
             continue
-
-        # 7. CREEK DHOONDO - SPRING SE PEHLE KA HIGH
-        df_before_spring = df.iloc[:spring_idx+1].tail(90)
-        if df_before_spring.empty:
-            continue
-        creek_high = df_before_spring['High'].max()
+        creek_high = df_before_spring['High'].tail(90).max()
 
         # 8. ABHI CREEK BREAK NAHI KIYA HONA CHAHIYE
         if last_candle['Close'] >= creek_high:
@@ -74,11 +105,12 @@ for i, stock in enumerate(stocks):
 
         # 9. KITNE DIN PURANA SPRING HAI
         days_ago = len(df) - spring_idx - 1
-        if days_ago > 90: # 90 din se zyada purana ignore
+        if days_ago > 120: # 120 din se zyada purana ignore
             print(f" ❌ {stock}: Spring bahut purana {days_ago} din")
             continue
 
-        spring_vol_dry = spring_candle['Volume'] < spring_candle['Vol_50'] * 0.8
+        # 10. VOLUME CHECK
+        spring_vol_dry = spring_candle['Volume'] < spring_candle['Vol_50'] * 0.8 if pd.notna(spring_candle['Vol_50']) else False
         spring_strength = 'STRONG' if spring_vol_dry else 'WEAK'
 
         signals.append({
@@ -99,7 +131,7 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 10. SHEET UPDATE
+# 11. SHEET UPDATE
 try:
     ws_output = sh.worksheet("SpringSetups")
     print("SpringSetups tab mil gayi")
