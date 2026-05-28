@@ -7,7 +7,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== SPRING FINDER: FIXED CREEK + VOLUME LOGIC ===")
+print("=== SPRING FINDER: CREEK + VOLUME + LIQUIDITY FILTER ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -38,11 +38,16 @@ for i, stock in enumerate(stocks):
         last_candle = df.iloc[-1]
         actual_last_date = df.index[-1].strftime('%d/%m/%Y')
 
-        # 4. LIQUIDITY CHECK
-        avg_turnover = last_candle['Vol_50'] * last_candle['Close']
-        if avg_turnover < 50000000 or last_candle['Vol_50'] < 100000:
-            print(f" ❌ Liquidity low - {avg_turnover/10000000:.1f}Cr")
+        # 4. LIQUIDITY CHECK - UPDATED ✅
+        avg_vol = last_candle['Vol_50']
+        avg_turnover = avg_vol * last_candle['Close']
+
+        # Volume 50 Lakh se jyada YA Turnover 5 Cr se jyada
+        if pd.isna(avg_vol) or (avg_vol < 5000000 and avg_turnover < 50000000):
+            print(f" ❌ Liquidity low - Vol:{avg_vol/100000:.1f}L, Turnover:{avg_turnover/10000000:.1f}Cr")
             continue
+        else:
+            print(f" ✅ Liquidity OK - Vol:{avg_vol/100000:.1f}L, Turnover:{avg_turnover/10000000:.1f}Cr")
 
         # 5. SPRING DHOONDO - MINIMUM 2 DIN PURANA
         df_check = df.iloc[:-2]
@@ -70,40 +75,45 @@ for i, stock in enumerate(stocks):
 
         spring_idx = df.index.get_loc(spring_date)
 
-        # 6. CREEK = CLOSE BASED SWING HIGH - FIXED LOGIC ✅
+        # 6. CREEK = CLOSE BASED SWING HIGH
         df_before_spring = df.iloc[:spring_idx]
         if len(df_before_spring) < 20:
             print(f" ❌ Spring se pehle data kam")
             continue
 
-        # Last 60 din me dhoondo
         df_recent = df_before_spring.tail(60).copy()
 
-        # FIX #1: Sahi 3-Left 3-Right Swing High Logic
+        # 3-Left 3-Right Swing High Logic
         swing_high_indices = []
-        for i in range(3, len(df_recent)-3):
-            current_close = df_recent['Close'].iloc[i]
-            left_3_max = df_recent['Close'].iloc[i-3:i].max()
-            right_3_max = df_recent['Close'].iloc[i+1:i+4].max()
-
+        for j in range(3, len(df_recent)-3):
+            current_close = df_recent['Close'].iloc[j]
+            left_3_max = df_recent['Close'].iloc[j-3:j].max()
+            right_3_max = df_recent['Close'].iloc[j+1:j+4].max()
             if current_close > left_3_max and current_close > right_3_max:
-                swing_high_indices.append(df_recent.index[i])
+                swing_high_indices.append(df_recent.index[j])
 
-        # FIX #2: Creek = High use karo, Close nahi. Fallback bhi High
+        # Creek = High use karo
         if len(swing_high_indices) == 0:
             creek_high = df_recent['High'].max()
             creek_date = df_recent['High'].idxmax().strftime('%d/%m/%Y')
             creek_type = 'Max High Last 60D'
         else:
-            # Spring ke sabse najdik wala Swing High
             creek_date_idx = swing_high_indices[-1]
-            creek_high = df_recent.loc[creek_date_idx, 'High'] # High use karo
+            creek_high = df_recent.loc[creek_date_idx, 'High']
             creek_date = creek_date_idx.strftime('%d/%m/%Y')
             creek_type = 'Nearest Swing High'
 
-        # FIX #3: Creek break check High se karo, Close se nahi
-        if last_candle['High'] >= creek_high:
-            print(f" ❌ Creek break ho gaya: {last_candle['High']:.2f} >= {creek_high:.2f}")
+        # SANITY CHECK - 10572% wala kand roko
+        if creek_high > spring_low * 1.8:
+            print(f" ❌ Creek {creek_high:.2f} Spring {spring_low:.2f} se 80%+ door")
+            continue
+        if creek_high > last_candle['Close'] * 2:
+            print(f" ❌ Creek {creek_high:.2f} CMP {last_candle['Close']:.2f} se 100%+ door")
+            continue
+
+        # Creek break check Close se karo
+        if last_candle['Close'] >= creek_high:
+            print(f" ❌ Creek break ho gaya: Close {last_candle['Close']:.2f} >= {creek_high:.2f}")
             continue
 
         # 8. KITNE DIN PURANA
@@ -112,8 +122,7 @@ for i, stock in enumerate(stocks):
             print(f" ❌ Spring bahut purana {days_ago} din")
             continue
 
-        # 9. VOLUME CHECK - FIXED ✅
-        # Spring pe VOLUME BLAST chahiye, dry nahi
+        # 9. VOLUME CHECK - Spring pe BLAST chahiye
         spring_vol_high = spring_candle['Volume'] > spring_candle['Vol_50'] * 1.5 if pd.notna(spring_candle['Vol_50']) else False
         spring_strength = 'STRONG' if spring_vol_high else 'WEAK'
 
@@ -125,14 +134,15 @@ for i, stock in enumerate(stocks):
             'Spring_Low': round(spring_low, 2),
             'Spring_Strength': spring_strength,
             'Trading_Days_Ago': days_ago,
-            'Creek_High': round(creek_high, 2), # Ab High hai, Close nahi
+            'Creek_High': round(creek_high, 2),
             'Creek_Date': creek_date,
             'Creek_Type': creek_type,
             'CMP': round(last_candle['Close'], 2),
             'Distance_To_Creek_%': round((creek_high - last_candle['Close'])/last_candle['Close']*100, 1),
+            'Avg_Vol_Lakh': round(avg_vol/100000, 1),
             'Avg_Turnover_Cr': round(avg_turnover/10000000, 1)
         })
-        print(f"[PASS] ✅ Spring {days_ago} din pehle | Creek {creek_high:.2f} on {creek_date} | {spring_strength}")
+        print(f"[PASS] ✅ Spring {days_ago} din pehle | Creek {creek_high:.2f} | {spring_strength}")
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
