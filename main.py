@@ -15,9 +15,22 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. A1 SE DATE - ISSE 10 DIN PEECHE BHI CHECK KAREGA
-date_str = str(ws_watchlist.acell('A1').value).split(' ')[0]
-ref_date = datetime.strptime(date_str, '%Y-%m-%d')
+# 2. A1 SE DATE - MULTIPLE FORMAT HANDLE ✅
+date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
+date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
+
+ref_date = None
+for fmt in date_formats:
+    try:
+        ref_date = datetime.strptime(date_raw, fmt)
+        break
+    except ValueError:
+        continue
+
+if ref_date is None:
+    raise ValueError(f"A1 me date format samajh nahi aaya: {date_raw}. Use YYYY-MM-DD ya DD/MM/YYYY")
+
+date_str = ref_date.strftime('%Y-%m-%d')
 print(f"Reference Date: {date_str} | + 10 Days Back Check")
 
 # 3. VSA + BASE DETECTION FUNCTION - UPGRADED ✅
