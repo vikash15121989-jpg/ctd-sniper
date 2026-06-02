@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== SPRING FINDER: BASE + VSA + 10 DAY BACKDATE CHECK ===")
+print("=== SPRING FINDER V2: BASE + VSA + CLIMAX FILTER ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -15,7 +15,7 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. A1 SE DATE - MULTIPLE FORMAT HANDLE ✅
+# 2. A1 SE DATE - MULTIPLE FORMAT HANDLE
 date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
 date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
 
@@ -33,19 +33,31 @@ if ref_date is None:
 date_str = ref_date.strftime('%Y-%m-%d')
 print(f"Reference Date: {date_str} | + 10 Days Back Check")
 
-# 3. VSA + BASE DETECTION FUNCTION - UPGRADED ✅
+# 3. VSA + BASE DETECTION FUNCTION - FIXED
 def analyze_base_context(df, end_date, window=22, max_range_pct=15):
     """
     end_date tak ka data leke pichle 22 din me base dhoondo
-    Aur batao Accumulation, Re-Accumulation ya Distribution
+    Ab Buying Climax + 52W High filter ke saath
     """
     df_till_date = df[df.index <= end_date].copy()
-    if len(df_till_date) < 80: # Context ke liye 80 din chahiye
+    if len(df_till_date) < 100:
         return None
 
-    df_recent = df_till_date.tail(window + 30).copy() # 52 din ka window
+    # FIX 1: BUYING CLIMAX FILTER - Top pe base reject
+    recent_30 = df_till_date.tail(30)
+    if len(recent_30) >= 20:
+        vol_avg_30 = recent_30['Volume'].mean()
+        high_20d = recent_30['High'].rolling(20).max()
+        climax_check = recent_30[
+            (recent_30['Volume'] > vol_avg_30 * 2.5) &
+            (recent_30['High'] >= high_20d * 0.99) &
+            (recent_30['Close'] < recent_30['High'] * 0.97)
+        ]
+        if not climax_check.empty:
+            return None
 
-    # Sliding window se 20 din ka base dhoondo
+    df_recent = df_till_date.tail(window + 60).copy()
+
     for i in range(len(df_recent) - 20):
         base_window = df_recent.iloc[i:i+20]
         base_high = base_window['High'].max()
@@ -56,45 +68,43 @@ def analyze_base_context(df, end_date, window=22, max_range_pct=15):
         range_pct = (base_high - base_low) / base_low * 100
         if range_pct > max_range_pct: continue
 
-        # VSA CHECK 1: VOLATILITY SOOKHI KYA?
+        # VSA CHECK 1: VOLATILITY SOOKHI KYA
         daily_range = (base_window['High'] - base_window['Low']) / base_window['Close'] * 100
         if daily_range.mean() > 3.5: continue
 
-        # VSA CHECK 2: VOLUME DRY UP?
+        # VSA CHECK 2: VOLUME DRY UP
         if len(base_window) >= 20:
             vol_first = base_window['Volume'].iloc[:10].mean()
             vol_second = base_window['Volume'].iloc[10:].mean()
-            if vol_second > vol_first * 0.8: continue # Volume sookha nahi
+            if vol_second > vol_first * 0.8: continue
 
-        # VSA CHECK 3: ACCUMULATION vs DISTRIBUTION vs RE-ACCUMULATION
-        # Base se 60 din pehle ka price dekho
-        lookback_idx = max(0, i-40)
-        price_60_days_ago = df_recent['Close'].iloc[lookback_idx]
-        rally_pct = (base_low - price_60_days_ago) / price_60_days_ago * 100
+        # FIX 2: SAHI RALLY PCT - 60 din ka swing low se
+        lookback_60 = df_recent.iloc[max(0, i-60):i]
+        if lookback_60.empty: continue
+        swing_low_60 = lookback_60['Low'].min()
+        rally_pct = (base_low - swing_low_60) / swing_low_60 * 100
 
-        # Base me up day vs down day volume
+        # FIX 3: 52-WEEK HIGH FILTER
+        yearly_high = df_till_date['High'].tail(252).max()
+        distance_from_high = (yearly_high - base_high) / yearly_high * 100
+
         up_vol = base_window[base_window['Close'] > base_window['Open']]['Volume'].sum()
         down_vol = base_window[base_window['Close'] < base_window['Open']]['Volume'].sum()
         vol_ratio = up_vol / down_vol if down_vol > 0 else 99
 
-        # Base ke neeche Spring/Test hai kya?
         df_after_base_start = df_recent.iloc[i:]
         spring_low = df_after_base_start['Low'].min()
         spring_exists = spring_low <= base_low * 1.02 and spring_low >= base_low * 0.95
 
-        # CLASSIFICATION LOGIC
-        if rally_pct < 20: # Bada move nahi hua
+        # NEW CLASSIFICATION LOGIC - TIGHT
+        if distance_from_high < 12: # 52-wk high se 12% ke andar = Distribution
+            base_type = 'Distribution Risk'
+        elif rally_pct < 25 and spring_exists and vol_ratio > 1.1:
             base_type = 'Accumulation'
-        elif rally_pct > 80: # 80%+ rally ke baad base
-            if vol_ratio < 0.8 or not spring_exists: # Down vol jyada ya spring nahi
-                base_type = 'Distribution Risk'
-            else:
-                base_type = 'Re-Accumulation'
-        else: # 20-80% rally ke baad
-            if spring_exists and vol_ratio > 1.2:
-                base_type = 'Re-Accumulation'
-            else:
-                base_type = 'Weak Base'
+        elif rally_pct > 70 and vol_ratio > 1.3 and spring_exists:
+            base_type = 'Re-Accumulation'
+        else:
+            base_type = 'Weak Base'
 
         # BREAKDOWN/BREAKOUT CHECK
         df_after_base = df_recent.iloc[i+20:]
@@ -102,7 +112,7 @@ def analyze_base_context(df, end_date, window=22, max_range_pct=15):
             status = f'Forming: {base_type}'
             breakout_date = None
         elif df_after_base['Close'].min() < base_low * 0.98:
-            return None # Breakdown ho gaya, skip
+            return None
         elif df_after_base['Close'].max() > base_high:
             status = f'Breakout: {base_type}'
             breakout_date = df_after_base[df_after_base['Close'] > base_high].index[0]
@@ -121,9 +131,9 @@ def analyze_base_context(df, end_date, window=22, max_range_pct=15):
             'rally_pct': rally_pct,
             'vol_ratio': vol_ratio,
             'spring_exists': spring_exists,
-            'breakout_date': breakout_date
+            'breakout_date': breakout_date,
+            'distance_from_52w_high_%': round(distance_from_high, 1)
         }
-
     return None
 
 # 4. STOCK LIST
@@ -131,7 +141,7 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 
 signals = []
-check_dates = [ref_date, ref_date - timedelta(days=14)] # Aaj + 14 calendar din peeche = ~10 trading days
+check_dates = [ref_date, ref_date - timedelta(days=14)]
 
 for i, stock in enumerate(stocks):
     print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
@@ -154,7 +164,7 @@ for i, stock in enumerate(stocks):
             print(f" ❌ Liquidity low")
             continue
 
-        # 6. DONO DATES PE CHECK KARO - AAJ AUR 10 DIN PEECHE
+        # 6. DONO DATES PE CHECK KARO
         for check_date in check_dates:
             check_date_str = check_date.strftime('%Y-%m-%d')
             print(f" Checking till: {check_date_str}")
@@ -168,7 +178,7 @@ for i, stock in enumerate(stocks):
                 print(f" ❌ {base_info['status']}")
                 continue
 
-            print(f" ✅ {base_info['status']} | Range: {base_info['range_pct']:.1f}%")
+            print(f" ✅ {base_info['status']} | Range: {base_info['range_pct']:.1f}% | 52W_High_Dist: {base_info['distance_from_52w_high_%']}%")
 
             # 7. SPRING DHOONDO - OPTIONAL CONTEXT
             df_check = df[df.index <= check_date].iloc[:-2]
@@ -196,6 +206,7 @@ for i, stock in enumerate(stocks):
                 'Base_Low': round(base_info['base_low'], 2),
                 'Base_Top': round(base_info['base_high'], 2),
                 'Base_Range_%': round(base_info['range_pct'], 1),
+                'From_52W_High_%': base_info['distance_from_52w_high_%'],
                 'Rally_Before_%': round(base_info['rally_pct'], 1),
                 'Up/Down_Vol_Ratio': round(base_info['vol_ratio'], 2),
                 'Spring_Present': 'Yes' if base_info['spring_exists'] else 'No',
@@ -206,7 +217,7 @@ for i, stock in enumerate(stocks):
                 'Distance_To_Top_%': round((base_info['base_high'] - last_candle['Close'])/last_candle['Close']*100, 1),
                 'Avg_Vol_Lakh': round(avg_vol/100000, 1)
             })
-            break # Ek date pe mil gaya to dusri date check nahi karni
+            break
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
@@ -220,7 +231,6 @@ except:
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    # Breakout wale upar, Re-Accumulation priority
     df_out['Priority'] = df_out['Base_Type'].apply(lambda x: 1 if 'Re-Accumulation' in x else 2 if 'Accumulation' in x else 3)
     df_out = df_out.sort_values(['Priority', 'Base_Start'])
     df_out = df_out.drop('Priority', axis=1)
