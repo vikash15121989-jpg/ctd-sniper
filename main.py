@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import gspread
 import json
 import os
@@ -8,29 +9,29 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== ZIGZAG 6% WYCKOFF - RECENT DATE FIRST ===")
+print("=== ZIGZAG 6% + RELATIVE SWING SCANNER ===")
 
-# ZIGZAG 6% SWING
+# ZIGZAG 6% - CLOSE BASIS
 def get_zigzag_swings(df, pct=6.0):
     highs, lows, closes = df['High'].values, df['Low'].values, df['Close'].values
-    swing_highs, swing_lows = [], []
+    swing_highs, swing_lows = [], [] # (idx, close, high/low)
     last_high_idx = last_low_idx = 0
     trend = 0
 
     for i in range(1, len(df)):
         if trend >= 0:
-            if closes[i] > highs[last_high_idx]: last_high_idx = i
-            elif (highs[last_high_idx] - lows[i]) / highs[last_high_idx] * 100 >= pct:
-                swing_highs.append((last_high_idx, highs[last_high_idx]))
+            if closes[i] > closes[last_high_idx]: last_high_idx = i
+            elif (closes[last_high_idx] - closes[i]) / closes[last_high_idx] * 100 >= pct:
+                swing_highs.append((last_high_idx, closes[last_high_idx], highs[last_high_idx]))
                 trend, last_low_idx = -1, i
         else:
-            if closes[i] < lows[last_low_idx]: last_low_idx = i
-            elif (highs[i] - lows[last_low_idx]) / lows[last_low_idx] * 100 >= pct:
-                swing_lows.append((last_low_idx, lows[last_low_idx]))
+            if closes[i] < closes[last_low_idx]: last_low_idx = i
+            elif (closes[i] - closes[last_low_idx]) / closes[last_low_idx] * 100 >= pct:
+                swing_lows.append((last_low_idx, closes[last_low_idx], lows[last_low_idx]))
                 trend, last_high_idx = 1, i
 
-    if trend >= 0: swing_highs.append((last_high_idx, highs[last_high_idx]))
-    else: swing_lows.append((last_low_idx, lows[last_low_idx]))
+    if trend >= 0: swing_highs.append((last_high_idx, closes[last_high_idx], highs[last_high_idx]))
+    else: swing_lows.append((last_low_idx, closes[last_low_idx], lows[last_low_idx]))
     return swing_highs, swing_lows
 
 # SHEET CONNECT
@@ -61,14 +62,34 @@ for stock in stocks:
         swing_highs, swing_lows = get_zigzag_swings(df, pct=6.0)
         if len(swing_highs) < 2 or len(swing_lows) < 2: continue
 
+        last_used_sh2_idx = -1
+        last_used_sl2_idx = -1
+
         for j in range(50, len(df)):
+            # ===== CONDITION 1: CLOSE BASIS HH-HL =====
             past_sh = [sh for sh in swing_highs if sh[0] < j]
             past_sl = [sl for sl in swing_lows if sl[0] < j]
             if len(past_sh) < 2 or len(past_sl) < 2: continue
 
-            sh1, sh2 = past_sh[-2][1], past_sh[-1][1]
-            sl1, sl2 = past_sl[-2][1], past_sl[-1][1]
-            if sh2 <= sh1 or sl2 <= sl1: continue
+            sh1_idx, sh1_close, sh1_high = past_sh[-2]
+            sh2_idx, sh2_close, sh2_high = past_sh[-1]
+            sl1_idx, sl1_close, sl1_low = past_sl[-2]
+            sl2_idx, sl2_close, sl2_low = past_sl[-1]
+
+            # Close basis HH-HL
+            if sh2_close <= sh1_close or sl2_close <= sl1_close: continue
+
+            # ✅ CONDITION 2: RELATIVE SWING - NAYA SWING BADA HO
+            swing1_size = sh1_close - sl1_close # Pehla swing ka range
+            swing2_size = sh2_close - sl2_close # Dusra swing ka range
+            if swing2_size <= swing1_size: continue # Relative swing nahi badha
+
+            # Ek structure = Ek signal
+            if sh2_idx == last_used_sh2_idx and sl2_idx == last_used_sl2_idx:
+                continue
+
+            # ===== CONDITION 3 & 4: FOOTPRINT AFTER HH =====
+            if j <= sh2_idx: continue # HH ke baad hi
 
             prev_10 = df.iloc[j-10:j]
             if len(prev_10) < 10: continue
@@ -77,9 +98,14 @@ for stock in stocks:
             if today['Volume'] <= prev_10['Volume'].max(): continue
             if today['High'] >= prev_10['High'].max(): continue
 
+            # ===== SIGNAL CONFIRM =====
+            last_used_sh2_idx = sh2_idx
+            last_used_sl2_idx = sl2_idx
+
             signal_date = today.name
-            hh_pct = round((sh2/sh1 - 1) * 100, 1)
-            hl_pct = round((sl2/sl1 - 1) * 100, 1)
+            hh_pct = round((sh2_close/sh1_close - 1) * 100, 1)
+            hl_pct = round((sl2_close/sl1_close - 1) * 100, 1)
+            swing_growth = round((swing2_size/swing1_size - 1) * 100, 1) # ✅ Relative growth
             vol_multiple = round(today['Volume'] / prev_10['Volume'].max(), 1)
             creek = prev_10['High'].max()
             entry = creek * 1.001
@@ -101,7 +127,7 @@ for stock in stocks:
                     else: status = "BREAKOUT_SMALL"
 
                 min_low_15d = future_data['Low'].min()
-                if min_low_15d < sl2 * 0.98 and status == "INTACT":
+                if min_low_15d < sl2_low * 0.98 and status == "INTACT":
                     status = "FAKEOUT"
 
             all_signals.append({
@@ -111,54 +137,51 @@ for stock in stocks:
                 'Creek': round(creek, 2),
                 'HH%': hh_pct,
                 'HL%': hl_pct,
-                'SH1': round(sh1, 2),
-                'SH2': round(sh2, 2),
-                'SL1': round(sl1, 2),
-                'SL2': round(sl2, 2),
+                'SwingGrow%': swing_growth, # ✅ Naya column
+                'SH1_C': round(sh1_close, 2),
+                'SH2_C': round(sh2_close, 2),
+                'SL1_C': round(sl1_close, 2),
+                'SL2_C': round(sl2_close, 2),
                 'Vol_x': vol_multiple,
                 'Status': status,
                 'Max%': max_profit,
                 'Days': days_to_breakout if days_to_breakout > 0 else "-"
             })
-            print(f"💎 {signal_date.date()} | {stock} | {status} {max_profit}%")
+            print(f"💎 {signal_date.date()} | {stock} | HH:{hh_pct}% HL:{hl_pct}% Swing:{swing_growth}% | {status} {max_profit}%")
 
         time.sleep(0.05)
-    except: pass
+    except Exception as e:
+        print(f"Error {stock}: {str(e)[:50]}")
 
-# OUTPUT - RECENT DATE FIRST
+# OUTPUT - RECENT FIRST
 try: ws_output = sh.worksheet("WyckoffSignals")
 except: ws_output = sh.add_worksheet(title="WyckoffSignals", rows=5000, cols=20)
 
 ws_output.clear()
 if all_signals:
     df_out = pd.DataFrame(all_signals)
+    df_out = df_out.replace([np.inf, -np.inf], np.nan)
+    df_out = df_out.fillna('')
     df_out['Date'] = pd.to_datetime(df_out['Date'])
-    df_out = df_out.sort_values('Date', ascending=False) # ✅ RECENT UPAR
+    df_out = df_out.sort_values('Date', ascending=False)
 
-    # OVERALL SUMMARY
     total = len(df_out)
     breakout = len(df_out[df_out['Status'] == 'BREAKOUT'])
-    breakout_weak = len(df_out[df_out['Status'] == 'BREAKOUT_WEAK'])
-    breakout_small = len(df_out[df_out['Status'] == 'BREAKOUT_SMALL'])
     fakeout = len(df_out[df_out['Status'] == 'FAKEOUT'])
-    intact = len(df_out[df_out['Status'] == 'INTACT'])
 
     final_payload = [
-        ["ZIGZAG 6% WYCKOFF - RECENT FIRST", ""],
-        ["Rule: 6% Swing HH+HL + Vol>10D MaxVol + High<10D High", ""],
+        ["ZIGZAG 6% + RELATIVE SWING", ""],
+        ["Rule: Close HH+HL + Swing Bada + Vol>10D MaxVol + High<10D High", ""],
         ["Period", f"{start_date.date()} to {end_date.date()}"],
         ["Total Signals", total],
         ["Breakout 6%+", breakout],
-        ["Breakout 3-6%", breakout_weak],
-        ["Breakout 0-3%", breakout_small],
         ["Fakeout", fakeout],
-        ["Intact", intact],
         ["Success Rate 6%+", f"{round(breakout/total*100,1)}%" if total > 0 else "0%"],
+        ["Avg Swing Growth", f"{round(df_out['SwingGrow%'].mean(),1)}%"],
         ["", ""],
     ]
 
-    # DATE WISE - RECENT FIRST
-    unique_dates = df_out['Date'].dt.strftime('%Y-%m-%d').unique() # Already sorted
+    unique_dates = df_out['Date'].dt.strftime('%Y-%m-%d').unique()
 
     for date_str in unique_dates:
         date_df = df_out[df_out['Date'].dt.strftime('%Y-%m-%d') == date_str]
@@ -168,12 +191,12 @@ if all_signals:
         d_success = round(d_breakout/d_total*100,1) if d_total > 0 else 0
 
         final_payload.append([f"DATE: {date_str}", f"Total: {d_total} | Breakout: {d_breakout} | Fakeout: {d_fakeout} | Success: {d_success}%"])
-        final_payload.append(["Stock", "Close", "Creek", "HH%", "HL%", "Vol_x", "Status", "Max%", "Days"])
+        final_payload.append(["Stock", "Close", "Creek", "HH%", "HL%", "SwingGrow%", "SH1_C", "SH2_C", "Vol_x", "Status", "Max%", "Days"])
 
         for _, row in date_df.iterrows():
             final_payload.append([
-                row['Stock'], row['Close'], row['Creek'], row['HH%'], row['HL%'],
-                row['Vol_x'], row['Status'], row['Max%'], row['Days']
+                row['Stock'], row['Close'], row['Creek'], row['HH%'], row['HL%'], row['SwingGrow%'],
+                row['SH1_C'], row['SH2_C'], row['Vol_x'], row['Status'], row['Max%'], row['Days']
             ])
         final_payload.append(["", ""])
 
