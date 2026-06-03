@@ -16,9 +16,13 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. DATE SETUP - A1 CELL ME DATE DAL: 2026-06-02 00:00:00
+# 2. DATE SETUP - AUTO FORMAT DETECT ✅
 date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
-ref_date = datetime.strptime(date_raw, '%Y-%m-%d')
+try:
+    ref_date = datetime.strptime(date_raw, '%Y-%m-%d')
+except ValueError:
+    ref_date = datetime.strptime(date_raw, '%d/%m/%Y')
+
 end_date = ref_date
 start_date = ref_date - timedelta(days=45)
 print(f"Backtest Period: {start_date.date()} to {end_date.date()}")
@@ -47,56 +51,50 @@ for i, stock in enumerate(stocks):
 
             # ===== STAGE 1: 10 DIN NIKAL DO, USKE PEHLE 20 DIN KA STRUCTURE =====
             if j < 30: continue
-            structure_window = df.iloc[j-30:j-10] # Day -30 se Day -11 tak
+            structure_window = df.iloc[j-30:j-10]
             if len(structure_window) < 20: continue
 
             # ===== STAGE 2A: SWING HIGH HIGHER BAN RAHA KYA =====
-            first_half = structure_window.iloc[:10] # Day -30 to -21
-            second_half = structure_window.iloc[10:] # Day -20 to -11
+            first_half = structure_window.iloc[:10]
+            second_half = structure_window.iloc[10:]
             swing_high_1 = first_half['High'].max()
             swing_high_2 = second_half['High'].max()
-            if swing_high_2 <= swing_high_1 * 1.005: continue # 0.5% se kam = Flat
+            if swing_high_2 <= swing_high_1 * 1.005: continue
 
             # ===== STAGE 2B: SWING LOW HIGHER BAN RAHA KYA =====
             swing_low_1 = first_half['Low'].min()
             swing_low_2 = second_half['Low'].min()
-            if swing_low_2 <= swing_low_1 * 1.005: continue # HL nahi ban raha
+            if swing_low_2 <= swing_low_1 * 1.005: continue
 
             # ===== STAGE 2C: CLOSE BASIS - ACCUMULATION CANDLE =====
             green_days = (structure_window['Close'] > structure_window['Open']).sum()
-            if green_days < 10: continue # 20 me se 10 green nahi = Distribution
+            if green_days < 10: continue
 
             # ===== STAGE 3: LAST 10 DIN FOOTPRINT CHECK =====
             prev_10 = df.iloc[j-10:j]
             ten_day_high = prev_10['High'].max()
             ten_day_max_vol = prev_10['Volume'].max()
-
-            # Footprint 1: Operator bech nahi raha - Naya high nahi banaya
             if today['High'] >= ten_day_high: continue
-
-            # Footprint 2: Operator khareed raha - Volume bomb
             if today['Volume'] <= ten_day_max_vol: continue
 
             # ===== STAGE 4: LIQUIDITY + RS CHECK =====
             avg_vol_50 = df['Volume'].iloc[j-50:j].mean()
-            if avg_vol_50 < 300000: continue # 3L shares min
+            if avg_vol_50 < 300000: continue
             vol_multiple = today['Volume'] / avg_vol_50
-            if vol_multiple < 2.0: continue # 2x volume min
+            if vol_multiple < 2.0: continue
 
-            # RS Positive hona chahiye
             nifty_idx = nifty_close.index.get_indexer([df.index[j]], method='nearest')[0]
             if nifty_idx < 63: continue
             nifty_ret = nifty_close.iloc[nifty_idx] / nifty_close.iloc[nifty_idx-63] - 1
             stock_ret = today['Close'] / df['Close'].iloc[j-63] - 1
             rs_rating = (stock_ret - nifty_ret) * 100
-            if rs_rating < 0: continue # Negative RS = Reject
+            if rs_rating < 0: continue
 
             # ===== SAB PASS ✅ WYCKOFF SIGNAL BANAO =====
             signal_date = today.name
             creek = ten_day_high
             entry = creek * 1.001
 
-            # Structure stats for info
             structure_hh = round((swing_high_2/swing_high_1 - 1) * 100, 1)
             structure_hl = round((swing_low_2/swing_low_1 - 1) * 100, 1)
             base_high = structure_window['High'].max()
@@ -120,7 +118,6 @@ for i, stock in enumerate(stocks):
                         else: status = "BREAKOUT_SMALL"
                         break
 
-                # SL check - Structure ka low tod diya kya
                 min_low_15d = future_data['Low'].min()
                 if min_low_15d < swing_low_2 * 0.98 and status == "INTACT":
                     status = "FAKEOUT"
