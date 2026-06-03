@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== SPRING FINDER V2: BASE + VSA + CLIMAX FILTER ===")
+print("=== SPRING FINDER V4: EOD GTT READY + ENTRY SIGNALS ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -31,13 +31,13 @@ if ref_date is None:
     raise ValueError(f"A1 me date format samajh nahi aaya: {date_raw}. Use YYYY-MM-DD ya DD/MM/YYYY")
 
 date_str = ref_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str} | + 10 Days Back Check")
+print(f"Reference Date: {date_str} | ONLY CREEK INTACT BASES + GTT LEVELS")
 
-# 3. VSA + BASE DETECTION FUNCTION - FIXED
-def analyze_base_context(df, end_date, window=22, max_range_pct=15):
+# 3. VSA + BASE DETECTION FUNCTION - CREEK INTACT ONLY
+def analyze_base_context(df, end_date, window=22, max_range_pct=10): # CHANGE 1: 15 se 10 kiya
     """
     end_date tak ka data leke pichle 22 din me base dhoondo
-    Ab Buying Climax + 52W High filter ke saath
+    BREAKOUT WALE REJECT - SIRF FORMING BASE JINKA CREEK INTACT HO
     """
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 100:
@@ -106,19 +106,16 @@ def analyze_base_context(df, end_date, window=22, max_range_pct=15):
         else:
             base_type = 'Weak Base'
 
-        # BREAKDOWN/BREAKOUT CHECK
+        # BREAKDOWN/BREAKOUT CHECK - BREAKOUT HO GAYA TO REJECT ✅
         df_after_base = df_recent.iloc[i+20:]
         if df_after_base.empty:
             status = f'Forming: {base_type}'
-            breakout_date = None
         elif df_after_base['Close'].min() < base_low * 0.98:
-            return None
+            return None # Breakdown ho gaya
         elif df_after_base['Close'].max() > base_high:
-            status = f'Breakout: {base_type}'
-            breakout_date = df_after_base[df_after_base['Close'] > base_high].index[0]
+            return None # CREEK TUT GAYA - REJECT KAR DO ✅
         else:
             status = f'Forming: {base_type}'
-            breakout_date = None
 
         return {
             'base_high': base_high,
@@ -131,8 +128,8 @@ def analyze_base_context(df, end_date, window=22, max_range_pct=15):
             'rally_pct': rally_pct,
             'vol_ratio': vol_ratio,
             'spring_exists': spring_exists,
-            'breakout_date': breakout_date,
-            'distance_from_52w_high_%': round(distance_from_high, 1)
+            'distance_from_52w_high_%': round(distance_from_high, 1),
+            'spring_low': spring_low if spring_exists else base_low
         }
     return None
 
@@ -180,41 +177,42 @@ for i, stock in enumerate(stocks):
 
             print(f" ✅ {base_info['status']} | Range: {base_info['range_pct']:.1f}% | 52W_High_Dist: {base_info['distance_from_52w_high_%']}%")
 
-            # 7. SPRING DHOONDO - OPTIONAL CONTEXT
-            df_check = df[df.index <= check_date].iloc[:-2]
-            spring_low, spring_date = None, None
-            if len(df_check) > 20:
-                df_check_rev = df_check.iloc[::-1]
-                for idx, row in df_check_rev.iterrows():
-                    current_low = row['Low']
-                    after_idx = df.index.get_loc(idx) + 1
-                    df_after = df.iloc[after_idx:df.index.get_loc(check_date)+1]
-                    if df_after.empty: continue
-                    if df_after['Close'].min() > current_low:
-                        spring_low = current_low
-                        spring_date = idx
-                        break
+            # CHANGE 2: ENTRY LOGIC ADD KIYA ✅
+            breakout_level = base_info['base_high'] * 1.005 # Creek + 0.5% buffer
+            stop_loss = base_info['spring_low'] * 0.98 # Spring low se 2% neeche
+            risk_pct = round((last_candle['Close'] - stop_loss) / last_candle['Close'] * 100, 1)
+
+            # VOLUME CHECK: Aaj ka vol 50-day avg se 1.5x hai?
+            vol_ok = last_candle['Volume'] > avg_vol * 1.5
+            dist_to_creek = round((base_info['base_high'] - last_candle['Close'])/last_candle['Close']*100, 1)
+
+            # ENTRY STATUS
+            if dist_to_creek <= 1 and vol_ok:
+                entry_status = "BUY NOW"
+            elif dist_to_creek <= 3:
+                entry_status = "ALERT LAGAO"
+            else:
+                entry_status = "WATCH"
 
             signals.append({
                 'Stock': stock,
                 'Check_Date': check_date.strftime('%d/%m/%Y'),
-                'Data_Till': actual_last_date.strftime('%d/%m/%Y'),
-                'Base_Start': base_info['base_start_date'].strftime('%d/%m/%Y'),
-                'Base_End': base_info['base_end_date'].strftime('%d/%m/%Y'),
-                'Base_Status': base_info['status'],
                 'Base_Type': base_info['base_type'],
+                'Base_Status': base_info['status'],
                 'Base_Low': round(base_info['base_low'], 2),
                 'Base_Top': round(base_info['base_high'], 2),
+                'CMP': round(last_candle['Close'], 2),
+                'Distance_To_Top_%': dist_to_creek,
+                'Entry_Level': round(breakout_level, 2), # GTT Trigger ✅
+                'Stop_Loss': round(stop_loss, 2), # GTT SL ✅
+                'Risk_%': risk_pct,
+                'Entry_Status': entry_status, # NAYA COLUMN ✅
+                'Volume_OK': 'Yes' if vol_ok else 'No', # NAYA COLUMN ✅
+                'Spring_Present': 'Yes' if base_info['spring_exists'] else 'No',
                 'Base_Range_%': round(base_info['range_pct'], 1),
                 'From_52W_High_%': base_info['distance_from_52w_high_%'],
                 'Rally_Before_%': round(base_info['rally_pct'], 1),
                 'Up/Down_Vol_Ratio': round(base_info['vol_ratio'], 2),
-                'Spring_Present': 'Yes' if base_info['spring_exists'] else 'No',
-                'Spring_Date': spring_date.strftime('%d/%m/%Y') if spring_date else 'None',
-                'Spring_Low': round(spring_low, 2) if spring_low else 0,
-                'Breakout_Date': base_info['breakout_date'].strftime('%d/%m/%Y') if base_info['breakout_date'] else 'Not Yet',
-                'CMP': round(last_candle['Close'], 2),
-                'Distance_To_Top_%': round((base_info['base_high'] - last_candle['Close'])/last_candle['Close']*100, 1),
                 'Avg_Vol_Lakh': round(avg_vol/100000, 1)
             })
             break
@@ -231,11 +229,16 @@ except:
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    df_out['Priority'] = df_out['Base_Type'].apply(lambda x: 1 if 'Re-Accumulation' in x else 2 if 'Accumulation' in x else 3)
-    df_out = df_out.sort_values(['Priority', 'Base_Start'])
-    df_out = df_out.drop('Priority', axis=1)
+    # CHANGE 3: SORTING BADLA ✅
+    status_priority = {'BUY NOW': 1, 'ALERT LAGAO': 2, 'WATCH': 3}
+    df_out['Status_Priority'] = df_out['Entry_Status'].map(status_priority)
+    df_out['Base_Priority'] = df_out['Base_Type'].apply(lambda x: 1 if 'Re-Accumulation' in x else 2)
+    df_out = df_out.sort_values(['Status_Priority', 'Base_Priority', 'Distance_To_Top_%'])
+    df_out = df_out.drop(['Status_Priority', 'Base_Priority'], axis=1)
+
     ws_output.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-    print(f"\n=== DONE: {len(signals)} SETUPS | Re-Accumulation Priority ===")
+    print(f"\n=== DONE: {len(signals)} SETUPS | TOP = BUY NOW ===")
+    print(f"BUY NOW Count: {len(df_out[df_out['Entry_Status']=='BUY NOW'])}")
 else:
-    ws_output.update([["Ref_Date", "Status"], [date_str, "No Setups Found"]])
+    ws_output.update([["Ref_Date", "Status"], [date_str, "No Forming Setups Found - Sab breakout ho gaye ya weak hain"]])
     print("\n=== DONE: 0 SETUPS ===")
