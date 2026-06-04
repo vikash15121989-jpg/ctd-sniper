@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== WYCKOFF V9.3 BACKTEST: PICHLE 1 SAAL ME KITNE SETUP BANE ===")
+print("=== WYCKOFF V10.0: GIRAAVAT KE BAAD BASE + ACCUMULATION + VCP ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -16,12 +16,23 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. BACKTEST DATES - PICHLE 1 SAAL
-end_date = datetime.now()
-start_date = end_date - timedelta(days=365)
-backtest_dates = pd.date_range(start=start_date, end=end_date, freq='B') # B = Business days
-print(f"Backtest Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-print(f"Total Trading Days: {len(backtest_dates)}")
+# 2. A1 DATE HANDLING
+date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
+date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
+
+ref_date = None
+for fmt in date_formats:
+    try:
+        ref_date = datetime.strptime(date_raw, fmt)
+        break
+    except ValueError:
+        continue
+
+if ref_date is None:
+    raise ValueError(f"A1 me date format galat: {date_raw}")
+
+date_str = ref_date.strftime('%Y-%m-%d')
+print(f"Reference Date: {date_str} | RULE: Giraavat ke baad Base + Accumulation")
 
 # 3. NIFTY DATA FOR RS RATING
 nifty_df = yf.download("^NSEI", period="2y", progress=False, auto_adjust=True)
@@ -29,7 +40,7 @@ if isinstance(nifty_df.columns, pd.MultiIndex):
     nifty_df.columns = nifty_df.columns.get_level_values(0)
 nifty_close = nifty_df['Close']
 
-# 4. VCP DETECTOR FUNCTION
+# 4. VCP DETECTOR
 def detect_vcp(range_df):
     if len(range_df) < 30:
         return "No VCP", 0, False
@@ -59,153 +70,93 @@ def detect_vcp(range_df):
     else:
         return "No VCP", 1, False
 
-# 5. RANGE HUNTER V9.3 - SAME LOGIC
-def analyze_base_context(df, end_date):
+# 5. BASE HUNTER V10.0 - GIRAAVAT KE BAAD ✅
+def find_base_after_decline(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 100:
         return None
 
-    # BUYING CLIMAX REJECT
-    recent_30 = df_till_date.tail(30)
-    if len(recent_30) >= 20:
-        vol_avg_50 = df_till_date['Volume'].tail(50).mean()
-        high_20d = recent_30['High'].rolling(20).max()
-        climax_check = recent_30[
-            (recent_30['Volume'] > vol_avg_50 * 2.0) &
-            (recent_30['High'] >= high_20d * 0.98) &
-            (recent_30['Close'] < recent_30['High'] * 0.97) &
-            (recent_30['Close'] < recent_30['Open'])
-        ]
-        if not climax_check.empty:
-            return None
-
-    df_recent = df_till_date.tail(250).copy()
-
-    # RULE-1: LAST 10 DIN ME RANGE BANI HAI?
-    last_10 = df_recent.tail(10)
-    recent_high = last_10['High'].max()
-    recent_low = last_10['Low'].min()
-    recent_range_pct = (recent_high - recent_low) / recent_low * 100
-
-    if recent_range_pct > 20 or recent_range_pct < 5:
-        return None
-
-    # RULE-2: YE RANGE LOW KE PAAS BANI HAI?
+    # RULE-1: GIRAAVAT CHECK - 52W High se 20%+ neeche hona chahiye ✅
     yearly_high = df_till_date['High'].tail(252).max()
-    yearly_low = df_till_date['Low'].tail(252).min()
-    location_pct = (recent_low - yearly_low) / (yearly_high - yearly_low) * 100 if yearly_high!= yearly_low else 50
+    last_close = df_till_date['Close'].iloc[-1]
+    decline_pct = (yearly_high - last_close) / yearly_high * 100
 
-    if location_pct > 40:
+    if decline_pct < 20: # 20% se kam gira to reject - rally me hai
         return None
 
-    # RULE-3: IS RANGE KO PICHE EXPAND KARO
-    support_zone = recent_low * 0.98
-    resistance_zone = recent_high * 1.02
+    # RULE-2: LAST 60 DIN ME SABSE TIGHT RANGE DHUNDO ✅
+    df_recent = df_till_date.tail(200).copy() # 200 din me dekho
+    best_base = None
+    best_length = 0
 
-    range_start_idx = len(df_recent) - 10
+    # 20 se 150 din tak ki har possible range check karo
+    for length in range(150, 19, -5): # 150D se 20D tak, badi range pehle
+        if len(df_recent) < length: continue
 
-    for i in range(len(df_recent) - 11, -1, -1):
-        candle = df_recent.iloc[i]
-        if candle['Low'] < support_zone * 0.90 or candle['High'] > resistance_zone * 1.10:
-            break
-        range_start_idx = i
+        range_df = df_recent.tail(length)
+        base_high = range_df['High'].max()
+        base_low = range_df['Low'].min()
+        range_pct = (base_high - base_low) / base_low * 100
 
-    full_range = df_recent.iloc[range_start_idx:]
-    base_high = full_range['High'].max()
-    base_low = full_range['Low'].min()
-    base_length = len(full_range)
+        # 5-25% range chahiye
+        if range_pct < 5 or range_pct > 25: continue
 
-    if base_length < 20:
+        # Daily volatility check
+        daily_range = (range_df['High'] - range_df['Low']) / range_df['Close'] * 100
+        if daily_range.mean() > 3.5: continue
+
+        # ACCUMULATION CHECK - COMPULSORY ✅
+        vol_first_3rd = range_df['Volume'].iloc[:length//3].mean()
+        vol_last_3rd = range_df['Volume'].iloc[-length//3:].mean()
+        vol_dry_ratio = vol_last_3rd / vol_first_3rd if vol_first_3rd > 0 else 1
+
+        up_vol = range_df[range_df['Close'] > range_df['Open']]['Volume'].sum()
+        down_vol = range_df[range_df['Close'] < range_df['Open']]['Volume'].sum()
+        vol_ratio = up_vol / down_vol if down_vol > 0 else 99
+
+        is_accumulation = vol_ratio >= 1.15 and vol_dry_ratio <= 0.80
+        if not is_accumulation: continue # Accumulation nahi to reject
+
+        # VCP CHECK - Bonus
+        vcp_status, vcp_strength, has_vcp = detect_vcp(range_df)
+
+        # 52W Location
+        yearly_low = df_till_date['Low'].tail(252).min()
+        location_pct = (base_low - yearly_low) / (yearly_high - yearly_low) * 100 if yearly_high!= yearly_low else 50
+
+        # Best base mil gaya - sabse lamba
+        best_base = {
+            'base_high': base_high, 'base_low': base_low, 'base_length': length,
+            'range_pct': range_pct, 'vol_ratio': vol_ratio, 'vol_dry_ratio': vol_dry_ratio,
+            'vcp_status': vcp_status, 'vcp_strength': vcp_strength, 'has_vcp': has_vcp,
+            'location_pct': location_pct, 'decline_pct': decline_pct,
+            'last_close': last_close
+        }
+        best_length = length
+        break # Sabse lamba mil gaya, ruk jao
+
+    if best_base is None:
         return None
 
-    range_pct = (base_high - base_low) / base_low * 100
-    if range_pct > 25: return None
+    # SCORE CALCULATION
+    length_bonus = best_base['base_length'] * 0.5 # 150D = 75 points
+    tightness_score = 30 - best_base['range_pct']
+    demand_score = best_base['vol_ratio'] * 15
+    dry_score = (1 - best_base['vol_dry_ratio']) * 25
+    vcp_bonus = best_base['vcp_strength'] * 15
+    location_bonus = max(0, 15 - best_base['location_pct'] * 0.3)
+    decline_bonus = best_base['decline_pct'] * 0.2 # 50% gira = 10 points
 
-    # RULE-4: STRONG ACCUMULATION COMPULSORY
-    daily_range = (full_range['High'] - full_range['Low']) / full_range['Close'] * 100
-    if daily_range.mean() > 3.5: return None
+    breakout_score = (length_bonus + tightness_score + demand_score +
+                    dry_score + vcp_bonus + location_bonus + decline_bonus)
 
-    vol_first_3rd = full_range['Volume'].iloc[:base_length//3].mean()
-    vol_last_3rd = full_range['Volume'].iloc[-base_length//3:].mean()
-    vol_dry_ratio = vol_last_3rd / vol_first_3rd if vol_first_3rd > 0 else 1
+    best_base['breakout_score'] = breakout_score
+    return best_base
 
-    up_vol = full_range[full_range['Close'] > full_range['Open']]['Volume'].sum()
-    down_vol = full_range[full_range['Close'] < full_range['Open']]['Volume'].sum()
-    vol_ratio = up_vol / down_vol if down_vol > 0 else 99
-
-    is_accumulation = vol_ratio >= 1.15 and vol_dry_ratio <= 0.80
-    if not is_accumulation:
-        return None
-
-    vsa_type = 'Accumulation'
-
-    # RULE-5: VCP CHECK
-    vcp_status, vcp_strength, has_vcp = detect_vcp(full_range)
-
-    # RULE-6: SPRING CHECK
-    df_after_base = df_recent.iloc[range_start_idx + base_length:]
-    last_close = df_recent.iloc[-1]['Close']
-    creek_high = base_high
-
-    if len(df_after_base) < 3:
-        spring_low = base_low
-        spring_type = "No Spring Yet"
-        spring_strength = 0
-    else:
-        spring_low = df_after_base['Low'].min()
-        creek_high = df_after_base['High'].max() if not df_after_base.empty else base_high
-
-        if len(df_after_base) >= 5:
-            post_range_high = df_after_base['High'].head(5).max()
-            if last_close < post_range_high * 0.92:
-                return None
-
-        if spring_low >= base_low * 0.99:
-            spring_type = "No Spring"
-            spring_strength = 1
-        elif spring_low < base_low * 0.99 and last_close >= base_low * 0.98:
-            spring_type = "Spring Reclaim"
-            spring_strength = 3
-        elif spring_low < base_low * 0.99 and last_close < base_low * 0.98:
-            return None
-        else:
-            spring_type = "Weak Spring"
-            spring_strength = 2
-
-        if spring_low < base_low * 0.85: return None
-        if last_close > creek_high * 1.01: return None
-
-    # RULE-7: RANKING SCORE
-    dist_to_creek_pct = (creek_high - last_close) / last_close * 100
-    tightness_score = 30 - range_pct
-    demand_score = vol_ratio * 15
-    dry_score = (1 - vol_dry_ratio) * 25
-    spring_bonus = spring_strength * 10
-    vcp_bonus = vcp_strength * 15
-    proximity_score = max(0, 25 - dist_to_creek_pct * 5)
-    length_bonus = base_length * 0.3
-    location_bonus = max(0, 15 - location_pct * 0.3)
-
-    breakout_score = (tightness_score + demand_score + dry_score +
-                    spring_bonus + vcp_bonus + proximity_score + length_bonus +
-                    location_bonus)
-
-    return {
-        'base_high': base_high, 'base_low': base_low, 'creek_high': creek_high,
-        'base_length': base_length, 'range_pct': range_pct, 'vsa_type': vsa_type,
-        'vcp_status': vcp_status, 'vol_ratio': vol_ratio, 'vol_dry_ratio': vol_dry_ratio,
-        'spring_low': spring_low, 'spring_type': spring_type,
-        'dist_to_creek_pct': dist_to_creek_pct, 'location_pct': location_pct,
-        'breakout_score': breakout_score, 'has_vcp': has_vcp, 'date': end_date.strftime('%Y-%m-%d')
-    }
-
-# 6. BACKTEST LOOP - HAR STOCK HAR DIN ✅
+# 6. MAIN LOOP
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
-all_signals = []
-
-print(f"\nScanning {len(stocks)} stocks for {len(backtest_dates)} days...")
-print("Ye 30-60 min chalega. Wait kar...")
+signals = []
 
 for i, stock in enumerate(stocks):
     print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
@@ -213,71 +164,88 @@ for i, stock in enumerate(stocks):
         df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 200: continue
+        if len(df) < 150: continue
 
         df['Vol_50'] = df['Volume'].rolling(50).mean()
-        df['EMA200'] = df['Close'].ewm(span=200).mean()
+        last_candle = df.iloc[-1]
+        avg_vol = last_candle['Vol_50']
+        avg_turnover = avg_vol * last_candle['Close']
 
-        stock_signals = 0
-        # Har 10 din me ek baar check karo - warna 1 saal me 250*2362 = 6 lakh loop ho jayega
-        for test_date in backtest_dates[::10]: # Every 10th trading day
-            if test_date not in df.index: continue
+        if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000:
+            print(f" ❌ Liquidity low")
+            continue
 
-            row = df.loc[test_date]
-            avg_vol = row['Vol_50']
-            avg_turnover = avg_vol * row['Close']
+        # 200 EMA filter hata diya - neeche wale stock bhi chalenge
+        base_info = find_base_after_decline(df, ref_date)
+        if base_info is None:
+            print(f" ❌ Giraavat ke baad Base+Accumulation nahi")
+            continue
 
-            if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000:
-                continue
+        entry_level = base_info['base_high'] # Creek
+        support_level = base_info['base_low']
+        stop_loss = support_level * 0.95 # Base low se 5% neeche
+        risk_pct = round((entry_level - stop_loss) / entry_level * 100, 1)
+        if risk_pct > 20: continue
 
-            if row['Close'] < row['EMA200'] * 0.95:
-                continue
+        target_15pct = entry_level * 1.15
+        target_30pct = entry_level * 1.30
+        rr = round((target_15pct - entry_level) / (entry_level - stop_loss), 1)
 
-            base_info = analyze_base_context(df, test_date)
-            if base_info is None:
-                continue
+        dist_to_entry = (entry_level - base_info['last_close']) / base_info['last_close'] * 100
 
-            setup_type = "ACCUM"
-            if base_info['has_vcp']: setup_type += "+VCP"
+        # STATUS - Rally se matlab nahi ✅
+        if base_info['has_vcp']:
+            entry_status = "ACCUM+VCP"
+        else:
+            entry_status = "ACCUM-BASE"
 
-            all_signals.append({
-                'Date': base_info['date'],
-                'Stock': stock,
-                'Setup_Type': setup_type,
-                'VCP_Status': base_info['vcp_status'],
-                'Range_Days': base_info['base_length'],
-                'Resistance_Creek': round(base_info['creek_high'], 2),
-                'Support_Base': round(base_info['base_low'], 2),
-                'Spring_Type': base_info['spring_type'],
-                'Vol_Ratio': round(base_info['vol_ratio'], 2),
-                'Vol_Dry_%': round((1-base_info['vol_dry_ratio'])*100, 0),
-                'Location_52W_%': round(base_info['location_pct'], 0),
-                'Rank_Score': round(base_info['breakout_score'], 0)
-            })
-            stock_signals += 1
+        print(f" ✅ {base_info['base_length']}D Base | -{base_info['decline_pct']:.0f}% Gira | {base_info['vcp_status']} | Score:{base_info['breakout_score']:.0f}")
 
-        print(f" ✅ {stock}: {stock_signals} setups found in 1 year")
-        time.sleep(0.2)
+        signals.append({
+            'Rank_Score': round(base_info['breakout_score'], 0),
+            'Stock': stock,
+            'Setup_Type': entry_status,
+            'VCP_Status': base_info['vcp_status'],
+            'Base_Days': base_info['base_length'],
+            'Decline_52W_%': round(base_info['decline_pct'], 0),
+            'Resistance_Creek': round(entry_level, 2),
+            'Support_Base': round(support_level, 2),
+            'CMP': round(base_info['last_close'], 2),
+            'Dist_to_Creek_%': round(dist_to_entry, 1),
+            'Stop_Loss': round(stop_loss, 2),
+            'Risk_%': risk_pct,
+            'Target_15%': round(target_15pct, 2),
+            'Target_30%': round(target_30pct, 2),
+            'R:R': rr,
+            'Vol_Ratio': round(base_info['vol_ratio'], 2),
+            'Vol_Dry_%': round((1-base_info['vol_dry_ratio'])*100, 0),
+            'Range_%': round(base_info['range_pct'], 1),
+            'Location_52W_%': round(base_info['location_pct'], 0),
+            'AvgVol_Lakh': round(avg_vol/100000, 1)
+        })
+
+        if (i + 1) % 30 == 0:
+            time.sleep(0.3)
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 7. SHEET UPDATE - BACKTEST RESULTS ✅
+# 7. SHEET UPDATE - BADE BASE FIRST ✅
 try:
-    ws_output = sh.worksheet("Backtest_Results")
+    ws_output = sh.worksheet("BaseSetups")
 except:
-    ws_output = sh.add_worksheet(title="Backtest_Results", rows=5000, cols=15)
+    ws_output = sh.add_worksheet(title="BaseSetups", rows=1000, cols=20)
 
 ws_output.clear()
-if all_signals:
-    df_out = pd.DataFrame(all_signals)
-    df_out = df_out.sort_values(['Date', 'Rank_Score'], ascending=[False, False])
+if signals:
+    df_out = pd.DataFrame(signals)
+    # RANKING: 1. Base_Days sabse lamba 2. VCP wala 3. Score
+    df_out = df_out.sort_values(['Base_Days', 'Setup_Type', 'Rank_Score'],
+                                ascending=[False, True, False])
     df_out = df_out.astype(str)
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
-    print(f"\n=== BACKTEST DONE: {len(all_signals)} TOTAL SETUPS IN 1 YEAR ===")
-    print(f"Sheet 'Backtest_Results' me dekh. Har date pe kaunse stock setup diye.")
+    print(f"\n=== DONE: {len(signals)} BASES FOUND | LONGEST FIRST ===")
 else:
-    ws_output.update('A1', [["Status"], ["No setups found in last 1 year"]])
-    print("\n=== BACKTEST DONE: 0 SETUPS IN 1 YEAR ===")
-    print("Agar ye aaye to filter bahut strict hai ya watchlist galat hai.")
+    ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Bases Found"]])
+    print("\n=== DONE: 0 SETUPS ===")
