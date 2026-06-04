@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== WYCKOFF V10.0: GIRAAVAT KE BAAD BASE + ACCUMULATION + VCP ===")
+print("=== WYCKOFF V10.1: GIRAAVAT + BASE + DATES ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -32,9 +32,9 @@ if ref_date is None:
     raise ValueError(f"A1 me date format galat: {date_raw}")
 
 date_str = ref_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str} | RULE: Giraavat ke baad Base + Accumulation")
+print(f"Reference Date: {date_str}")
 
-# 3. NIFTY DATA FOR RS RATING
+# 3. NIFTY DATA
 nifty_df = yf.download("^NSEI", period="2y", progress=False, auto_adjust=True)
 if isinstance(nifty_df.columns, pd.MultiIndex):
     nifty_df.columns = nifty_df.columns.get_level_values(0)
@@ -70,27 +70,25 @@ def detect_vcp(range_df):
     else:
         return "No VCP", 1, False
 
-# 5. BASE HUNTER V10.0 - GIRAAVAT KE BAAD ✅
+# 5. BASE HUNTER V10.1 - DATE KE SAATH ✅
 def find_base_after_decline(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 100:
         return None
 
-    # RULE-1: GIRAAVAT CHECK - 52W High se 20%+ neeche hona chahiye ✅
+    # RULE-1: GIRAAVAT CHECK - 20%+
     yearly_high = df_till_date['High'].tail(252).max()
     last_close = df_till_date['Close'].iloc[-1]
     decline_pct = (yearly_high - last_close) / yearly_high * 100
 
-    if decline_pct < 20: # 20% se kam gira to reject - rally me hai
+    if decline_pct < 20:
         return None
 
-    # RULE-2: LAST 60 DIN ME SABSE TIGHT RANGE DHUNDO ✅
-    df_recent = df_till_date.tail(200).copy() # 200 din me dekho
+    # RULE-2: LAST 200 DIN ME SABSE LAMBA BASE DHUNDO
+    df_recent = df_till_date.tail(200).copy()
     best_base = None
-    best_length = 0
 
-    # 20 se 150 din tak ki har possible range check karo
-    for length in range(150, 19, -5): # 150D se 20D tak, badi range pehle
+    for length in range(150, 19, -5):
         if len(df_recent) < length: continue
 
         range_df = df_recent.tail(length)
@@ -98,14 +96,12 @@ def find_base_after_decline(df, end_date):
         base_low = range_df['Low'].min()
         range_pct = (base_high - base_low) / base_low * 100
 
-        # 5-25% range chahiye
         if range_pct < 5 or range_pct > 25: continue
 
-        # Daily volatility check
         daily_range = (range_df['High'] - range_df['Low']) / range_df['Close'] * 100
         if daily_range.mean() > 3.5: continue
 
-        # ACCUMULATION CHECK - COMPULSORY ✅
+        # ACCUMULATION CHECK
         vol_first_3rd = range_df['Volume'].iloc[:length//3].mean()
         vol_last_3rd = range_df['Volume'].iloc[-length//3:].mean()
         vol_dry_ratio = vol_last_3rd / vol_first_3rd if vol_first_3rd > 0 else 1
@@ -115,37 +111,39 @@ def find_base_after_decline(df, end_date):
         vol_ratio = up_vol / down_vol if down_vol > 0 else 99
 
         is_accumulation = vol_ratio >= 1.15 and vol_dry_ratio <= 0.80
-        if not is_accumulation: continue # Accumulation nahi to reject
+        if not is_accumulation: continue
 
-        # VCP CHECK - Bonus
         vcp_status, vcp_strength, has_vcp = detect_vcp(range_df)
 
-        # 52W Location
         yearly_low = df_till_date['Low'].tail(252).min()
         location_pct = (base_low - yearly_low) / (yearly_high - yearly_low) * 100 if yearly_high!= yearly_low else 50
 
-        # Best base mil gaya - sabse lamba
+        # BASE KI DATE NIKALO ✅
+        base_start_date = range_df.index[0].strftime('%Y-%m-%d')
+        base_end_date = range_df.index[-1].strftime('%Y-%m-%d')
+
         best_base = {
             'base_high': base_high, 'base_low': base_low, 'base_length': length,
             'range_pct': range_pct, 'vol_ratio': vol_ratio, 'vol_dry_ratio': vol_dry_ratio,
             'vcp_status': vcp_status, 'vcp_strength': vcp_strength, 'has_vcp': has_vcp,
             'location_pct': location_pct, 'decline_pct': decline_pct,
-            'last_close': last_close
+            'last_close': last_close,
+            'base_start_date': base_start_date, # NEW ✅
+            'base_end_date': base_end_date # NEW ✅
         }
-        best_length = length
-        break # Sabse lamba mil gaya, ruk jao
+        break
 
     if best_base is None:
         return None
 
-    # SCORE CALCULATION
-    length_bonus = best_base['base_length'] * 0.5 # 150D = 75 points
+    # SCORE
+    length_bonus = best_base['base_length'] * 0.5
     tightness_score = 30 - best_base['range_pct']
     demand_score = best_base['vol_ratio'] * 15
     dry_score = (1 - best_base['vol_dry_ratio']) * 25
     vcp_bonus = best_base['vcp_strength'] * 15
     location_bonus = max(0, 15 - best_base['location_pct'] * 0.3)
-    decline_bonus = best_base['decline_pct'] * 0.2 # 50% gira = 10 points
+    decline_bonus = best_base['decline_pct'] * 0.2
 
     breakout_score = (length_bonus + tightness_score + demand_score +
                     dry_score + vcp_bonus + location_bonus + decline_bonus)
@@ -172,18 +170,15 @@ for i, stock in enumerate(stocks):
         avg_turnover = avg_vol * last_candle['Close']
 
         if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000:
-            print(f" ❌ Liquidity low")
             continue
 
-        # 200 EMA filter hata diya - neeche wale stock bhi chalenge
         base_info = find_base_after_decline(df, ref_date)
         if base_info is None:
-            print(f" ❌ Giraavat ke baad Base+Accumulation nahi")
             continue
 
-        entry_level = base_info['base_high'] # Creek
+        entry_level = base_info['base_high']
         support_level = base_info['base_low']
-        stop_loss = support_level * 0.95 # Base low se 5% neeche
+        stop_loss = support_level * 0.95
         risk_pct = round((entry_level - stop_loss) / entry_level * 100, 1)
         if risk_pct > 20: continue
 
@@ -193,19 +188,17 @@ for i, stock in enumerate(stocks):
 
         dist_to_entry = (entry_level - base_info['last_close']) / base_info['last_close'] * 100
 
-        # STATUS - Rally se matlab nahi ✅
-        if base_info['has_vcp']:
-            entry_status = "ACCUM+VCP"
-        else:
-            entry_status = "ACCUM-BASE"
+        entry_status = "ACCUM+VCP" if base_info['has_vcp'] else "ACCUM-BASE"
 
-        print(f" ✅ {base_info['base_length']}D Base | -{base_info['decline_pct']:.0f}% Gira | {base_info['vcp_status']} | Score:{base_info['breakout_score']:.0f}")
+        print(f" ✅ {base_info['base_length']}D | {base_info['base_start_date']} to {base_info['base_end_date']} | -{base_info['decline_pct']:.0f}%")
 
         signals.append({
             'Rank_Score': round(base_info['breakout_score'], 0),
             'Stock': stock,
             'Setup_Type': entry_status,
             'VCP_Status': base_info['vcp_status'],
+            'Base_Start': base_info['base_start_date'], # NEW ✅
+            'Base_End': base_info['base_end_date'], # NEW ✅
             'Base_Days': base_info['base_length'],
             'Decline_52W_%': round(base_info['decline_pct'], 0),
             'Resistance_Creek': round(entry_level, 2),
@@ -230,22 +223,21 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 7. SHEET UPDATE - BADE BASE FIRST ✅
+# 7. SHEET UPDATE
 try:
     ws_output = sh.worksheet("BaseSetups")
 except:
-    ws_output = sh.add_worksheet(title="BaseSetups", rows=1000, cols=20)
+    ws_output = sh.add_worksheet(title="BaseSetups", rows=1000, cols=23)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    # RANKING: 1. Base_Days sabse lamba 2. VCP wala 3. Score
     df_out = df_out.sort_values(['Base_Days', 'Setup_Type', 'Rank_Score'],
                                 ascending=[False, True, False])
     df_out = df_out.astype(str)
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
-    print(f"\n=== DONE: {len(signals)} BASES FOUND | LONGEST FIRST ===")
+    print(f"\n=== DONE: {len(signals)} BASES | DATE RANGE ADDED ===")
 else:
     ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Bases Found"]])
     print("\n=== DONE: 0 SETUPS ===")
