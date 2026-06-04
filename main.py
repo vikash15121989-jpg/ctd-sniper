@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== WYCKOFF SPRING FINDER V8.3: LOCATION AGNOSTIC - ONLY VSA ===")
+print("=== WYCKOFF RANGE HUNTER V8.7: RANKED BY BREAKOUT PROBABILITY ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -16,10 +16,9 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. A1 DATE HANDLING
+# 2. DATE
 date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
 date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
-
 ref_date = None
 for fmt in date_formats:
     try:
@@ -27,133 +26,104 @@ for fmt in date_formats:
         break
     except ValueError:
         continue
-
 if ref_date is None:
-    raise ValueError(f"A1 me date format galat: {date_raw}")
-
+    raise ValueError(f"A1 me date galat: {date_raw}")
 date_str = ref_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str} | TOP/MID/BOTTOM SAB BASE ALLOWED")
+print(f"Reference Date: {date_str} | RANKING: High Prob Breakout Upar")
 
-# 3. NIFTY DATA FOR RS RATING
+# 3. NIFTY FOR RS
 nifty_df = yf.download("^NSEI", period="1y", progress=False, auto_adjust=True)
 if isinstance(nifty_df.columns, pd.MultiIndex):
     nifty_df.columns = nifty_df.columns.get_level_values(0)
 nifty_close = nifty_df['Close']
 
-# 4. WYCKOFF VSA - LOCATION FILTER HATA DIYA ✅
-def analyze_base_context(df, end_date):
+# 4. RANGE HUNTER + RANKING SCORE ✅
+def find_clean_range(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
-    if len(df_till_date) < 100:
+    if len(df_till_date) < 50:
         return None
 
-    # BUYING CLIMAX REJECT - SIRF DISTRIBUTION FILTER ✅
-    recent_30 = df_till_date.tail(30)
-    if len(recent_30) >= 20:
-        vol_avg_30 = recent_30['Volume'].mean()
-        high_20d = recent_30['High'].rolling(20).max()
-        climax_check = recent_30[
-            (recent_30['Volume'] > vol_avg_30 * 2.5) &
-            (recent_30['High'] >= high_20d * 0.99) &
-            (recent_30['Close'] < recent_30['High'] * 0.97)
-        ]
-        if not climax_check.empty:
-            return None # Distribution confirmed - Reject
-
-    df_recent = df_till_date.tail(150).copy()
-    base_windows = [15, 22, 35, 50] # Dynamic base length ✅
+    df_recent = df_till_date.tail(250).copy()
+    base_windows = [20, 35, 50, 75, 100, 150, 200]
     best_base = None
 
     for window in base_windows:
-        if len(df_recent) < window + 20: continue
+        if len(df_recent) < window + 10: continue
 
         total_len = len(df_recent)
-        for i in range(max(0, total_len - 80), total_len - window):
+        for i in range(max(0, total_len - 120), total_len - window):
             base_window = df_recent.iloc[i:i+window]
             base_high = base_window['High'].max()
             base_low = base_window['Low'].min()
 
+            # RULE-1: RANGE TIGHT
             range_pct = (base_high - base_low) / base_low * 100
-            max_range_allowed = 8 if window <= 22 else 12
-            if range_pct > max_range_allowed: continue
+            if range_pct > 25 or range_pct < 5: continue
 
-            # VSA 1: VOLATILITY TIGHT
+            # RULE-2: VOLATILITY TIGHT
             daily_range = (base_window['High'] - base_window['Low']) / base_window['Close'] * 100
-            if daily_range.mean() > 3.0: continue
+            if daily_range.mean() > 3.5: continue
 
-            # VSA 2: VOLUME DRY UP
-            mid = window // 2
-            vol_first = base_window['Volume'].iloc[:mid].mean()
-            vol_last = base_window['Volume'].iloc[mid:].mean()
-            if vol_last > vol_first * 0.75: continue
+            # RULE-3: VOLUME DRY UP
+            vol_first_3rd = base_window['Volume'].iloc[:window//3].mean()
+            vol_last_3rd = base_window['Volume'].iloc[-window//3:].mean()
+            vol_dry_ratio = vol_last_3rd / vol_first_3rd if vol_first_3rd > 0 else 1
+            if vol_dry_ratio > 0.80: continue
 
-            # RALLY PCT - SIRF CLASSIFICATION KE LIYE, REJECT NAHI ✅
-            lookback_60 = df_recent.iloc[max(0, i-60):i]
-            if lookback_60.empty: continue
-            swing_low_60 = lookback_60['Low'].min()
-            rally_pct = (base_low - swing_low_60) / swing_low_60 * 100
-
-            # 52W DATA - SIRF INFO KE LIYE, REJECT NAHI ✅
-            yearly_high = df_till_date['High'].tail(252).max()
-            yearly_low = df_till_date['Low'].tail(252).min()
-            distance_from_high = (yearly_high - base_high) / yearly_high * 100
-            distance_from_low = (base_low - yearly_low) / yearly_low * 100
-            # LOCATION FILTER HATA DIYA - Top pe bhi chalega ✅
-
-            # VSA 3: UP/DOWN VOLUME RATIO - MANDATORY
+            # RULE-4: UP/DOWN VOLUME RATIO
             up_vol = base_window[base_window['Close'] > base_window['Open']]['Volume'].sum()
             down_vol = base_window[base_window['Close'] < base_window['Open']]['Volume'].sum()
             vol_ratio = up_vol / down_vol if down_vol > 0 else 99
-            if vol_ratio < 1.1: continue # Demand nahi to reject
+            if vol_ratio < 1.15: continue
 
-            # VSA 4: SPRING - MANDATORY
+            # RULE-5: SPRING CHECK - BREAKDOWN RECLAIM ALLOWED ✅
             df_after_base = df_recent.iloc[i+window:]
             if len(df_after_base) < 3: continue
-            df_30d_after = df_after_base.head(30)
-            spring_low = df_30d_after['Low'].min()
-            spring_exists = spring_low <= base_low * 1.02 and spring_low >= base_low * 0.93
-            if not spring_exists: continue
 
-            spring_idx = df_30d_after['Low'].idxmin()
-            after_spring = df_30d_after[df_30d_after.index > spring_idx]
-            if len(after_spring) >= 1:
-                if after_spring['Close'].iloc[-1] < base_low * 0.97: # 3% neeche tak allow
-                    continue
-
-            # CLASSIFICATION - RALLY % SE, LOCATION SE NAHI ✅
-            if rally_pct < 25 and vol_ratio > 1.2:
-                base_type = 'Accumulation' # Naye low ya beech me, top pe bhi
-            elif rally_pct >= 25 and rally_pct < 200 and vol_ratio > 1.3:
-                base_type = 'Re-Accumulation' # Bhaag ke baad, kahin bhi
-            else:
-                continue # 200%+ extended ya vol_ratio kam
-
-            # CREEK CHECK - FIXED ✅
-            creek_high = df_after_base['High'].max() if not df_after_base.empty else base_high
+            spring_low = df_after_base['Low'].min()
             last_close = df_after_base.iloc[-1]['Close']
+            creek_high = df_after_base['High'].max() if not df_after_base.empty else base_high
 
-            if len(df_after_base) >= 14:
-                atr = (df_after_base['High'] - df_after_base['Low']).rolling(14).mean().iloc[-1]
+            # Spring logic
+            if spring_low >= base_low * 0.99:
+                spring_type = "No Spring"
+                spring_strength = 1
+            elif spring_low < base_low * 0.99 and last_close >= base_low * 0.98:
+                spring_type = "Spring Reclaim"
+                spring_strength = 3 # Strongest
+            elif spring_low < base_low * 0.99 and last_close < base_low * 0.98:
+                continue # Failed breakdown reject
             else:
-                atr = (df_after_base['High'] - df_after_base['Low']).mean()
+                spring_type = "Weak Spring"
+                spring_strength = 2
 
-            if pd.isna(atr) or atr == 0:
-                atr = (creek_high - base_low) * 0.05
+            if spring_low < base_low * 0.85: continue # 15% se zyada tod diya
 
-            fail_level = min(creek_high * 0.93, creek_high - 2*atr)
+            # RULE-6: BREAKOUT NAHI HUA HONA CHAHIYE
+            if last_close > creek_high * 1.01: continue
+            if not (base_low * 0.85 <= last_close <= creek_high * 1.01): continue
 
-            if df_after_base['Close'].min() < base_low * 0.98: continue # Breakdown
-            if last_close < fail_level: continue # Creek fail
-            if last_close > creek_high: continue # Breakout ho gaya
+            # BREAKOUT PROBABILITY SCORE CALCULATION ✅
+            dist_to_creek_pct = (creek_high - last_close) / last_close * 100
+            tightness_score = 30 - range_pct # Tight range = high score
+            demand_score = vol_ratio * 15 # High vol ratio = high score
+            dry_score = (1 - vol_dry_ratio) * 20 # Zyada dry = high score
+            spring_bonus = spring_strength * 10 # Spring Reclaim = 30 bonus
+            proximity_score = max(0, 20 - dist_to_creek_pct * 4) # Creek ke paas = high score
+            length_bonus = window * 0.05 # Lambi range = slight bonus
+            freshness_penalty = (total_len - i) * 0.1 # Purani range = penalty
 
-            current_score = (100 - range_pct) + vol_ratio * 10 - (total_len - i)
-            if best_base is None or current_score > best_base['score']:
+            breakout_score = (tightness_score + demand_score + dry_score +
+                            spring_bonus + proximity_score + length_bonus - freshness_penalty)
+
+            if best_base is None or breakout_score > best_base['breakout_score']:
                 best_base = {
                     'base_high': base_high, 'base_low': base_low, 'creek_high': creek_high,
-                    'base_type': base_type, 'base_length': window, 'range_pct': range_pct,
-                    'rally_pct': rally_pct, 'vol_ratio': vol_ratio, 'spring_low': spring_low,
-                    'distance_from_52w_high_%': round(distance_from_high, 1),
-                    'distance_from_52w_low_%': round(distance_from_low, 1),
-                    'score': current_score
+                    'base_length': window, 'range_pct': range_pct,
+                    'vol_ratio': vol_ratio, 'vol_dry_ratio': vol_dry_ratio,
+                    'spring_low': spring_low, 'spring_type': spring_type,
+                    'dist_to_creek_pct': dist_to_creek_pct,
+                    'breakout_score': breakout_score
                 }
 
     return best_base
@@ -162,100 +132,114 @@ def analyze_base_context(df, end_date):
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
-check_dates = [ref_date, ref_date - timedelta(days=14)]
 
 for i, stock in enumerate(stocks):
     print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
     try:
-        df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=True)
+        df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         if len(df) < 100: continue
 
+        # Liquidity check
         df['Vol_50'] = df['Volume'].rolling(50).mean()
         last_candle = df.iloc[-1]
-
         avg_vol = last_candle['Vol_50']
-        avg_turnover = avg_vol * last_candle['Close']
-        if pd.isna(avg_vol) or (avg_vol < 2000000 or avg_turnover < 50000000):
-            print(f" ❌ Liquidity low")
+        if pd.isna(avg_vol) or avg_vol < 1000000:
+            print(f" ❌ Volume low")
             continue
 
-        # RS RATING - FIXED ✅
+        # RS check
         stock_ret_63d = df['Close'].pct_change(63).iloc[-1] * 100
         nifty_ret_63d = nifty_close.pct_change(63).iloc[-1] * 100
-        if pd.isna(stock_ret_63d) or pd.isna(nifty_ret_63d):
-            rs_rating = 0
-        else:
-            rs_rating = stock_ret_63d - nifty_ret_63d # Difference
-
-        if rs_rating < -5: # Nifty se 5% weak = Reject
+        rs_rating = stock_ret_63d - nifty_ret_63d if not pd.isna(stock_ret_63d) else -99
+        if rs_rating < -3:
             print(f" ❌ RS weak: {rs_rating:.1f}%")
             continue
 
-        for check_date in check_dates:
-            base_info = analyze_base_context(df, check_date)
-            if base_info is None:
-                continue
+        # 200 EMA filter - Downtrend reject
+        df['EMA200'] = df['Close'].ewm(span=200).mean()
+        if df.iloc[-1]['Close'] < df.iloc[-1]['EMA200'] * 0.90:
+            print(f" ❌ 200EMA se 10% neeche")
+            continue
 
-            print(f" ✅ {base_info['base_type']} | {base_info['base_length']}D | 52W_H:{base_info['distance_from_52w_high_%']}% | RS:{rs_rating:.1f}%")
+        base_info = find_clean_range(df, ref_date)
+        if base_info is None:
+            print(f" ❌ Clean range nahi")
+            continue
 
-            breakout_level = base_info['creek_high'] * 1.005
-            retest_level = base_info['creek_high'] * 0.995
-            stop_loss = base_info['spring_low'] * 0.98
-            risk_pct = round((last_candle['Close'] - stop_loss) / last_candle['Close'] * 100, 1)
+        # ENTRY = CREEK HIGH
+        entry_level = base_info['creek_high']
+        stop_loss = base_info['spring_low'] * 0.97
+        risk_pct = round((entry_level - stop_loss) / entry_level * 100, 1)
+        if risk_pct > 15: continue
 
-            vol_ok = last_candle['Volume'] > avg_vol * 1.5
-            dist_to_creek = round((base_info['creek_high'] - last_candle['Close'])/last_candle['Close']*100, 1)
+        target_8pct = entry_level * 1.08
+        target_15pct = entry_level * 1.15
+        rr = round((target_8pct - entry_level) / (entry_level - stop_loss), 1)
 
-            if dist_to_creek <= 1 and vol_ok:
-                entry_status = "BUY NOW"
-            elif dist_to_creek <= 3:
-                entry_status = "ALERT LAGAO"
-            else:
-                entry_status = "WATCH"
+        dist_to_entry = base_info['dist_to_creek_pct']
 
-            signals.append({
-                'Stock': stock, 'Check_Date': check_date.strftime('%d/%m/%Y'),
-                'Base_Type': base_info['base_type'], 'Base_Length': base_info['base_length'],
-                'Base_Low': round(base_info['base_low'], 2), 'Base_High': round(base_info['base_high'], 2),
-                'Creek_High': round(base_info['creek_high'], 2), 'CMP': round(last_candle['Close'], 2),
-                'Distance_To_Creek_%': dist_to_creek, 'Entry_Breakout': round(breakout_level, 2),
-                'Entry_Retest': round(retest_level, 2), 'Stop_Loss': round(stop_loss, 2),
-                'Risk_%': risk_pct, 'Entry_Status': entry_status, 'RS_Rating': round(rs_rating, 1),
-                'VSA_Confirm': 'Yes', 'Volume_OK': 'Yes' if vol_ok else 'No',
-                'Base_Range_%': round(base_info['range_pct'], 1),
-                'From_52W_High_%': base_info['distance_from_52w_high_%'],
-                'From_52W_Low_%': base_info['distance_from_52w_low_%'],
-                'Rally_Before_%': round(base_info['rally_pct'], 1),
-                'Up/Down_Vol_Ratio': round(base_info['vol_ratio'], 2),
-                'Avg_Vol_Lakh': round(avg_vol/100000, 1)
-            })
-            break
+        if dist_to_entry <= 0.5:
+            entry_status = "BUY ZONE"
+        elif dist_to_entry <= 2:
+            entry_status = "ALERT"
+        elif dist_to_entry <= 5:
+            entry_status = "WATCH"
+        else:
+            entry_status = "WATCHLIST"
 
-        if (i + 1) % 50 == 0:
-            time.sleep(0.2)
+        print(f" ✅ {base_info['base_length']}D | {base_info['spring_type']} | Score:{base_info['breakout_score']:.0f} | {entry_status}")
+
+        signals.append({
+            'Rank_Score': round(base_info['breakout_score'], 0),
+            'Stock': stock,
+            'Status': entry_status,
+            'Range_Days': base_info['base_length'],
+            'Entry_Creek_High': round(entry_level, 2),
+            'CMP': round(last_candle['Close'], 2),
+            'Dist_to_Entry_%': round(dist_to_entry, 1),
+            'Range_Low': round(base_info['base_low'], 2),
+            'Range_High': round(base_info['base_high'], 2),
+            'Spring_Type': base_info['spring_type'],
+            'Spring_Low': round(base_info['spring_low'], 2),
+            'Stop_Loss': round(stop_loss, 2),
+            'Risk_%': risk_pct,
+            'Target_8%': round(target_8pct, 2),
+            'Target_15%': round(target_15pct, 2),
+            'R:R': rr,
+            'Vol_Ratio': round(base_info['vol_ratio'], 2),
+            'Vol_Dry_%': round((1-base_info['vol_dry_ratio'])*100, 0),
+            'Range_%': round(base_info['range_pct'], 1),
+            'RS_vs_Nifty': round(rs_rating, 1),
+            'AvgVol_Lakh': round(avg_vol/100000, 1)
+        })
+
+        if (i + 1) % 30 == 0:
+            time.sleep(0.3)
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE
+# 6. SHEET UPDATE - RANKED ✅
 try:
-    ws_output = sh.worksheet("SpringSetups")
+    ws_output = sh.worksheet("RangeSetups")
 except:
-    ws_output = sh.add_worksheet(title="SpringSetups", rows=1000, cols=30)
+    ws_output = sh.add_worksheet(title="RangeSetups", rows=1000, cols=25)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    status_priority = {'BUY NOW': 1, 'ALERT LAGAO': 2, 'WATCH': 3}
-    df_out['Status_Priority'] = df_out['Entry_Status'].map(status_priority)
-    df_out = df_out.sort_values(['Status_Priority', 'Distance_To_Creek_%', 'RS_Rating'], ascending=[True, True, False])
-    df_out = df_out.drop(['Status_Priority'], axis=1)
+    # RANKING: 1. Rank_Score sabse upar 2. BUY ZONE first 3. Creek ke paas
+    status_priority = {'BUY ZONE': 1, 'ALERT': 2, 'WATCH': 3, 'WATCHLIST': 4}
+    df_out['Priority'] = df_out['Status'].map(status_priority)
+    df_out = df_out.sort_values(['Rank_Score', 'Priority', 'Dist_to_Entry_%'],
+                                ascending=[False, True, True])
+    df_out = df_out.drop(['Priority'], axis=1)
     df_out = df_out.astype(str)
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
-    print(f"\n=== DONE: {len(signals)} SETUPS | LOCATION AGNOSTIC ===")
+    print(f"\n=== DONE: {len(signals)} RANGES | TOP RANK = HIGHEST BREAKOUT PROB ===")
 else:
-    ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Clean Setups"]])
+    ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Clean Ranges Found"]])
     print("\n=== DONE: 0 SETUPS ===")
