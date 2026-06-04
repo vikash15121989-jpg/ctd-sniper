@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== WYCKOFF SPRING FINDER V8.3: LOCATION AGNOSTIC + NAN FIXED ===")
+print("=== WYCKOFF SPRING FINDER V8.4: CLIMAX FILTER FIXED ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -32,7 +32,7 @@ if ref_date is None:
     raise ValueError(f"A1 me date format galat: {date_raw}")
 
 date_str = ref_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str} | TOP/MID/BOTTOM SAB BASE ALLOWED")
+print(f"Reference Date: {date_str} | DISTRIBUTION REJECT ON")
 
 # 3. NIFTY DATA FOR RS RATING
 nifty_df = yf.download("^NSEI", period="1y", progress=False, auto_adjust=True)
@@ -40,24 +40,25 @@ if isinstance(nifty_df.columns, pd.MultiIndex):
     nifty_df.columns = nifty_df.columns.get_level_values(0)
 nifty_close = nifty_df['Close']
 
-# 4. WYCKOFF VSA - LOCATION FILTER HATA DIYA ✅
+# 4. WYCKOFF VSA - CLIMAX FILTER FIXED ✅
 def analyze_base_context(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 100:
         return None
 
-    # BUYING CLIMAX REJECT - SIRF DISTRIBUTION FILTER ✅
+    # BUYING CLIMAX REJECT - FIXED ✅
     recent_30 = df_till_date.tail(30)
     if len(recent_30) >= 20:
-        vol_avg_30 = recent_30['Volume'].mean()
+        vol_avg_50 = df_till_date['Volume'].tail(50).mean() # 50D avg use kar
         high_20d = recent_30['High'].rolling(20).max()
         climax_check = recent_30[
-            (recent_30['Volume'] > vol_avg_30 * 2.5) &
-            (recent_30['High'] >= high_20d * 0.99) &
-            (recent_30['Close'] < recent_30['High'] * 0.97)
+            (recent_30['Volume'] > vol_avg_50 * 2.0) & # 2.0x, 50D avg
+            (recent_30['High'] >= high_20d * 0.98) & # 0.98
+            (recent_30['Close'] < recent_30['High'] * 0.97) &
+            (recent_30['Close'] < recent_30['Open']) # Red candle mandatory
         ]
         if not climax_check.empty:
-            return None
+            return None # Distribution confirmed - Reject
 
     df_recent = df_till_date.tail(150).copy()
     base_windows = [15, 22, 35, 50]
@@ -86,13 +87,13 @@ def analyze_base_context(df, end_date):
             vol_last = base_window['Volume'].iloc[mid:].mean()
             if vol_last > vol_first * 0.75: continue
 
-            # RALLY PCT - SIRF CLASSIFICATION KE LIYE ✅
+            # RALLY PCT
             lookback_60 = df_recent.iloc[max(0, i-60):i]
             if lookback_60.empty: continue
             swing_low_60 = lookback_60['Low'].min()
             rally_pct = (base_low - swing_low_60) / swing_low_60 * 100
 
-            # 52W DATA - SIRF INFO KE LIYE ✅
+            # 52W DATA - INFO ONLY
             yearly_high = df_till_date['High'].tail(252).max()
             yearly_low = df_till_date['Low'].tail(252).min()
             distance_from_high = (yearly_high - base_high) / yearly_high * 100
@@ -118,7 +119,7 @@ def analyze_base_context(df, end_date):
                 if after_spring['Close'].iloc[-1] < base_low * 0.97:
                     continue
 
-            # CLASSIFICATION - RALLY % SE ✅
+            # CLASSIFICATION
             if rally_pct < 25 and vol_ratio > 1.2:
                 base_type = 'Accumulation'
             elif rally_pct >= 25 and rally_pct < 200 and vol_ratio > 1.3:
@@ -174,7 +175,6 @@ for i, stock in enumerate(stocks):
         df['Vol_50'] = df['Volume'].rolling(50).mean()
 
         for check_date in check_dates:
-            # FIX: check_date tak ka data lo ✅
             check_date_data = df[df.index <= check_date]
             if check_date_data.empty or len(check_date_data) < 50:
                 continue
@@ -200,6 +200,7 @@ for i, stock in enumerate(stocks):
 
             base_info = analyze_base_context(df, check_date)
             if base_info is None:
+                print(f" ❌ Distribution/Climax ya VSA fail")
                 continue
 
             print(f" ✅ {base_info['base_type']} | {base_info['base_length']}D | 52W_H:{base_info['distance_from_52w_high_%']}% | RS:{rs_rating:.1f}%")
@@ -259,7 +260,7 @@ if signals:
     df_out = df_out.astype(str)
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
-    print(f"\n=== DONE: {len(signals)} SETUPS | LOCATION AGNOSTIC ===")
+    print(f"\n=== DONE: {len(signals)} SETUPS | DISTRIBUTION REJECTED ===")
 else:
     ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Clean Setups"]])
     print("\n=== DONE: 0 SETUPS ===")
