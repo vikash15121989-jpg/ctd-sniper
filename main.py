@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import gspread
 import json
 import os
@@ -8,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.2: JSON SERIALIZABLE FIX ===")
+print("=== VSA SPRING SNIPER V3.3: FINAL JSON FIX ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -55,7 +56,7 @@ def calculate_buyer_seller(df):
     df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER - UPDATED QUALITY LOGIC
+# 4. VSA SPRING HUNTER
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -218,7 +219,7 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE - JSON FIX ✅
+# 6. SHEET UPDATE - JSON FIX FINAL ✅
 try:
     ws_output = sh.worksheet("VSA_Spring_Setups")
 except:
@@ -229,8 +230,18 @@ if signals and len(signals) > 0:
     df_out = pd.DataFrame(signals)
     df_out = df_out.sort_values('P&L_%', ascending=False)
 
-    # FIX: Convert all to native python types for gspread
-    df_out = df_out.astype(object).where(pd.notnull(df_out), None)
+    # FIX: numpy types ko native python me convert karo
+    def convert_to_native(val):
+        if isinstance(val, (np.integer, np.int64, np.int32)):
+            return int(val)
+        elif isinstance(val, (np.floating, np.float64, np.float32)):
+            return float(val)
+        elif isinstance(val, np.bool_):
+            return bool(val)
+        else:
+            return val
+
+    df_out = df_out.applymap(convert_to_native)
 
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
@@ -238,24 +249,24 @@ if signals and len(signals) > 0:
     total_trades = len(df_out)
     wins = len(df_out[df_out['Result'] == 'Target Hit'])
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
-    total_pl = df_out['P&L_%'].sum()
+    total_pl = float(df_out['P&L_%'].sum())
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
 
     quality_counts = df_out['Quality'].value_counts()
 
     summary = [
         ['', ''],
-        ['TOTAL TRADES', total_trades],
-        ['WINS', wins],
-        ['WIN RATE %', win_rate],
+        ['TOTAL TRADES', int(total_trades)],
+        ['WINS', int(wins)],
+        ['WIN RATE %', float(win_rate)],
         ['TOTAL P&L %', round(total_pl, 2)],
-        ['AVG P&L %', avg_pl],
+        ['AVG P&L %', float(avg_pl)],
         ['AVG R:R', '1:3'],
         ['', ''],
-        ['A++ Count', quality_counts.get('A++', 0)],
-        ['A+ Count', quality_counts.get('A+', 0)],
-        ['A Count', quality_counts.get('A', 0)],
-        ['B Count', quality_counts.get('B', 0)]
+        ['A++ Count', int(quality_counts.get('A++', 0))],
+        ['A+ Count', int(quality_counts.get('A+', 0))],
+        ['A Count', int(quality_counts.get('A', 0))],
+        ['B Count', int(quality_counts.get('B', 0))]
     ]
     ws_output.update(f'A{len(payload)+2}', summary)
 
