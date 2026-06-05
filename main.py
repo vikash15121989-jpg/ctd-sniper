@@ -4,11 +4,11 @@ import gspread
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== WYCKOFF V10.1: GIRAAVAT + BASE + DATES ===")
+print("=== VSA SNIPER V2.1: ENTRY + EXIT + P&L TRACKER ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -34,122 +34,174 @@ if ref_date is None:
 date_str = ref_date.strftime('%Y-%m-%d')
 print(f"Reference Date: {date_str}")
 
-# 3. NIFTY DATA
-nifty_df = yf.download("^NSEI", period="2y", progress=False, auto_adjust=True)
-if isinstance(nifty_df.columns, pd.MultiIndex):
-    nifty_df.columns = nifty_df.columns.get_level_values(0)
-nifty_close = nifty_df['Close']
+# 3. OBV + BUYER/SELLER CALCULATOR - TERA LOGIC ✅
+def calculate_obv_buyer_seller(df):
+    df = df.copy()
+    df['OBV'] = 0
+    df['Buyer_Vol'] = 0
+    df['Seller_Vol'] = 0
 
-# 4. VCP DETECTOR
-def detect_vcp(range_df):
-    if len(range_df) < 30:
-        return "No VCP", 0, False
+    for i in range(1, len(df)):
+        # Normal OBV
+        if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+            df.loc[df.index[i], 'OBV'] = df['OBV'].iloc[i-1] + df['Volume'].iloc[i]
+        elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+            df.loc[df.index[i], 'OBV'] = df['OBV'].iloc[i-1] - df['Volume'].iloc[i]
+        else:
+            df.loc[df.index[i], 'OBV'] = df['OBV'].iloc[i-1]
 
-    part_len = len(range_df) // 3
-    part1 = range_df.iloc[:part_len]
-    part2 = range_df.iloc[part_len:2*part_len]
-    part3 = range_df.iloc[2*part_len:]
+        # TERA BUYER/SELLER LOGIC ✅
+        h, l, c, v = df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i], df['Volume'].iloc[i]
+        range_hl = h - l
+        if range_hl == 0:
+            buyer, seller = 0, 0
+        else:
+            buyer = (c - l) / range_hl * v
+            seller = (h - c) / range_hl * v
 
-    range1 = (part1['High'].max() - part1['Low'].min()) / part1['Low'].min() * 100
-    range2 = (part2['High'].max() - part2['Low'].min()) / part2['Low'].min() * 100
-    range3 = (part3['High'].max() - part3['Low'].min()) / part3['Low'].min() * 100
+        df.loc[df.index[i], 'Buyer_Vol'] = buyer
+        df.loc[df.index[i], 'Seller_Vol'] = seller
 
-    vol1 = part1['Volume'].mean()
-    vol2 = part2['Volume'].mean()
-    vol3 = part3['Volume'].mean()
+    df['20DMA'] = df['Close'].rolling(20).mean()
+    df['OBV_20SMA'] = df['OBV'].rolling(20).mean()
+    return df
 
-    contractions = 0
-    if range2 < range1 * 0.7: contractions += 1
-    if range3 < range2 * 0.7: contractions += 1
-    if vol3 < vol1 * 0.6: contractions += 1
+# 4. BACKTEST ENGINE - EXIT + P&L NIKALO ✅
+def backtest_trade(df, entry_idx, entry_price, sl, target):
+    exit_price = 0
+    exit_date = None
+    days = 0
+    result_type = 'Running'
 
-    if contractions >= 2 and range3 < 5:
-        return "Strong VCP", 3, True
-    elif contractions >= 1 and range3 < 8:
-        return "Weak VCP", 2, True
-    else:
-        return "No VCP", 1, False
+    for j in range(entry_idx + 1, len(df)):
+        days += 1
+        h, l, c = df['High'].iloc[j], df['Low'].iloc[j], df['Close'].iloc[j]
+        date = df.index[j]
 
-# 5. BASE HUNTER V10.1 - DATE KE SAATH ✅
-def find_base_after_decline(df, end_date):
+        # SL pehle check karo
+        if l <= sl:
+            exit_price = sl
+            exit_date = date
+            result_type = 'SL Hit'
+            break
+        # Phir Target
+        if h >= target:
+            exit_price = target
+            exit_date = date
+            result_type = 'Target Hit'
+            break
+        # Last din
+        if j == len(df) - 1:
+            exit_price = c
+            exit_date = date
+            result_type = 'Running'
+
+    if exit_date is None:
+        return None
+
+    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+    pl_rs = exit_price - entry_price
+
+    return {
+        'exit_date': exit_date.strftime('%Y-%m-%d'),
+        'exit_price': round(exit_price, 2),
+        'days': days,
+        'pl_pct': round(pl_pct, 2),
+        'pl_rs': round(pl_rs, 2),
+        'result': result_type
+    }
+
+# 5. VSA SPRING HUNTER V2.1
+def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
-    if len(df_till_date) < 100:
-        return None
+    if len(df_till_date) < 25:
+        return []
 
-    # RULE-1: GIRAAVAT CHECK - 20%+
-    yearly_high = df_till_date['High'].tail(252).max()
-    last_close = df_till_date['Close'].iloc[-1]
-    decline_pct = (yearly_high - last_close) / yearly_high * 100
+    df_till_date = calculate_obv_buyer_seller(df_till_date)
+    trades = []
 
-    if decline_pct < 20:
-        return None
+    for i in range(20, len(df_till_date) - 4):
+        curr = df_till_date.iloc[i]
+        prev = df_till_date.iloc[i-1]
 
-    # RULE-2: LAST 200 DIN ME SABSE LAMBA BASE DHUNDO
-    df_recent = df_till_date.tail(200).copy()
-    best_base = None
+        # CONDITION-1: SPRING - Seller > 3x Buyer + -8% drop
+        prev_range = prev['High'] - prev['Low']
+        if prev_range == 0: continue
 
-    for length in range(150, 19, -5):
-        if len(df_recent) < length: continue
+        prev_buyer = prev['Buyer_Vol']
+        prev_seller = prev['Seller_Vol']
+        if prev_buyer == 0: continue
 
-        range_df = df_recent.tail(length)
-        base_high = range_df['High'].max()
-        base_low = range_df['Low'].min()
-        range_pct = (base_high - base_low) / base_low * 100
+        spring_ratio = prev_seller / prev_buyer
+        spring_drop = (prev['Low'] - prev['Open']) / prev['Open']
 
-        if range_pct < 5 or range_pct > 25: continue
+        if not (spring_ratio > 3 and spring_drop < -0.08):
+            continue
 
-        daily_range = (range_df['High'] - range_df['Low']) / range_df['Close'] * 100
-        if daily_range.mean() > 3.5: continue
+        # CONDITION-2: CONFIRM - Buyer > 3x Seller in next 3 days
+        confirm = False
+        confirm_idx = None
+        for j in range(1, 4):
+            if i + j >= len(df_till_date): break
+            conf_candle = df_till_date.iloc[i + j]
+            if conf_candle['Seller_Vol'] == 0: continue
+            if conf_candle['Buyer_Vol'] / conf_candle['Seller_Vol'] > 3:
+                confirm = True
+                confirm_idx = i + j
+                break
 
-        # ACCUMULATION CHECK
-        vol_first_3rd = range_df['Volume'].iloc[:length//3].mean()
-        vol_last_3rd = range_df['Volume'].iloc[-length//3:].mean()
-        vol_dry_ratio = vol_last_3rd / vol_first_3rd if vol_first_3rd > 0 else 1
+        if not confirm:
+            continue
 
-        up_vol = range_df[range_df['Close'] > range_df['Open']]['Volume'].sum()
-        down_vol = range_df[range_df['Close'] < range_df['Open']]['Volume'].sum()
-        vol_ratio = up_vol / down_vol if down_vol > 0 else 99
+        # CONDITION-3: 20 DMA ke upar
+        if pd.isna(curr['20DMA']) or curr['Close'] <= curr['20DMA']:
+            continue
 
-        is_accumulation = vol_ratio >= 1.15 and vol_dry_ratio <= 0.80
-        if not is_accumulation: continue
+        # CONDITION-4: OBV > OBV_20SMA + Rising
+        if pd.isna(curr['OBV_20SMA']) or curr['OBV'] <= curr['OBV_20SMA'] or curr['OBV'] <= prev['OBV']:
+            continue
 
-        vcp_status, vcp_strength, has_vcp = detect_vcp(range_df)
+        entry_price = curr['Close']
+        sl = prev['Low'] * 0.98
+        risk = entry_price - sl
+        target = entry_price + (risk * 3)
+        risk_pct = (risk / entry_price) * 100
 
-        yearly_low = df_till_date['Low'].tail(252).min()
-        location_pct = (base_low - yearly_low) / (yearly_high - yearly_low) * 100 if yearly_high!= yearly_low else 50
+        if risk_pct > 10:
+            continue
 
-        # BASE KI DATE NIKALO ✅
-        base_start_date = range_df.index[0].strftime('%Y-%m-%d')
-        base_end_date = range_df.index[-1].strftime('%Y-%m-%d')
+        # BACKTEST KARO - EXIT + P&L NIKALO ✅
+        backtest_result = backtest_trade(df, i, entry_price, sl, target)
+        if backtest_result is None:
+            continue
 
-        best_base = {
-            'base_high': base_high, 'base_low': base_low, 'base_length': length,
-            'range_pct': range_pct, 'vol_ratio': vol_ratio, 'vol_dry_ratio': vol_dry_ratio,
-            'vcp_status': vcp_status, 'vcp_strength': vcp_strength, 'has_vcp': has_vcp,
-            'location_pct': location_pct, 'decline_pct': decline_pct,
-            'last_close': last_close,
-            'base_start_date': base_start_date, # NEW ✅
-            'base_end_date': base_end_date # NEW ✅
-        }
-        break
+        # QUALITY GRADE
+        if spring_ratio > 5:
+            quality = "A++"
+        elif spring_ratio > 4:
+            quality = "A+"
+        elif spring_ratio > 3:
+            quality = "A"
+        else:
+            quality = "B"
 
-    if best_base is None:
-        return None
+        trades.append({
+            'entry_date': curr.name.strftime('%Y-%m-%d'),
+            'spring_date': prev.name.strftime('%Y-%m-%d'),
+            'confirm_date': df_till_date.iloc[confirm_idx].name.strftime('%Y-%m-%d'),
+            'entry_price': round(entry_price, 2),
+            'sl': round(sl, 2),
+            'target': round(target, 2),
+            'risk_pct': round(risk_pct, 1),
+            'quality': quality,
+            'spring_ratio': round(spring_ratio, 1),
+            'spring_drop': round(spring_drop * 100, 1),
+            'obv': round(curr['OBV'], 0),
+            'obv_sma': round(curr['OBV_20SMA'], 0),
+            **backtest_result # EXIT + P&L ADD KAR DIYA
+        })
 
-    # SCORE
-    length_bonus = best_base['base_length'] * 0.5
-    tightness_score = 30 - best_base['range_pct']
-    demand_score = best_base['vol_ratio'] * 15
-    dry_score = (1 - best_base['vol_dry_ratio']) * 25
-    vcp_bonus = best_base['vcp_strength'] * 15
-    location_bonus = max(0, 15 - best_base['location_pct'] * 0.3)
-    decline_bonus = best_base['decline_pct'] * 0.2
-
-    breakout_score = (length_bonus + tightness_score + demand_score +
-                    dry_score + vcp_bonus + location_bonus + decline_bonus)
-
-    best_base['breakout_score'] = breakout_score
-    return best_base
+    return trades
 
 # 6. MAIN LOOP
 stocks = ws_watchlist.col_values(1)[1:]
@@ -162,7 +214,9 @@ for i, stock in enumerate(stocks):
         df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 150: continue
+        if len(df) < 150:
+            print("Data kam hai")
+            continue
 
         df['Vol_50'] = df['Volume'].rolling(50).mean()
         last_candle = df.iloc[-1]
@@ -170,74 +224,81 @@ for i, stock in enumerate(stocks):
         avg_turnover = avg_vol * last_candle['Close']
 
         if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000:
+            print("Volume/Turnover kam")
             continue
 
-        base_info = find_base_after_decline(df, ref_date)
-        if base_info is None:
+        trades = find_vsa_spring(df, ref_date)
+        if len(trades) == 0:
+            print("No VSA Spring")
             continue
 
-        entry_level = base_info['base_high']
-        support_level = base_info['base_low']
-        stop_loss = support_level * 0.95
-        risk_pct = round((entry_level - stop_loss) / entry_level * 100, 1)
-        if risk_pct > 20: continue
+        for trade in trades:
+            rr = (trade['target'] - trade['entry_price']) / (trade['entry_price'] - trade['sl'])
 
-        target_15pct = entry_level * 1.15
-        target_30pct = entry_level * 1.30
-        rr = round((target_15pct - entry_level) / (entry_level - stop_loss), 1)
+            print(f" ✅ {trade['quality']} | {trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}%")
 
-        dist_to_entry = (entry_level - base_info['last_close']) / base_info['last_close'] * 100
+            signals.append({
+                'Stock': stock,
+                'Quality': trade['quality'],
+                'Entry_Date': trade['entry_date'],
+                'Spring_Date': trade['spring_date'],
+                'Confirm_Date': trade['confirm_date'],
+                'Entry_Price': trade['entry_price'],
+                'SL': trade['sl'],
+                'Target': trade['target'],
+                'Exit_Date': trade['exit_date'],
+                'Exit_Price': trade['exit_price'],
+                'Days_Held': trade['days'],
+                'P&L_%': trade['pl_pct'],
+                'P&L_Rs': trade['pl_rs'],
+                'Result': trade['result'],
+                'Risk_%': trade['risk_pct'],
+                'R:R': round(rr, 1),
+                'Spring_Ratio': trade['spring_ratio'],
+                'Spring_Drop_%': trade['spring_drop'],
+                'OBV': trade['obv'],
+                'OBV_20SMA': trade['obv_sma'],
+                'AvgVol_Lakh': round(avg_vol/100000, 1)
+            })
 
-        entry_status = "ACCUM+VCP" if base_info['has_vcp'] else "ACCUM-BASE"
-
-        print(f" ✅ {base_info['base_length']}D | {base_info['base_start_date']} to {base_info['base_end_date']} | -{base_info['decline_pct']:.0f}%")
-
-        signals.append({
-            'Rank_Score': round(base_info['breakout_score'], 0),
-            'Stock': stock,
-            'Setup_Type': entry_status,
-            'VCP_Status': base_info['vcp_status'],
-            'Base_Start': base_info['base_start_date'], # NEW ✅
-            'Base_End': base_info['base_end_date'], # NEW ✅
-            'Base_Days': base_info['base_length'],
-            'Decline_52W_%': round(base_info['decline_pct'], 0),
-            'Resistance_Creek': round(entry_level, 2),
-            'Support_Base': round(support_level, 2),
-            'CMP': round(base_info['last_close'], 2),
-            'Dist_to_Creek_%': round(dist_to_entry, 1),
-            'Stop_Loss': round(stop_loss, 2),
-            'Risk_%': risk_pct,
-            'Target_15%': round(target_15pct, 2),
-            'Target_30%': round(target_30pct, 2),
-            'R:R': rr,
-            'Vol_Ratio': round(base_info['vol_ratio'], 2),
-            'Vol_Dry_%': round((1-base_info['vol_dry_ratio'])*100, 0),
-            'Range_%': round(base_info['range_pct'], 1),
-            'Location_52W_%': round(base_info['location_pct'], 0),
-            'AvgVol_Lakh': round(avg_vol/100000, 1)
-        })
-
-        if (i + 1) % 30 == 0:
-            time.sleep(0.3)
+        if (i + 1) % 20 == 0:
+            time.sleep(0.5)
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
 # 7. SHEET UPDATE
 try:
-    ws_output = sh.worksheet("BaseSetups")
+    ws_output = sh.worksheet("VSA_Backtest")
 except:
-    ws_output = sh.add_worksheet(title="BaseSetups", rows=1000, cols=23)
+    ws_output = sh.add_worksheet(title="VSA_Backtest", rows=1000, cols=22)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    df_out = df_out.sort_values(['Base_Days', 'Setup_Type', 'Rank_Score'],
-                                ascending=[False, True, False])
+    df_out = df_out.sort_values(['Quality', 'P&L_%'], ascending=[False, False])
     df_out = df_out.astype(str)
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
-    print(f"\n=== DONE: {len(signals)} BASES | DATE RANGE ADDED ===")
+
+    # SUMMARY ADD KARO
+    total_trades = len(df_out)
+    wins = len(df_out[df_out['Result'] == 'Target Hit'])
+    win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
+    total_pl = df_out['P&L_%'].astype(float).sum()
+    avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
+
+    summary = [
+        ['', ''],
+        ['TOTAL TRADES', total_trades],
+        ['WINS', wins],
+        ['WIN RATE %', win_rate],
+        ['TOTAL P&L %', round(total_pl, 2)],
+        ['AVG P&L %', avg_pl]
+    ]
+    ws_output.update(f'A{len(payload)+2}', summary)
+
+    print(f"\n=== DONE: {len(signals)} TRADES | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
 else:
-    ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No Bases Found"]])
+    ws_output.update('A1', [["Ref_Date", "Status"], [date_str, "No VSA Springs Found"]])
     print("\n=== DONE: 0 SETUPS ===")
