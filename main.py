@@ -8,7 +8,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.1: QUALITY GRADES + 1 YEAR BACKTEST ===")
+print("=== VSA SPRING SNIPER V3.2: JSON SERIALIZABLE FIX ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -34,7 +34,7 @@ if ref_date is None:
 date_str = ref_date.strftime('%Y-%m-%d')
 print(f"Reference Date: {date_str}")
 
-# 3. BUYER/SELLER CALCULATOR - TERA FORMULA ✅
+# 3. BUYER/SELLER CALCULATOR
 def calculate_buyer_seller(df):
     df = df.copy()
     df['Buyer_Vol'] = 0
@@ -46,8 +46,8 @@ def calculate_buyer_seller(df):
         if range_hl == 0:
             buyer, seller = 0, 0
         else:
-            buyer = (c - l) / range_hl * v # Low se Close = Buyer
-            seller = (h - c) / range_hl * v # High se Close = Seller
+            buyer = (c - l) / range_hl * v
+            seller = (h - c) / range_hl * v
 
         df.loc[df.index[i], 'Buyer_Vol'] = buyer
         df.loc[df.index[i], 'Seller_Vol'] = seller
@@ -55,7 +55,7 @@ def calculate_buyer_seller(df):
     df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER - UPDATED QUALITY LOGIC ✅
+# 4. VSA SPRING HUNTER - UPDATED QUALITY LOGIC
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -64,14 +64,12 @@ def find_vsa_spring(df, end_date):
     df_till_date = calculate_buyer_seller(df_till_date)
     setups = []
 
-    # 1 SAAL = 365 DIN PEeche tak scan karo ✅
     start_idx = max(21, len(df_till_date) - 365)
 
     for i in range(start_idx, len(df_till_date) - 4):
         curr = df_till_date.iloc[i]
         prev = df_till_date.iloc[i-1]
 
-        # CONDITION-1: SPRING - Seller >= 2x Buyer + -8% drop ✅
         prev_buyer = prev['Buyer_Vol']
         prev_seller = prev['Seller_Vol']
         if prev_buyer == 0: continue
@@ -79,11 +77,9 @@ def find_vsa_spring(df, end_date):
         spring_ratio = prev_seller / prev_buyer
         spring_drop = (prev['Low'] - prev['Open']) / prev['Open']
 
-        # Minimum 2x spring chahiye B grade ke liye
         if not (spring_ratio >= 2 and spring_drop < -0.08):
             continue
 
-        # CONDITION-2: CONFIRM - Buyer > 3x Seller in next 3 days ✅
         confirm = False
         confirm_idx = None
         for j in range(1, 4):
@@ -98,21 +94,18 @@ def find_vsa_spring(df, end_date):
         if not confirm:
             continue
 
-        # CONDITION-3: 20 DMA ke upar ✅
         if pd.isna(curr['20DMA']) or curr['Close'] <= curr['20DMA']:
             continue
 
-        # ENTRY FOUND
-        entry_price = curr['Close']
-        sl = prev['Low'] * 0.98 # 2% buffer
+        entry_price = float(curr['Close'])
+        sl = float(prev['Low'] * 0.98)
         risk = entry_price - sl
-        target = entry_price + (risk * 3) # 1:3 RR
+        target = float(entry_price + (risk * 3))
         risk_pct = (risk / entry_price) * 100
 
         if risk_pct > 10 or risk_pct < 0.5:
             continue
 
-        # BACKTEST - EXIT + P&L
         exit_price, exit_date, days, result = 0, None, 0, 'Running'
         for j in range(i + 1, len(df)):
             days += 1
@@ -125,14 +118,14 @@ def find_vsa_spring(df, end_date):
                 exit_price, exit_date, result = target, df.index[j], 'Target Hit'
                 break
             if j == len(df) - 1:
-                exit_price, exit_date, result = c, df.index[j], 'Running'
+                exit_price, exit_date, result = float(c), df.index[j], 'Running'
 
         if exit_date is None:
             continue
 
         pl_pct = ((exit_price - entry_price) / entry_price) * 100
 
-        # QUALITY GRADE - TERA LOGIC ✅
+        # QUALITY GRADE - TERA LOGIC
         if spring_ratio >= 5:
             quality = "A++"
         elif spring_ratio >= 4 and spring_ratio < 5:
@@ -153,7 +146,7 @@ def find_vsa_spring(df, end_date):
             'target': round(target, 2),
             'exit_date': exit_date.strftime('%Y-%m-%d'),
             'exit_price': round(exit_price, 2),
-            'days': days,
+            'days': int(days),
             'pl_pct': round(pl_pct, 2),
             'result': result,
             'risk_pct': round(risk_pct, 1),
@@ -225,7 +218,7 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE
+# 6. SHEET UPDATE - JSON FIX ✅
 try:
     ws_output = sh.worksheet("VSA_Spring_Setups")
 except:
@@ -235,17 +228,19 @@ ws_output.clear()
 if signals and len(signals) > 0:
     df_out = pd.DataFrame(signals)
     df_out = df_out.sort_values('P&L_%', ascending=False)
-    df_out = df_out.astype(str)
+
+    # FIX: Convert all to native python types for gspread
+    df_out = df_out.astype(object).where(pd.notnull(df_out), None)
+
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
 
     total_trades = len(df_out)
     wins = len(df_out[df_out['Result'] == 'Target Hit'])
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
-    total_pl = df_out['P&L_%'].astype(float).sum()
+    total_pl = df_out['P&L_%'].sum()
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
 
-    # Quality wise breakdown
     quality_counts = df_out['Quality'].value_counts()
 
     summary = [
