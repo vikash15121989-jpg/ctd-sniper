@@ -8,7 +8,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.0: 3X SPRING + 3X CONFIRM + 1 YEAR BACKTEST ===")
+print("=== VSA SPRING SNIPER V3.1: QUALITY GRADES + 1 YEAR BACKTEST ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -46,7 +46,7 @@ def calculate_buyer_seller(df):
         if range_hl == 0:
             buyer, seller = 0, 0
         else:
-            buyer = (c - l) / range_hl * v # TERA LOGIC: Low se Close = Buyer
+            buyer = (c - l) / range_hl * v # Low se Close = Buyer
             seller = (h - c) / range_hl * v # High se Close = Seller
 
         df.loc[df.index[i], 'Buyer_Vol'] = buyer
@@ -55,7 +55,7 @@ def calculate_buyer_seller(df):
     df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER - APPS SCRIPT WALA LOGIC ✅
+# 4. VSA SPRING HUNTER - UPDATED QUALITY LOGIC ✅
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -71,7 +71,7 @@ def find_vsa_spring(df, end_date):
         curr = df_till_date.iloc[i]
         prev = df_till_date.iloc[i-1]
 
-        # CONDITION-1: SPRING - Seller > 3x Buyer + -8% drop ✅
+        # CONDITION-1: SPRING - Seller >= 2x Buyer + -8% drop ✅
         prev_buyer = prev['Buyer_Vol']
         prev_seller = prev['Seller_Vol']
         if prev_buyer == 0: continue
@@ -79,7 +79,8 @@ def find_vsa_spring(df, end_date):
         spring_ratio = prev_seller / prev_buyer
         spring_drop = (prev['Low'] - prev['Open']) / prev['Open']
 
-        if not (spring_ratio > 3 and spring_drop < -0.08):
+        # Minimum 2x spring chahiye B grade ke liye
+        if not (spring_ratio >= 2 and spring_drop < -0.08):
             continue
 
         # CONDITION-2: CONFIRM - Buyer > 3x Seller in next 3 days ✅
@@ -105,10 +106,10 @@ def find_vsa_spring(df, end_date):
         entry_price = curr['Close']
         sl = prev['Low'] * 0.98 # 2% buffer
         risk = entry_price - sl
-        target = entry_price + (risk * 3) # 1:3 RR - Apps Script se better
+        target = entry_price + (risk * 3) # 1:3 RR
         risk_pct = (risk / entry_price) * 100
 
-        if risk_pct > 10 or risk_pct < 0.5: # 0.5% se 10% risk
+        if risk_pct > 10 or risk_pct < 0.5:
             continue
 
         # BACKTEST - EXIT + P&L
@@ -131,15 +132,17 @@ def find_vsa_spring(df, end_date):
 
         pl_pct = ((exit_price - entry_price) / entry_price) * 100
 
-        # QUALITY GRADE
-        if spring_ratio > 5:
+        # QUALITY GRADE - TERA LOGIC ✅
+        if spring_ratio >= 5:
             quality = "A++"
-        elif spring_ratio > 4:
+        elif spring_ratio >= 4 and spring_ratio < 5:
             quality = "A+"
-        elif spring_ratio > 3:
+        elif spring_ratio >= 3 and spring_ratio < 4:
             quality = "A"
-        else:
+        elif spring_ratio >= 2 and spring_ratio < 3:
             quality = "B"
+        else:
+            quality = "C"
 
         setups.append({
             'entry_date': curr.name.strftime('%Y-%m-%d'),
@@ -193,7 +196,7 @@ for i, stock in enumerate(stocks):
         for trade in trades:
             rr = (trade['target'] - trade['entry_price']) / (trade['entry_price'] - trade['sl'])
 
-            print(f" ✅ {trade['quality']} | {trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}%")
+            print(f" ✅ {trade['quality']} | {trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}% | Ratio: {trade['spring_ratio']}x")
 
             signals.append({
                 'Stock': stock,
@@ -242,6 +245,9 @@ if signals and len(signals) > 0:
     total_pl = df_out['P&L_%'].astype(float).sum()
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
 
+    # Quality wise breakdown
+    quality_counts = df_out['Quality'].value_counts()
+
     summary = [
         ['', ''],
         ['TOTAL TRADES', total_trades],
@@ -249,11 +255,17 @@ if signals and len(signals) > 0:
         ['WIN RATE %', win_rate],
         ['TOTAL P&L %', round(total_pl, 2)],
         ['AVG P&L %', avg_pl],
-        ['AVG R:R', '1:3']
+        ['AVG R:R', '1:3'],
+        ['', ''],
+        ['A++ Count', quality_counts.get('A++', 0)],
+        ['A+ Count', quality_counts.get('A+', 0)],
+        ['A Count', quality_counts.get('A', 0)],
+        ['B Count', quality_counts.get('B', 0)]
     ]
     ws_output.update(f'A{len(payload)+2}', summary)
 
     print(f"\n=== DONE: {len(signals)} VSA SPRINGS | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
+    print(f"A++: {quality_counts.get('A++', 0)} | A+: {quality_counts.get('A+', 0)} | A: {quality_counts.get('A', 0)} | B: {quality_counts.get('B', 0)}")
 else:
-    ws_output.update('A1', [["Ref_Date", "Status", "Reason"], [date_str, "No VSA Springs Found", "3x Seller + 8% drop + 3x Confirm nahi mila"]])
+    ws_output.update('A1', [["Ref_Date", "Status", "Reason"], [date_str, "No VSA Springs Found", "2x Seller + 8% drop + 3x Confirm nahi mila"]])
     print("\n=== DONE: 0 SETUPS - Filter strict hai ===")
