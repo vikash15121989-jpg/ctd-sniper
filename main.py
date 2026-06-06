@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== OBV WEEKLY CROSSOVER + SWING BREAKOUT V6.1 ===")
+print("=== OBV ACCUMULATION BREAKOUT V7.0 ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -48,22 +48,25 @@ def calculate_obv(df):
     df['OBV'] = obv
     return df
 
-# 4. SWING POINTS FINDER
-def find_swing_points(df, left=2, right=2):
-    highs, lows = [], []
-    for i in range(left, len(df) - right):
-        # Swing High: middle candle highest
-        if df['High'].iloc[i] == df['High'].iloc[i-left:i+right+1].max():
-            highs.append({'idx': i, 'price': df['High'].iloc[i], 'date': df.index[i]})
-        # Swing Low: middle candle lowest
-        if df['Low'].iloc[i] == df['Low'].iloc[i-left:i+right+1].min():
-            lows.append({'idx': i, 'price': df['Low'].iloc[i], 'date': df.index[i]})
-    return highs, lows
+# 4. BASE DETECTOR - 3 MAHINE KA DABBA
+def is_accumulation_base(df, end_idx, lookback=60, max_range_pct=15):
+    if end_idx < lookback:
+        return False, None, None
+
+    base_df = df.iloc[end_idx-lookback:end_idx]
+    base_high = base_df['High'].max()
+    base_low = base_df['Low'].min()
+    base_range = (base_high - base_low) / base_low * 100
+
+    # 15% se kam range + kam se kam 40 din base me ho
+    if base_range <= max_range_pct and base_range > 3:
+        return True, base_high, base_low
+    return False, None, None
 
 # 5. MAIN STRATEGY
-def find_obv_swing_breakout(df_daily, end_date):
+def find_obv_accumulation_breakout(df_daily, end_date):
     df_daily = df_daily[df_daily.index <= end_date].copy()
-    if len(df_daily) < 250:
+    if len(df_daily) < 300:
         return []
 
     # WEEKLY DATA
@@ -82,9 +85,6 @@ def find_obv_swing_breakout(df_daily, end_date):
     df_daily = calculate_obv(df_daily)
     df_daily['OBV_20DMA'] = df_daily['OBV'].rolling(20).mean()
 
-    # SWING POINTS
-    swing_highs, swing_lows = find_swing_points(df_daily, left=2, right=2)
-
     setups = []
 
     # WEEKLY CROSSOVER CHECK
@@ -101,48 +101,40 @@ def find_obv_swing_breakout(df_daily, end_date):
         week_end_date = curr_wk.name
         week_start_idx = df_daily.index.get_indexer([week_end_date], method='bfill')[0]
 
-        # Us week ke baad 15 trading days me entry dhoondo
-        for j in range(week_start_idx, min(week_start_idx + 15, len(df_daily) - 1)):
+        # CONDITION-0: BASE CHECK - SABSE IMPORTANT
+        is_base, base_high, base_low = is_accumulation_base(df_daily, week_start_idx, lookback=60, max_range_pct=15)
+        if not is_base:
+            continue # Base nahi tha to skip
+
+        print(f"DEBUG: BASE FOUND {week_end_date.date()} | Range:{((base_high-base_low)/base_low*100):.1f}% | High:{base_high:.2f} Low:{base_low:.2f}")
+
+        # BASE KE BAAD BREAKOUT DHOONDO
+        for j in range(week_start_idx, min(week_start_idx + 20, len(df_daily) - 1)):
             today = df_daily.iloc[j]
 
             # CONDITION-2: DAILY OBV RISING
             if today['OBV'] <= today['OBV_20DMA']:
                 continue
 
-            # CONDITION-3: SWING HIGH BREAKOUT
-            # Recent swing high nikalo
-            recent_sh = [sh for sh in swing_highs if sh['idx'] < j]
-            if not recent_sh:
+            # CONDITION-3: BASE HIGH BREAKOUT
+            if today['Close'] <= base_high:
                 continue
-            last_swing_high = recent_sh[-1]['price']
-
-            # Breakout hua kya?
-            if today['Close'] <= last_swing_high:
-                continue
-
-            # CONDITION-4: SL = RECENT SWING LOW
-            recent_sl = [sl for sl in swing_lows if sl['idx'] < j]
-            if not recent_sl:
-                continue
-            last_swing_low = recent_sl[-1]['price']
 
             # ENTRY MILI
-            entry_idx = j
             entry_price = float(today['Close'])
-            sl = float(last_swing_low * 0.99) # 1% buffer niche
-
+            sl = float(base_low) # Base ka low hi SL
             risk = entry_price - sl
-            if risk <= 0 or risk/entry_price > 0.15: # 15% se zyada risk nahi
+
+            if risk <= 0:
                 continue
 
             target = float(entry_price + (risk * 3))
 
-            # DEBUG LOG
-            print(f"DEBUG: Entry {today.name.date()} | WkCross {week_end_date.date()} | SH:{last_swing_high:.2f} | SL:{sl:.2f} | Entry:{entry_price:.2f}")
+            print(f"DEBUG: ENTRY {today.name.date()} | Base:{base_low:.2f}-{base_high:.2f} | Entry:{entry_price:.2f} | SL:{sl:.2f}")
 
             # BACKTEST
             exit_price, exit_date, days, result = 0, None, 0, 'Running'
-            for k in range(entry_idx + 1, len(df_daily)):
+            for k in range(j + 1, len(df_daily)):
                 days += 1
                 h, l, c = df_daily['High'].iloc[k], df_daily['Low'].iloc[k], df_daily['Close'].iloc[k]
                 if l <= sl:
@@ -162,10 +154,11 @@ def find_obv_swing_breakout(df_daily, end_date):
             setups.append({
                 'entry_date': today.name.strftime('%Y-%m-%d'),
                 'weekly_crossover': week_end_date.strftime('%Y-%m-%d'),
+                'base_high': round(base_high, 2),
+                'base_low': round(base_low, 2),
+                'base_range_pct': round((base_high-base_low)/base_low*100, 1),
                 'entry_price': round(entry_price, 2),
-                'swing_high': round(last_swing_high, 2),
                 'sl': round(sl, 2),
-                'swing_low': round(last_swing_low, 2),
                 'target': round(target, 2),
                 'exit_date': exit_date.strftime('%Y-%m-%d'),
                 'exit_price': round(exit_price, 2),
@@ -174,7 +167,7 @@ def find_obv_swing_breakout(df_daily, end_date):
                 'result': result,
                 'risk_pct': round((risk/entry_price)*100, 1)
             })
-            break # Ek crossover pe ek entry
+            break
 
     return setups
 
@@ -191,14 +184,14 @@ for i, stock in enumerate(stocks):
             df.columns = df.columns.get_level_values(0)
         if len(df) < 300: continue
 
-        trades = find_obv_swing_breakout(df, ref_date)
+        trades = find_obv_accumulation_breakout(df, ref_date)
         if len(trades) == 0:
-            print("No OBV Swing Setup")
+            print("No Accumulation Setup")
             continue
 
         for trade in trades:
             rr = (trade['target'] - trade['entry_price']) / (trade['entry_price'] - trade['sl'])
-            print(f" ✅ {trade['weekly_crossover']}→{trade['entry_date']} | SH:{trade['swing_high']} | {trade['result']} | P&L: {trade['pl_pct']}%")
+            print(f" ✅ Base:{trade['base_range_pct']}% | {trade['weekly_crossover']}→{trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}%")
             signals.append({'Stock': stock, **trade, 'R:R': round(rr, 1)})
 
         time.sleep(0.3)
@@ -208,9 +201,9 @@ for i, stock in enumerate(stocks):
 
 # 7. SHEET UPDATE
 try:
-    ws_output = sh.worksheet("OBV_Swing_Setups")
+    ws_output = sh.worksheet("OBV_Accumulation_Setups")
 except:
-    ws_output = sh.add_worksheet(title="OBV_Swing_Setups", rows=1000, cols=16)
+    ws_output = sh.add_worksheet(title="OBV_Accumulation_Setups", rows=1000, cols=16)
 
 ws_output.clear()
 if signals:
@@ -231,15 +224,16 @@ if signals:
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
     total_pl = float(pd.Series(df_out['pl_pct']).astype(float).sum())
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
+    avg_base_range = round(df_out['base_range_pct'].mean(), 1)
 
     summary = [
-        ['', ''], ['STRATEGY', 'Weekly OBV Cross + Daily OBV Rise + Swing High Breakout'],
-        ['SL', 'Recent Swing Low'], ['TOTAL TRADES', int(total_trades)],
+        ['', ''], ['STRATEGY', 'Accumulation Base <15% + OBV Cross + Base BO'],
+        ['AVG BASE RANGE', f"{avg_base_range}%"], ['TOTAL TRADES', int(total_trades)],
         ['WINS', int(wins)], ['WIN RATE %', float(win_rate)],
         ['TOTAL P&L %', round(total_pl, 2)], ['AVG P&L %', float(avg_pl)]
     ]
     ws_output.update(f'A{len(payload)+2}', summary)
     print(f"\n=== DONE: {len(signals)} TRADES | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
 else:
-    ws_output.update('A1', [["No Setups Found"]])
+    ws_output.update('A1', [["No Accumulation Setups Found"]])
     print("\n=== DONE: 0 SETUPS ===")
