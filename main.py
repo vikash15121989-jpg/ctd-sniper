@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.6: NaN/INF FIX + DATE SORT ===")
+print("=== VSA SPRING SNIPER V5.0: CONFIRM THEN ENTRY ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -53,10 +53,9 @@ def calculate_buyer_seller(df):
         df.loc[df.index[i], 'Buyer_Vol'] = buyer
         df.loc[df.index[i], 'Seller_Vol'] = seller
 
-    df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER - ENTRY DATE LOGIC FIXED ✅
+# 4. VSA SPRING HUNTER - CONFIRM THEN ENTRY ✅
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -64,7 +63,6 @@ def find_vsa_spring(df, end_date):
 
     df_till_date = calculate_buyer_seller(df_till_date)
     setups = []
-
     start_idx = max(21, len(df_till_date) - 365)
 
     for i in range(start_idx, len(df_till_date) - 5):
@@ -81,7 +79,7 @@ def find_vsa_spring(df, end_date):
         if not (spring_ratio >= 2 and spring_drop < -0.08):
             continue
 
-        # CONDITION-2: CONFIRM - agle 3 din me dhoondo
+        # CONDITION-2: CONFIRM - agle 3 din me Buyer 3x Seller
         confirm = False
         confirm_idx = None
         for j in range(1, 4):
@@ -96,30 +94,19 @@ def find_vsa_spring(df, end_date):
         if not confirm:
             continue
 
-        # CONDITION-3: ENTRY - confirm ke baad pehla din jab Close > 20DMA ✅
-        entry_idx = None
-        for k in range(confirm_idx + 1, min(confirm_idx + 6, len(df_till_date))):
-            entry_candle = df_till_date.iloc[k]
-            if pd.isna(entry_candle['20DMA']): continue
-            if entry_candle['Close'] > entry_candle['20DMA']:
-                entry_idx = k
-                break
-
-        if entry_idx is None:
+        # CONDITION-3: ENTRY - Confirm ke agle din turant ✅
+        entry_idx = confirm_idx + 1
+        if entry_idx >= len(df_till_date):
             continue
 
         entry_candle = df_till_date.iloc[entry_idx]
         entry_price = float(entry_candle['Close'])
         sl = float(prev['Low'] * 0.98)
         risk = entry_price - sl
-
-        # FIX: Risk 0 hone pe skip karo taaki inf na aaye
-        if risk <= 0:
-            continue
+        if risk <= 0: continue
 
         target = float(entry_price + (risk * 3))
         risk_pct = (risk / entry_price) * 100
-
         if risk_pct > 10 or risk_pct < 0.5:
             continue
 
@@ -128,7 +115,6 @@ def find_vsa_spring(df, end_date):
         for j in range(entry_idx + 1, len(df)):
             days += 1
             h, l, c = df['High'].iloc[j], df['Low'].iloc[j], df['Close'].iloc[j]
-
             if l <= sl:
                 exit_price, exit_date, result = sl, df.index[j], 'SL Hit'
                 break
@@ -143,17 +129,11 @@ def find_vsa_spring(df, end_date):
 
         pl_pct = ((exit_price - entry_price) / entry_price) * 100
 
-        # QUALITY GRADE
-        if spring_ratio >= 5:
-            quality = "A++"
-        elif spring_ratio >= 4 and spring_ratio < 5:
-            quality = "A+"
-        elif spring_ratio >= 3 and spring_ratio < 4:
-            quality = "A"
-        elif spring_ratio >= 2 and spring_ratio < 3:
-            quality = "B"
-        else:
-            quality = "C"
+        if spring_ratio >= 5: quality = "A++"
+        elif spring_ratio >= 4: quality = "A+"
+        elif spring_ratio >= 3: quality = "A"
+        elif spring_ratio >= 2: quality = "B"
+        else: quality = "C"
 
         setups.append({
             'entry_date': entry_candle.name.strftime('%Y-%m-%d'),
@@ -186,18 +166,13 @@ for i, stock in enumerate(stocks):
         df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 150:
-            print("Data kam hai")
-            continue
+        if len(df) < 150: continue
 
         df['Vol_50'] = df['Volume'].rolling(50).mean()
         last_candle = df.iloc[-1]
         avg_vol = last_candle['Vol_50']
         avg_turnover = avg_vol * last_candle['Close']
-
-        if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000:
-            print("Volume/Turnover kam")
-            continue
+        if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000: continue
 
         trades = find_vsa_spring(df, ref_date)
         if len(trades) == 0:
@@ -206,15 +181,14 @@ for i, stock in enumerate(stocks):
 
         for trade in trades:
             rr = (trade['target'] - trade['entry_price']) / (trade['entry_price'] - trade['sl'])
-
-            print(f" ✅ {trade['quality']} | {trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}% | Ratio: {trade['spring_ratio']}x")
+            print(f" ✅ {trade['quality']} | {trade['spring_date']}→{trade['confirm_date']}→{trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}%")
 
             signals.append({
                 'Stock': stock,
                 'Quality': trade['quality'],
-                'Entry_Date': trade['entry_date'],
                 'Spring_Date': trade['spring_date'],
                 'Confirm_Date': trade['confirm_date'],
+                'Entry_Date': trade['entry_date'],
                 'Entry_Price': trade['entry_price'],
                 'SL': trade['sl'],
                 'Target': trade['target'],
@@ -226,8 +200,7 @@ for i, stock in enumerate(stocks):
                 'Risk_%': trade['risk_pct'],
                 'R:R': round(rr, 1),
                 'Spring_Ratio': trade['spring_ratio'],
-                'Spring_Drop_%': trade['spring_drop'],
-                'AvgVol_Lakh': round(avg_vol/100000, 1)
+                'Spring_Drop_%': trade['spring_drop']
             })
 
         if (i + 1) % 20 == 0:
@@ -236,67 +209,44 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE - NaN/INF FIX + DATE WISE SORT ✅
+# 6. SHEET UPDATE
 try:
     ws_output = sh.worksheet("VSA_Spring_Setups")
 except:
-    ws_output = sh.add_worksheet(title="VSA_Spring_Setups", rows=1000, cols=18)
+    ws_output = sh.add_worksheet(title="VSA_Spring_Setups", rows=1000, cols=17)
 
 ws_output.clear()
-if signals and len(signals) > 0:
+if signals:
     df_out = pd.DataFrame(signals)
-
-    # SORT BY ENTRY_DATE DESCENDING - RECENT FIRST ✅
     df_out = df_out.sort_values('Entry_Date', ascending=False)
+    df_out = df_out.replace([np.inf, -np.inf], np.nan).fillna('')
 
-    # FIX-1: NaN aur inf ko hatao taaki JSON error na aaye
-    df_out = df_out.replace([np.inf, -np.inf], np.nan)
-    df_out = df_out.fillna('')
-
-    # FIX-2: numpy types ko native python me convert karo
     def convert_to_native(val):
-        if isinstance(val, (np.integer, np.int64, np.int32)):
-            return int(val)
-        elif isinstance(val, (np.floating, np.float64, np.float32)):
-            return float(val)
-        elif isinstance(val, np.bool_):
-            return bool(val)
-        else:
-            return val
+        if isinstance(val, (np.integer, np.int64, np.int32)): return int(val)
+        elif isinstance(val, (np.floating, np.float64, np.float32)): return float(val)
+        elif isinstance(val, np.bool_): return bool(val)
+        else: return val
 
     df_out = df_out.applymap(convert_to_native)
-
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
 
     total_trades = len(df_out)
     wins = len(df_out[df_out['Result'] == 'Target Hit'])
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
-
-    # FIX-3: Summary me NaN check
     total_pl = float(pd.Series(df_out['P&L_%']).replace('', 0).astype(float).sum())
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
-
     quality_counts = df_out['Quality'].value_counts()
 
     summary = [
-        ['', ''],
-        ['TOTAL TRADES', int(total_trades)],
-        ['WINS', int(wins)],
-        ['WIN RATE %', float(win_rate)],
-        ['TOTAL P&L %', round(total_pl, 2)],
-        ['AVG P&L %', float(avg_pl)],
-        ['AVG R:R', '1:3'],
-        ['', ''],
-        ['A++ Count', int(quality_counts.get('A++', 0))],
-        ['A+ Count', int(quality_counts.get('A+', 0))],
-        ['A Count', int(quality_counts.get('A', 0))],
+        ['', ''], ['STRATEGY', 'Confirm → Next Day Entry'], ['TOTAL TRADES', int(total_trades)],
+        ['WINS', int(wins)], ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', round(total_pl, 2)],
+        ['AVG P&L %', float(avg_pl)], ['', ''], ['A++ Count', int(quality_counts.get('A++', 0))],
+        ['A+ Count', int(quality_counts.get('A+', 0))], ['A Count', int(quality_counts.get('A', 0))],
         ['B Count', int(quality_counts.get('B', 0))]
     ]
     ws_output.update(f'A{len(payload)+2}', summary)
-
-    print(f"\n=== DONE: {len(signals)} VSA SPRINGS | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
-    print(f"A++: {quality_counts.get('A++', 0)} | A+: {quality_counts.get('A+', 0)} | A: {quality_counts.get('A', 0)} | B: {quality_counts.get('B', 0)}")
+    print(f"\n=== DONE: {len(signals)} TRADES | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
 else:
-    ws_output.update('A1', [["Ref_Date", "Status", "Reason"], [date_str, "No VSA Springs Found", "2x Seller + 8% drop + 3x Confirm nahi mila"]])
-    print("\n=== DONE: 0 SETUPS - Filter strict hai ===")
+    ws_output.update('A1', [["No Setups Found"]])
+    print("\n=== DONE: 0 SETUPS ===")
