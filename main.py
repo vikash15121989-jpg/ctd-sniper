@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== OBV SQUEEZE BACKTEST V8.1 ===")
+print("=== OBV SQUEEZE BACKTEST V8.1 - FIXED ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -17,10 +17,23 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. A1 DATE
+# 2. A1 DATE - MULTI FORMAT SUPPORT
 date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
-ref_date = datetime.strptime(date_raw, '%Y-%m-%d')
-print(f"Backtest Till Date: {ref_date.date()}")
+date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
+
+ref_date = None
+for fmt in date_formats:
+    try:
+        ref_date = datetime.strptime(date_raw, fmt)
+        break
+    except ValueError:
+        continue
+
+if ref_date is None:
+    raise ValueError(f"A1 me date format galat: {date_raw}")
+
+date_str = ref_date.strftime('%Y-%m-%d')
+print(f"Backtest Till Date: {date_str}")
 
 # 3. OBV CALCULATOR
 def calculate_obv(df):
