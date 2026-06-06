@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.5: DATE WISE SORTED ===")
+print("=== VSA SPRING SNIPER V3.6: NaN/INF FIX + DATE SORT ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -56,7 +56,7 @@ def calculate_buyer_seller(df):
     df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER - ENTRY DATE FIXED ✅
+# 4. VSA SPRING HUNTER - ENTRY DATE LOGIC FIXED ✅
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -96,7 +96,7 @@ def find_vsa_spring(df, end_date):
         if not confirm:
             continue
 
-        # CONDITION-3: ENTRY - confirm ke baad pehla din jab Close > 20DMA
+        # CONDITION-3: ENTRY - confirm ke baad pehla din jab Close > 20DMA ✅
         entry_idx = None
         for k in range(confirm_idx + 1, min(confirm_idx + 6, len(df_till_date))):
             entry_candle = df_till_date.iloc[k]
@@ -112,6 +112,11 @@ def find_vsa_spring(df, end_date):
         entry_price = float(entry_candle['Close'])
         sl = float(prev['Low'] * 0.98)
         risk = entry_price - sl
+
+        # FIX: Risk 0 hone pe skip karo taaki inf na aaye
+        if risk <= 0:
+            continue
+
         target = float(entry_price + (risk * 3))
         risk_pct = (risk / entry_price) * 100
 
@@ -231,7 +236,7 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE - DATE WISE SORTED ✅
+# 6. SHEET UPDATE - NaN/INF FIX + DATE WISE SORT ✅
 try:
     ws_output = sh.worksheet("VSA_Spring_Setups")
 except:
@@ -244,6 +249,11 @@ if signals and len(signals) > 0:
     # SORT BY ENTRY_DATE DESCENDING - RECENT FIRST ✅
     df_out = df_out.sort_values('Entry_Date', ascending=False)
 
+    # FIX-1: NaN aur inf ko hatao taaki JSON error na aaye
+    df_out = df_out.replace([np.inf, -np.inf], np.nan)
+    df_out = df_out.fillna('')
+
+    # FIX-2: numpy types ko native python me convert karo
     def convert_to_native(val):
         if isinstance(val, (np.integer, np.int64, np.int32)):
             return int(val)
@@ -262,7 +272,9 @@ if signals and len(signals) > 0:
     total_trades = len(df_out)
     wins = len(df_out[df_out['Result'] == 'Target Hit'])
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
-    total_pl = float(df_out['P&L_%'].sum())
+
+    # FIX-3: Summary me NaN check
+    total_pl = float(pd.Series(df_out['P&L_%']).replace('', 0).astype(float).sum())
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
 
     quality_counts = df_out['Quality'].value_counts()
