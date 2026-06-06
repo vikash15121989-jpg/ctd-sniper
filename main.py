@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V3.3: FINAL JSON FIX ===")
+print("=== VSA SPRING SNIPER V3.5: DATE WISE SORTED ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -56,7 +56,7 @@ def calculate_buyer_seller(df):
     df['20DMA'] = df['Close'].rolling(20).mean()
     return df
 
-# 4. VSA SPRING HUNTER
+# 4. VSA SPRING HUNTER - ENTRY DATE FIXED ✅
 def find_vsa_spring(df, end_date):
     df_till_date = df[df.index <= end_date].copy()
     if len(df_till_date) < 50:
@@ -67,9 +67,8 @@ def find_vsa_spring(df, end_date):
 
     start_idx = max(21, len(df_till_date) - 365)
 
-    for i in range(start_idx, len(df_till_date) - 4):
-        curr = df_till_date.iloc[i]
-        prev = df_till_date.iloc[i-1]
+    for i in range(start_idx, len(df_till_date) - 5):
+        prev = df_till_date.iloc[i-1] # Spring candle
 
         prev_buyer = prev['Buyer_Vol']
         prev_seller = prev['Seller_Vol']
@@ -78,9 +77,11 @@ def find_vsa_spring(df, end_date):
         spring_ratio = prev_seller / prev_buyer
         spring_drop = (prev['Low'] - prev['Open']) / prev['Open']
 
+        # CONDITION-1: SPRING
         if not (spring_ratio >= 2 and spring_drop < -0.08):
             continue
 
+        # CONDITION-2: CONFIRM - agle 3 din me dhoondo
         confirm = False
         confirm_idx = None
         for j in range(1, 4):
@@ -95,10 +96,20 @@ def find_vsa_spring(df, end_date):
         if not confirm:
             continue
 
-        if pd.isna(curr['20DMA']) or curr['Close'] <= curr['20DMA']:
+        # CONDITION-3: ENTRY - confirm ke baad pehla din jab Close > 20DMA
+        entry_idx = None
+        for k in range(confirm_idx + 1, min(confirm_idx + 6, len(df_till_date))):
+            entry_candle = df_till_date.iloc[k]
+            if pd.isna(entry_candle['20DMA']): continue
+            if entry_candle['Close'] > entry_candle['20DMA']:
+                entry_idx = k
+                break
+
+        if entry_idx is None:
             continue
 
-        entry_price = float(curr['Close'])
+        entry_candle = df_till_date.iloc[entry_idx]
+        entry_price = float(entry_candle['Close'])
         sl = float(prev['Low'] * 0.98)
         risk = entry_price - sl
         target = float(entry_price + (risk * 3))
@@ -107,8 +118,9 @@ def find_vsa_spring(df, end_date):
         if risk_pct > 10 or risk_pct < 0.5:
             continue
 
+        # BACKTEST
         exit_price, exit_date, days, result = 0, None, 0, 'Running'
-        for j in range(i + 1, len(df)):
+        for j in range(entry_idx + 1, len(df)):
             days += 1
             h, l, c = df['High'].iloc[j], df['Low'].iloc[j], df['Close'].iloc[j]
 
@@ -126,7 +138,7 @@ def find_vsa_spring(df, end_date):
 
         pl_pct = ((exit_price - entry_price) / entry_price) * 100
 
-        # QUALITY GRADE - TERA LOGIC
+        # QUALITY GRADE
         if spring_ratio >= 5:
             quality = "A++"
         elif spring_ratio >= 4 and spring_ratio < 5:
@@ -139,7 +151,7 @@ def find_vsa_spring(df, end_date):
             quality = "C"
 
         setups.append({
-            'entry_date': curr.name.strftime('%Y-%m-%d'),
+            'entry_date': entry_candle.name.strftime('%Y-%m-%d'),
             'spring_date': prev.name.strftime('%Y-%m-%d'),
             'confirm_date': df_till_date.iloc[confirm_idx].name.strftime('%Y-%m-%d'),
             'entry_price': round(entry_price, 2),
@@ -219,7 +231,7 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE - JSON FIX FINAL ✅
+# 6. SHEET UPDATE - DATE WISE SORTED ✅
 try:
     ws_output = sh.worksheet("VSA_Spring_Setups")
 except:
@@ -228,9 +240,10 @@ except:
 ws_output.clear()
 if signals and len(signals) > 0:
     df_out = pd.DataFrame(signals)
-    df_out = df_out.sort_values('P&L_%', ascending=False)
 
-    # FIX: numpy types ko native python me convert karo
+    # SORT BY ENTRY_DATE DESCENDING - RECENT FIRST ✅
+    df_out = df_out.sort_values('Entry_Date', ascending=False)
+
     def convert_to_native(val):
         if isinstance(val, (np.integer, np.int64, np.int32)):
             return int(val)
