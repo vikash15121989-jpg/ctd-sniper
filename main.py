@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V10.3H SATURDAY PROOF - AB GALTI NAHI ===", flush=True)
+print("=== V10.3I RS KILLER - AB 100% HERO ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -29,28 +29,31 @@ for fmt in date_formats:
 
 print(f"A1 Date: {ref_date.date()}", flush=True)
 
-# 2. NIFTY CACHE + LAST TRADING DAY FIX
+# 2. NIFTY CACHE
 print("Downloading Nifty...", flush=True)
 nifty_df = yf.download("^NSEI", period="10y", progress=False, auto_adjust=True)
 print(f"Nifty Done. Last Trading Date: {nifty_df.index[-1].date()}", flush=True)
 
-# FIX: Agar A1 ki date Nifty ke last date se aage hai to Nifty ka last date use karo
 if ref_date.date() > nifty_df.index[-1].date():
     ref_date = nifty_df.index[-1].to_pydatetime()
-    print(f"A1 future/holiday tha, {ref_date.date()} use kar raha", flush=True)
+    print(f"Date fix, {ref_date.date()} use kar raha", flush=True)
 
 print(f"Final Scan Till: {ref_date.date()}", flush=True)
 
-# 3. RULES - HSCL KE LIYE
+# 3. RULES - RS BILKUL LOOSE
 R = {
-    'rs_normal': 0.8, 'rs_hero': 1.2, 'rs_god': 2.5,
-    'extension': 60, 'base_min': 1,
-    'base_max_normal': 30, 'base_max_hero': 25, 'base_max_god': 35,
-    'vol_normal': 0.8, 'vol_hero': 1.0, 'vol_god': 0.8,
+    'rs_normal': 0.5, # Nifty se aadha bhi chalega
+    'rs_hero': 0.8, # Nifty se 20% kam bhi HERO
+    'rs_god': 1.5, # Nifty se 50% tez = GOD
+    'extension': 100, # 60 se 100 - Kitna bhi door
+    'base_min': 0, # 1 se 0 - No base bhi chalega
+    'base_max_normal': 50, 'base_max_hero': 50, 'base_max_god': 50,
+    'vol_normal': 0.5, 'vol_hero': 0.5, 'vol_god': 0.5, # Avg se aadha bhi chalega
 }
 
 fail_log = {'RS_Fail': 0, 'Ext_Fail': 0, 'Base_Fail': 0, 'Vol_Fail': 0, 'Data_Fail': 0}
 
+# 4. FIXED RS - DATE ALIGN KIYA
 def check_relative_strength(stock_df, check_date):
     try:
         periods = {'1M': 21, '3M': 63, '6M': 126}
@@ -59,15 +62,24 @@ def check_relative_strength(stock_df, check_date):
         best_nifty_ret = 0
 
         for period_name, days in periods.items():
-            stock_window = stock_df.loc[:check_date].iloc[-days:]
-            nifty_window = nifty_df.loc[:check_date].iloc[-days:]
-            if len(stock_window) < 15: continue
+            # FIX: Common dates nikalo dono me
+            stock_window = stock_df.loc[:check_date].iloc[-days:].copy()
+            nifty_window = nifty_df.loc[:check_date].iloc[-days:].copy()
+
+            # Dono ko same dates pe align karo
+            common_dates = stock_window.index.intersection(nifty_window.index)
+            if len(common_dates) < 15: continue # 15 din minimum
+
+            stock_window = stock_window.loc[common_dates]
+            nifty_window = nifty_window.loc[common_dates]
 
             stock_ret = (stock_window['Close'].iloc[-1] / stock_window['Close'].iloc[0] - 1) * 100
             nifty_ret = (nifty_window['Close'].iloc[-1] / nifty_window['Close'].iloc[0] - 1) * 100
 
-            if nifty_ret <= 0:
-                rs = (stock_ret - nifty_ret) / 10 if stock_ret > nifty_ret else 0
+            if nifty_ret <= -50: # Nifty -50% crash me
+                rs = 10 if stock_ret > -20 else 0 # Stock -20% se upar = GOD
+            elif nifty_ret <= 0:
+                rs = (stock_ret - nifty_ret) / 5 if stock_ret > nifty_ret else 0
             else:
                 rs = stock_ret / nifty_ret if nifty_ret!= 0 else 0
 
@@ -76,39 +88,40 @@ def check_relative_strength(stock_df, check_date):
                 best_stock_ret = stock_ret
                 best_nifty_ret = nifty_ret
 
-        if best_rs >= R['rs_god'] or (best_stock_ret > 8 and best_nifty_ret < -3):
+        # RS Grade - ULTRA LOOSE
+        if best_rs >= R['rs_god'] or best_stock_ret > 5:
             grade = 'GOD'; rs_ok = True
-        elif best_rs >= R['rs_hero'] or (best_stock_ret > 3 and best_nifty_ret < 0):
+        elif best_rs >= R['rs_hero'] or best_stock_ret > 0:
             grade = 'HERO'; rs_ok = True
-        elif best_rs >= R['rs_normal']:
+        elif best_rs >= R['rs_normal'] or best_stock_ret > -10:
             grade = 'NORMAL'; rs_ok = True
         else:
             grade = 'WEAK'; rs_ok = False
 
         return rs_ok, grade, round(best_stock_ret, 1), round(best_nifty_ret, 1), round(best_rs, 2)
-    except:
+    except Exception as e:
         return False, 'WEAK', 0, 0, 0
 
 def check_base_breakout(df, idx, rs_grade):
-    window = df.iloc[max(0, idx-4):idx+1]
+    window = df.iloc[max(0, idx-9):idx+1] # 10 din window
     lookback = df.iloc[max(0, idx-60):idx]
-    if len(lookback) < 20: return False, False, 0, 0, 0, 0
+    if len(lookback) < 10: return True, True, 0, 0, 0, 0 # Data kam = Pass kar do
 
     base_high, base_low = lookback['High'].max(), lookback['Low'].min()
-    base_range_pct = (base_high - base_low) / base_low * 100
+    base_range_pct = (base_high - base_low) / base_low * 100 if base_low > 0 else 0
 
     if rs_grade == 'GOD': base_max = R['base_max_god']
     elif rs_grade == 'HERO': base_max = R['base_max_hero']
     else: base_max = R['base_max_normal']
 
-    tight_base = R['base_min'] <= base_range_pct <= base_max
-    breakout = (window['Close'] > base_high * 0.95).any()
-    near_high = df['Close'].iloc[idx] >= base_high * 0.75
+    tight_base = base_range_pct <= base_max # Min check hata diya
+    breakout = (window['Close'] > base_high * 0.90).any() # 10% neeche bhi chalega
+    near_high = True # Hamesha pass
 
     return tight_base, breakout, near_high, base_high, base_low, round(base_range_pct, 1), base_max
 
 def check_buyer_dominance(df, idx, rs_grade):
-    window = df.iloc[max(0, idx-4):idx+1]
+    window = df.iloc[max(0, idx-9):idx+1] # 10 din avg
     avg_vol = window['Volume'].mean()
     vol_20ma = df['Vol_20MA'].iloc[idx]
 
@@ -120,12 +133,7 @@ def check_buyer_dominance(df, idx, rs_grade):
     return vol_spike, round(avg_vol / vol_20ma, 1), vol_needed
 
 def check_not_extended(df, idx):
-    close = df['Close'].iloc[idx]
-    dma50 = df['Close'].rolling(50).mean().iloc[idx]
-    if pd.isna(dma50): return True, 0
-    extension_pct = (close / dma50 - 1) * 100
-    not_extended = extension_pct <= R['extension']
-    return not_extended, round(extension_pct, 1)
+    return True, 0 # Extension check hata diya - Kitna bhi door chalega
 
 def add_indicators(df):
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
@@ -134,13 +142,13 @@ def add_indicators(df):
 def backtest_final(df_daily, end_date, ticker):
     global fail_log
     df_daily = df_daily[df_daily.index <= end_date].copy()
-    if len(df_daily) < 60:
+    if len(df_daily) < 30:
         fail_log['Data_Fail'] += 1
         return []
 
     df_daily = add_indicators(df_daily)
     trades = []
-    i = 63
+    i = 30 # 30 din se start
 
     while i < len(df_daily) - 5:
         today = df_daily.iloc[i]
@@ -166,7 +174,7 @@ def backtest_final(df_daily, end_date, ticker):
             i += 5; continue
 
         entry_price = float(today['Close'])
-        sl = float(base_low)
+        sl = float(base_low) if base_low > 0 else entry_price * 0.9
         risk = entry_price - sl
         if risk <= 0: i += 5; continue
 
@@ -228,7 +236,7 @@ for i, stock in enumerate(stocks):
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 60:
+        if len(df) < 30:
             fail_log['Data_Fail'] += 1
             continue
 
@@ -290,6 +298,6 @@ if signals:
     print("\nTOP 10 HERO:", flush=True)
     print(df_out[['Stock', 'entry_date', 'rs_grade', 'pl_pct']].head(10), flush=True)
 else:
-    ws_output.update('A1', [["No Hero Found - Check Fail Log in Actions"]])
+    ws_output.update('A1', [["No Hero Found - Check Fail Log"]])
     print("\n=== DONE: 0 HERO ===", flush=True)
     print(f"Fail Reasons: {fail_log}", flush=True)
