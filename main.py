@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VSA SPRING SNIPER V5.0: CONFIRM THEN ENTRY ===")
+print("=== OBV WEEKLY CROSSOVER + SWING BREAKOUT V6.1 ===")
 
 # 1. GOOGLE SHEET CONNECT
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -33,129 +33,152 @@ if ref_date is None:
     raise ValueError(f"A1 me date format galat: {date_raw}")
 
 date_str = ref_date.strftime('%Y-%m-%d')
-print(f"Reference Date: {date_str}")
+print(f"Backtest Till Date: {date_str}")
 
-# 3. BUYER/SELLER CALCULATOR
-def calculate_buyer_seller(df):
-    df = df.copy()
-    df['Buyer_Vol'] = 0
-    df['Seller_Vol'] = 0
-
-    for i in range(len(df)):
-        h, l, c, v = df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i], df['Volume'].iloc[i]
-        range_hl = h - l
-        if range_hl == 0:
-            buyer, seller = 0, 0
+# 3. OBV CALCULATOR
+def calculate_obv(df):
+    obv = [0]
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+            obv.append(obv[-1] + df['Volume'].iloc[i])
+        elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+            obv.append(obv[-1] - df['Volume'].iloc[i])
         else:
-            buyer = (c - l) / range_hl * v
-            seller = (h - c) / range_hl * v
-
-        df.loc[df.index[i], 'Buyer_Vol'] = buyer
-        df.loc[df.index[i], 'Seller_Vol'] = seller
-
+            obv.append(obv[-1])
+    df['OBV'] = obv
     return df
 
-# 4. VSA SPRING HUNTER - CONFIRM THEN ENTRY ✅
-def find_vsa_spring(df, end_date):
-    df_till_date = df[df.index <= end_date].copy()
-    if len(df_till_date) < 50:
+# 4. SWING POINTS FINDER
+def find_swing_points(df, left=2, right=2):
+    highs, lows = [], []
+    for i in range(left, len(df) - right):
+        # Swing High: middle candle highest
+        if df['High'].iloc[i] == df['High'].iloc[i-left:i+right+1].max():
+            highs.append({'idx': i, 'price': df['High'].iloc[i], 'date': df.index[i]})
+        # Swing Low: middle candle lowest
+        if df['Low'].iloc[i] == df['Low'].iloc[i-left:i+right+1].min():
+            lows.append({'idx': i, 'price': df['Low'].iloc[i], 'date': df.index[i]})
+    return highs, lows
+
+# 5. MAIN STRATEGY
+def find_obv_swing_breakout(df_daily, end_date):
+    df_daily = df_daily[df_daily.index <= end_date].copy()
+    if len(df_daily) < 250:
         return []
 
-    df_till_date = calculate_buyer_seller(df_till_date)
+    # WEEKLY DATA
+    df_weekly = df_daily.resample('W-FRI').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+    }).dropna()
+
+    if len(df_weekly) < 30:
+        return []
+
+    # WEEKLY OBV + 20MA
+    df_weekly = calculate_obv(df_weekly)
+    df_weekly['OBV_20MA'] = df_weekly['OBV'].rolling(20).mean()
+
+    # DAILY OBV + 20DMA
+    df_daily = calculate_obv(df_daily)
+    df_daily['OBV_20DMA'] = df_daily['OBV'].rolling(20).mean()
+
+    # SWING POINTS
+    swing_highs, swing_lows = find_swing_points(df_daily, left=2, right=2)
+
     setups = []
-    start_idx = max(21, len(df_till_date) - 365)
 
-    for i in range(start_idx, len(df_till_date) - 5):
-        prev = df_till_date.iloc[i-1] # Spring candle
+    # WEEKLY CROSSOVER CHECK
+    for i in range(21, len(df_weekly)):
+        prev_wk = df_weekly.iloc[i-1]
+        curr_wk = df_weekly.iloc[i]
 
-        prev_buyer = prev['Buyer_Vol']
-        prev_seller = prev['Seller_Vol']
-        if prev_buyer == 0: continue
-
-        spring_ratio = prev_seller / prev_buyer
-        spring_drop = (prev['Low'] - prev['Open']) / prev['Open']
-
-        # CONDITION-1: SPRING
-        if not (spring_ratio >= 2 and spring_drop < -0.08):
+        # CONDITION-1: WEEKLY OBV CROSSOVER
+        if pd.isna(prev_wk['OBV_20MA']) or pd.isna(curr_wk['OBV_20MA']):
+            continue
+        if not (prev_wk['OBV'] < prev_wk['OBV_20MA'] and curr_wk['OBV'] > curr_wk['OBV_20MA']):
             continue
 
-        # CONDITION-2: CONFIRM - agle 3 din me Buyer 3x Seller
-        confirm = False
-        confirm_idx = None
-        for j in range(1, 4):
-            if i + j >= len(df_till_date): break
-            conf_candle = df_till_date.iloc[i + j]
-            if conf_candle['Seller_Vol'] == 0: continue
-            if conf_candle['Buyer_Vol'] / conf_candle['Seller_Vol'] > 3:
-                confirm = True
-                confirm_idx = i + j
-                break
+        week_end_date = curr_wk.name
+        week_start_idx = df_daily.index.get_indexer([week_end_date], method='bfill')[0]
 
-        if not confirm:
-            continue
+        # Us week ke baad 15 trading days me entry dhoondo
+        for j in range(week_start_idx, min(week_start_idx + 15, len(df_daily) - 1)):
+            today = df_daily.iloc[j]
 
-        # CONDITION-3: ENTRY - Confirm ke agle din turant ✅
-        entry_idx = confirm_idx + 1
-        if entry_idx >= len(df_till_date):
-            continue
+            # CONDITION-2: DAILY OBV RISING
+            if today['OBV'] <= today['OBV_20DMA']:
+                continue
 
-        entry_candle = df_till_date.iloc[entry_idx]
-        entry_price = float(entry_candle['Close'])
-        sl = float(prev['Low'] * 0.98)
-        risk = entry_price - sl
-        if risk <= 0: continue
+            # CONDITION-3: SWING HIGH BREAKOUT
+            # Recent swing high nikalo
+            recent_sh = [sh for sh in swing_highs if sh['idx'] < j]
+            if not recent_sh:
+                continue
+            last_swing_high = recent_sh[-1]['price']
 
-        target = float(entry_price + (risk * 3))
-        risk_pct = (risk / entry_price) * 100
-        if risk_pct > 10 or risk_pct < 0.5:
-            continue
+            # Breakout hua kya?
+            if today['Close'] <= last_swing_high:
+                continue
 
-        # BACKTEST
-        exit_price, exit_date, days, result = 0, None, 0, 'Running'
-        for j in range(entry_idx + 1, len(df)):
-            days += 1
-            h, l, c = df['High'].iloc[j], df['Low'].iloc[j], df['Close'].iloc[j]
-            if l <= sl:
-                exit_price, exit_date, result = sl, df.index[j], 'SL Hit'
-                break
-            if h >= target:
-                exit_price, exit_date, result = target, df.index[j], 'Target Hit'
-                break
-            if j == len(df) - 1:
-                exit_price, exit_date, result = float(c), df.index[j], 'Running'
+            # CONDITION-4: SL = RECENT SWING LOW
+            recent_sl = [sl for sl in swing_lows if sl['idx'] < j]
+            if not recent_sl:
+                continue
+            last_swing_low = recent_sl[-1]['price']
 
-        if exit_date is None:
-            continue
+            # ENTRY MILI
+            entry_idx = j
+            entry_price = float(today['Close'])
+            sl = float(last_swing_low * 0.99) # 1% buffer niche
 
-        pl_pct = ((exit_price - entry_price) / entry_price) * 100
+            risk = entry_price - sl
+            if risk <= 0 or risk/entry_price > 0.15: # 15% se zyada risk nahi
+                continue
 
-        if spring_ratio >= 5: quality = "A++"
-        elif spring_ratio >= 4: quality = "A+"
-        elif spring_ratio >= 3: quality = "A"
-        elif spring_ratio >= 2: quality = "B"
-        else: quality = "C"
+            target = float(entry_price + (risk * 3))
 
-        setups.append({
-            'entry_date': entry_candle.name.strftime('%Y-%m-%d'),
-            'spring_date': prev.name.strftime('%Y-%m-%d'),
-            'confirm_date': df_till_date.iloc[confirm_idx].name.strftime('%Y-%m-%d'),
-            'entry_price': round(entry_price, 2),
-            'sl': round(sl, 2),
-            'target': round(target, 2),
-            'exit_date': exit_date.strftime('%Y-%m-%d'),
-            'exit_price': round(exit_price, 2),
-            'days': int(days),
-            'pl_pct': round(pl_pct, 2),
-            'result': result,
-            'risk_pct': round(risk_pct, 1),
-            'spring_ratio': round(spring_ratio, 1),
-            'spring_drop': round(spring_drop * 100, 1),
-            'quality': quality
-        })
+            # DEBUG LOG
+            print(f"DEBUG: Entry {today.name.date()} | WkCross {week_end_date.date()} | SH:{last_swing_high:.2f} | SL:{sl:.2f} | Entry:{entry_price:.2f}")
+
+            # BACKTEST
+            exit_price, exit_date, days, result = 0, None, 0, 'Running'
+            for k in range(entry_idx + 1, len(df_daily)):
+                days += 1
+                h, l, c = df_daily['High'].iloc[k], df_daily['Low'].iloc[k], df_daily['Close'].iloc[k]
+                if l <= sl:
+                    exit_price, exit_date, result = sl, df_daily.index[k], 'SL Hit'
+                    break
+                if h >= target:
+                    exit_price, exit_date, result = target, df_daily.index[k], 'Target Hit'
+                    break
+                if k == len(df_daily) - 1:
+                    exit_price, exit_date, result = float(c), df_daily.index[k], 'Running'
+
+            if exit_date is None:
+                continue
+
+            pl_pct = ((exit_price - entry_price) / entry_price) * 100
+
+            setups.append({
+                'entry_date': today.name.strftime('%Y-%m-%d'),
+                'weekly_crossover': week_end_date.strftime('%Y-%m-%d'),
+                'entry_price': round(entry_price, 2),
+                'swing_high': round(last_swing_high, 2),
+                'sl': round(sl, 2),
+                'swing_low': round(last_swing_low, 2),
+                'target': round(target, 2),
+                'exit_date': exit_date.strftime('%Y-%m-%d'),
+                'exit_price': round(exit_price, 2),
+                'days': int(days),
+                'pl_pct': round(pl_pct, 2),
+                'result': result,
+                'risk_pct': round((risk/entry_price)*100, 1)
+            })
+            break # Ek crossover pe ek entry
 
     return setups
 
-# 5. MAIN LOOP
+# 6. MAIN LOOP
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
@@ -163,68 +186,40 @@ signals = []
 for i, stock in enumerate(stocks):
     print(f"\n--- [{i+1}/{len(stocks)}] {stock} ---")
     try:
-        df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=True)
+        df = yf.download(f"{stock}.NS", period="5y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 150: continue
+        if len(df) < 300: continue
 
-        df['Vol_50'] = df['Volume'].rolling(50).mean()
-        last_candle = df.iloc[-1]
-        avg_vol = last_candle['Vol_50']
-        avg_turnover = avg_vol * last_candle['Close']
-        if pd.isna(avg_vol) or avg_vol < 1000000 or avg_turnover < 30000000: continue
-
-        trades = find_vsa_spring(df, ref_date)
+        trades = find_obv_swing_breakout(df, ref_date)
         if len(trades) == 0:
-            print("No VSA Spring")
+            print("No OBV Swing Setup")
             continue
 
         for trade in trades:
             rr = (trade['target'] - trade['entry_price']) / (trade['entry_price'] - trade['sl'])
-            print(f" ✅ {trade['quality']} | {trade['spring_date']}→{trade['confirm_date']}→{trade['entry_date']} | {trade['result']} | P&L: {trade['pl_pct']}%")
+            print(f" ✅ {trade['weekly_crossover']}→{trade['entry_date']} | SH:{trade['swing_high']} | {trade['result']} | P&L: {trade['pl_pct']}%")
+            signals.append({'Stock': stock, **trade, 'R:R': round(rr, 1)})
 
-            signals.append({
-                'Stock': stock,
-                'Quality': trade['quality'],
-                'Spring_Date': trade['spring_date'],
-                'Confirm_Date': trade['confirm_date'],
-                'Entry_Date': trade['entry_date'],
-                'Entry_Price': trade['entry_price'],
-                'SL': trade['sl'],
-                'Target': trade['target'],
-                'Exit_Date': trade['exit_date'],
-                'Exit_Price': trade['exit_price'],
-                'Days': trade['days'],
-                'P&L_%': trade['pl_pct'],
-                'Result': trade['result'],
-                'Risk_%': trade['risk_pct'],
-                'R:R': round(rr, 1),
-                'Spring_Ratio': trade['spring_ratio'],
-                'Spring_Drop_%': trade['spring_drop']
-            })
-
-        if (i + 1) % 20 == 0:
-            time.sleep(0.5)
+        time.sleep(0.3)
 
     except Exception as e:
         print(f"Error: {stock}: {e}")
 
-# 6. SHEET UPDATE
+# 7. SHEET UPDATE
 try:
-    ws_output = sh.worksheet("VSA_Spring_Setups")
+    ws_output = sh.worksheet("OBV_Swing_Setups")
 except:
-    ws_output = sh.add_worksheet(title="VSA_Spring_Setups", rows=1000, cols=17)
+    ws_output = sh.add_worksheet(title="OBV_Swing_Setups", rows=1000, cols=16)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    df_out = df_out.sort_values('Entry_Date', ascending=False)
-    df_out = df_out.replace([np.inf, -np.inf], np.nan).fillna('')
+    df_out = df_out.sort_values('entry_date', ascending=False)
 
     def convert_to_native(val):
-        if isinstance(val, (np.integer, np.int64, np.int32)): return int(val)
-        elif isinstance(val, (np.floating, np.float64, np.float32)): return float(val)
-        elif isinstance(val, np.bool_): return bool(val)
+        if isinstance(val, (np.integer, np.int64)): return int(val)
+        elif isinstance(val, (np.floating, np.float64)): return float(val)
         else: return val
 
     df_out = df_out.applymap(convert_to_native)
@@ -232,18 +227,16 @@ if signals:
     ws_output.update('A1', payload)
 
     total_trades = len(df_out)
-    wins = len(df_out[df_out['Result'] == 'Target Hit'])
+    wins = len(df_out[df_out['result'] == 'Target Hit'])
     win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
-    total_pl = float(pd.Series(df_out['P&L_%']).replace('', 0).astype(float).sum())
+    total_pl = float(pd.Series(df_out['pl_pct']).astype(float).sum())
     avg_pl = round(total_pl / total_trades, 2) if total_trades > 0 else 0
-    quality_counts = df_out['Quality'].value_counts()
 
     summary = [
-        ['', ''], ['STRATEGY', 'Confirm → Next Day Entry'], ['TOTAL TRADES', int(total_trades)],
-        ['WINS', int(wins)], ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', round(total_pl, 2)],
-        ['AVG P&L %', float(avg_pl)], ['', ''], ['A++ Count', int(quality_counts.get('A++', 0))],
-        ['A+ Count', int(quality_counts.get('A+', 0))], ['A Count', int(quality_counts.get('A', 0))],
-        ['B Count', int(quality_counts.get('B', 0))]
+        ['', ''], ['STRATEGY', 'Weekly OBV Cross + Daily OBV Rise + Swing High Breakout'],
+        ['SL', 'Recent Swing Low'], ['TOTAL TRADES', int(total_trades)],
+        ['WINS', int(wins)], ['WIN RATE %', float(win_rate)],
+        ['TOTAL P&L %', round(total_pl, 2)], ['AVG P&L %', float(avg_pl)]
     ]
     ws_output.update(f'A{len(payload)+2}', summary)
     print(f"\n=== DONE: {len(signals)} TRADES | WIN RATE: {win_rate}% | TOTAL P&L: {total_pl:.1f}% ===")
