@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.5 YEAR WISE PERFECT BACKTEST ===", flush=True)
+print("=== V15.6 PERFECT BACKTEST FIXED ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -17,7 +17,7 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. PERFECT RULES
+# 2. PERFECT RULES - FIXED
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
@@ -29,7 +29,7 @@ R = {
     'target_pct': 15,
     'sl_pct': 8,
     'hold_days': 30,
-    'checks_per_stock': 999,
+    'checks_per_stock': 1, # FIX 1: SIRF 1 BAAR CHECK KARO PER STOCK PER YEAR
     'gap_between_checks': 1,
     'min_vol_ratio': 1.0,
     'min_pullback_pct': 10.0,
@@ -165,17 +165,14 @@ def check_entry_in_watchlist(df, watchlist_idx, entry_price):
 def backtest_stock_perfect_only(df_daily, ticker, start_date, end_date):
     df_daily = add_indicators(df_daily)
     if not check_liquidity(df_daily): return []
-    # Filter data for this year only
-    df_year = df_daily[(df_daily.index >= start_date) & (df_daily.index <= end_date)]
-    if len(df_year) < 50: return []
+
+    # FIX 2: Saal ke andar hi scan karo, poora history nahi
+    df_scan = df_daily[(df_daily.index >= start_date) & (df_daily.index <= end_date)]
+    if len(df_scan) < 50: return []
 
     trades = []
-    total_len = len(df_daily)
-    if total_len < 252: return []
-
-    for i in range(R['checks_per_stock']):
-        check_end_idx = total_len - 1 - (i * R['gap_between_checks'])
-        if check_end_idx < R['scan_window']: break
+    # FIX 3: End se scan karo aur pehla signal milte hi break
+    for check_end_idx in range(len(df_daily)-1, 251, -1):
         if df_daily.index[check_end_idx] < start_date: break
         if df_daily.index[check_end_idx] > end_date: continue
 
@@ -184,20 +181,22 @@ def backtest_stock_perfect_only(df_daily, ticker, start_date, end_date):
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, watchlist_idx, details['entry_price'])
         if not entry_ok: continue
         trades.append({'Stock': ticker, **details, **trade_details})
+        break # FIX 4: Ek stock me 1 saal me 1 trade bas
+
     return trades
 
 # MAIN LOOP - YEAR BY YEAR
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 
-years = [2024, 2025, 2026] # Last 3 saal
+years = [2024, 2025, 2026]
 all_year_results = []
 
 for year in years:
     print(f"\n=== SCANNING YEAR {year} ===", flush=True)
     start_date = datetime(year, 1, 1)
     end_date = datetime(year, 12, 31)
-    if year == 2026: end_date = datetime(2026, 6, 7) # Aaj tak
+    if year == 2026: end_date = datetime(2026, 6, 7)
 
     signals = []
     for i, stock in enumerate(stocks):
@@ -234,11 +233,7 @@ for year in years:
         print(f"YEAR {year}: {total_trades} Trades | {win_rate}% Win | {total_pl}% Total | {avg_pl}% Avg", flush=True)
     else:
         all_year_results.append({
-            'Year': year,
-            'Trades': 0,
-            'Win_Rate': 0,
-            'Total_PL': 0,
-            'Avg_PL': 0
+            'Year': year, 'Trades': 0, 'Win_Rate': 0, 'Total_PL': 0, 'Avg_PL': 0
         })
         print(f"YEAR {year}: 0 Trades", flush=True)
 
