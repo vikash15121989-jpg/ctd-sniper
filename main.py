@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.0 PULLBACK SILENT - TERA LOGIC ===", flush=True)
+print("=== V15.2 REAL SCORE ANALYSIS ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -33,28 +33,19 @@ if ref_date.date() > nifty_df.index[-1].date():
 
 print(f"Scan Till: {ref_date.date()}", flush=True)
 
-# 2. RULES - TERA LOGIC
+# 2. RULES
 R = {
-    # LIQUIDITY
     'min_price': 50,
     'min_daily_value_cr': 0.5,
     'min_vol_shares': 100000,
-
-    # UPTREND CHECK
-    'uptrend_days': 10, # Pichle 10 din me high ban raha ho
-    'vol_ma_days': 20, # Volume 20MA se compare
-
-    # SCAN WINDOW
-    'scan_window': 60, # Pichle 60 din me setup dhoondo
-
-    # SILENT & ENTRY
-    'silent_lookback': 10, # 10 din ka max vol/high
-    'watchlist_days': 10, # 10 din tak watchlist me
+    'uptrend_days': 10,
+    'vol_ma_days': 20,
+    'scan_window': 60,
+    'silent_lookback': 10,
+    'watchlist_days': 10,
     'target_pct': 15,
     'sl_pct': 8,
     'hold_days': 30,
-
-    # SAMPLING
     'checks_per_stock': 4,
     'gap_between_checks': 60,
 }
@@ -67,7 +58,6 @@ def add_indicators(df):
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
     df['Daily_Value'] = df['Close'] * df['Volume']
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
-    # Naya high bana ya nahi
     df['New_High_10D'] = df['High'] > df['High'].shift(1).rolling(10).max()
     return df
 
@@ -84,73 +74,58 @@ def check_liquidity(df):
         return False
 
 def find_pullback_silent(df, end_idx):
-    """
-    60 DIN SCAN KARO:
-    1. Uptrend dhoondo - Naye high + Volume support
-    2. Pullback mark karo - High nahi tuta + Vol kam
-    3. Silent entry - Vol fata + High nahi tuta = Watchlist
-    """
     try:
         start_idx = max(0, end_idx - R['scan_window'] + 1)
-
         for i in range(start_idx, end_idx + 1):
-            if i < 20: continue
+            if i < 252: continue
 
-            # STEP 1: UPTREND CHECK - Kya pehle high ban raha tha?
+            # UPTREND CHECK
             uptrend_start = i - R['uptrend_days']
             if uptrend_start < 0: continue
-
             uptrend_zone = df.iloc[uptrend_start:i]
-            # Pichle 10 din me kam se kam 3 naye high
             new_highs = uptrend_zone['New_High_10D'].sum()
-            # Volume 20MA se upar
             avg_vol = uptrend_zone['Volume'].mean()
             vol_20ma = df['Vol_20MA'].iloc[i]
-
             if pd.isna(vol_20ma): continue
             uptrend = new_highs >= 3 and avg_vol > vol_20ma
-
             if not uptrend: continue
 
-            # STEP 2: PULLBACK MARK - High ruka + Vol kam
+            # PULLBACK MARK
             row = df.iloc[i]
             vol_max_10d = row['Vol_10D_Max']
             high_max_10d = row['High_10D_Max']
-
             if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
-
-            # High break nahi kiya
             pullback_cond1 = row['High'] < high_max_10d
-            # Volume bhi kam hai
             pullback_cond2 = row['Volume'] < vol_max_10d
-
             if not (pullback_cond1 and pullback_cond2): continue
 
-            # Pullback mil gaya - Ab iske aage silent dhoondo
             pullback_idx = i
-
-            # STEP 3: SILENT ENTRY - Pullback ke baad 10 din me
             search_end = min(pullback_idx + 1 + R['watchlist_days'], len(df))
 
             for j in range(pullback_idx + 1, search_end):
                 silent_row = df.iloc[j]
                 vol_max_10d_silent = silent_row['Vol_10D_Max']
                 high_max_10d_silent = silent_row['High_10D_Max']
-
                 if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent): continue
 
-                # Bina volume ke high break = Ignore
                 if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent:
                     continue
 
-                # SILENT CONDITION: Vol fata + High nahi tuta
                 silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
                 silent_cond2 = silent_row['High'] < high_max_10d_silent
 
                 if silent_cond1 and silent_cond2:
-                    # WATCHLIST ME DALO
                     watchlist_date = df.index[j]
-                    entry_price = high_max_10d_silent # Pichle 10 din ka max = Entry
+                    entry_price = high_max_10d_silent
+
+                    # QUALITY SCORE CALC
+                    pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
+                    year_high = df['High'].iloc[max(0, j-252):j].max()
+                    nearness_52w = ((year_high - entry_price) / year_high) * 100
+                    vol_score = (silent_row['Volume'] / vol_max_10d_silent * 40)
+                    depth_score = (pullback_depth * 3)
+                    near_score = (max(0, 20-nearness_52w) * 1.5)
+                    score = vol_score + depth_score + near_score
 
                     details = {
                         'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
@@ -162,41 +137,32 @@ def find_pullback_silent(df, end_idx):
                         'silent_vol': int(silent_row['Volume']),
                         'silent_vol_10d_max': int(vol_max_10d_silent),
                         'silent_vol_ratio': round(silent_row['Volume'] / vol_max_10d_silent, 2),
+                        'pullback_depth': round(pullback_depth, 1),
+                        'nearness_52w': round(nearness_52w, 1),
+                        'quality_score': round(score, 1),
                         'entry_price': round(entry_price, 2),
-                        'watchlist_expiry': (watchlist_date + timedelta(days=R['watchlist_days'])).strftime('%Y-%m-%d')
                     }
                     return details, j
-
         return None, {}
     except:
         return None, {}
 
 def check_entry_in_watchlist(df, watchlist_idx, entry_price):
-    """
-    STEP 4: Watchlist me aane ke 10 din me entry price break kare to Entry
-    """
     try:
         start_idx = watchlist_idx + 1
         if start_idx >= len(df): return False, {}
-
         end_search = min(start_idx + R['watchlist_days'], len(df))
         window = df.iloc[start_idx:end_search]
-
         for i in range(len(window)):
             if window['High'].iloc[i] > entry_price:
-                # ENTRY MIL GAYA
                 entry_idx = start_idx + i
                 entry_date = window.index[i]
-
-                # EXIT
                 sl_price = entry_price * (1 - R['sl_pct']/100)
                 target_price = entry_price * (1 + R['target_pct']/100)
-
                 exit_idx = min(entry_idx + R['hold_days'], len(df) - 1)
                 exit_price = float(df['Close'].iloc[exit_idx])
                 exit_date = df.index[exit_idx]
                 result = f'Exit_{R["hold_days"]}D'
-
                 for k in range(entry_idx + 1, exit_idx + 1):
                     h, l = df['High'].iloc[k], df['Low'].iloc[k]
                     if l <= sl_price:
@@ -209,10 +175,8 @@ def check_entry_in_watchlist(df, watchlist_idx, entry_price):
                         exit_date = df.index[k]
                         result = f'Target +{R["target_pct"]}%'
                         break
-
                 pl_pct = ((exit_price - entry_price) / entry_price) * 100
                 hold_days = (exit_date - entry_date).days
-
                 return True, {
                     'entry_date': entry_date.strftime('%Y-%m-%d'),
                     'exit_date': exit_date.strftime('%Y-%m-%d'),
@@ -221,94 +185,71 @@ def check_entry_in_watchlist(df, watchlist_idx, entry_price):
                     'pl_pct': round(pl_pct, 2),
                     'result': result
                 }
-
-        return False, {'reason': 'No_Breakout_10D'}
+        return False, {}
     except:
         return False, {}
 
 def backtest_stock_pullback_silent(df_daily, ticker):
     df_daily = add_indicators(df_daily)
-
     if not check_liquidity(df_daily):
         fail_log['Liquidity'] += 1
         return []
-
     trades = []
     total_len = len(df_daily)
-    if total_len < 200:
+    if total_len < 252:
         fail_log['Data'] += 1
         return []
-
     for i in range(R['checks_per_stock']):
         check_end_idx = total_len - 1 - (i * R['gap_between_checks'])
         if check_end_idx < R['scan_window']: continue
-
-        # PULLBACK + SILENT DHUNDO
         details, watchlist_idx = find_pullback_silent(df_daily, check_end_idx)
         if details is None:
             fail_log['No_Silent'] += 1
             continue
-
-        # ENTRY DHUNDO
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, watchlist_idx, details['entry_price'])
-
         if not entry_ok:
             fail_log['No_Entry'] += 1
             continue
-
-        trades.append({
-            'Stock': ticker,
-            **details,
-            **trade_details
-        })
-
+        trades.append({'Stock': ticker, **details, **trade_details})
     return trades
 
-# 6. MAIN LOOP
+# MAIN LOOP
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks - PULLBACK SILENT MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks...", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Fail: L:{fail_log['Liquidity']} S:{fail_log['No_Silent']} E:{fail_log['No_Entry']}", flush=True)
-
-        start_date = ref_date - timedelta(days=730)
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)}", flush=True)
+        start_date = ref_date - timedelta(days=800)
         df = yf.download(f"{stock}.NS", start=start_date, end=ref_date + timedelta(days=1),
                         progress=False, auto_adjust=True, timeout=10)
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 200:
+        if len(df) < 252:
             fail_log['Data'] += 1
             continue
-
         trades = backtest_stock_pullback_silent(df, stock)
-        if len(trades) == 0: continue
-
-        for trade in trades:
-            print(f"🎯 {stock} Pullback:{trade['pullback_date']} | Watchlist:{trade['watchlist_date']} Vol:{trade['silent_vol_ratio']}x | Entry:{trade['entry_date']} @ {trade['entry_price']} | {trade['pl_pct']}%", flush=True)
-            signals.append(trade)
+        signals.extend(trades)
         time.sleep(0.2)
-    except Exception as e:
+    except:
         continue
 
-print(f"\nScan Complete. Total Pullback Silent Signals: {len(signals)}", flush=True)
-print(f"Fail Log: {fail_log}", flush=True)
+print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
 
-# 7. OUTPUT
+# OUTPUT + REAL SCORE ANALYSIS
 try:
-    ws_output = sh.worksheet("Pullback_Silent")
+    ws_output = sh.worksheet("Pullback_Silent_Real")
 except:
-    ws_output = sh.add_worksheet(title="Pullback_Silent", rows=5000, cols=25)
+    ws_output = sh.add_worksheet(title="Pullback_Silent_Real", rows=5000, cols=30)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    df_out = df_out.sort_values('pl_pct', ascending=False)
+    df_out = df_out.sort_values('quality_score', ascending=False)
 
     def convert_to_native(val):
         if isinstance(val, (np.integer, np.int64)): return int(val)
@@ -319,27 +260,59 @@ if signals:
     payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
     ws_output.update('A1', payload)
 
+    # BASIC STATS
     total_trades = len(df_out)
     win_trades = (df_out['pl_pct'] > 0).sum()
     win_rate = round(win_trades / total_trades * 100, 1)
     total_pl = round(df_out['pl_pct'].sum(), 2)
     avg_pl = round(df_out['pl_pct'].mean(), 1)
 
-    summary = [
-        ['', ''], ['TOTAL PULLBACK SILENT SIGNALS', int(total_trades)],
-        ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', float(total_pl)],
-        ['AVG P&L PER TRADE %', float(avg_pl)],
-        ['AVG SILENT VOL RATIO', float(df_out['silent_vol_ratio'].mean())],
-        ['', ''], ['FAIL REASONS', ''],
-        ['Liquidity Fail', int(fail_log['Liquidity'])],
-        ['No Pullback+Silent', int(fail_log['No_Silent'])],
-        ['Watchlist But No Entry', int(fail_log['No_Entry'])],
-        ['Data Error', int(fail_log['Data'])],
-    ]
+    # SCORE BUCKET ANALYSIS - REAL DATA
+    bins = [0, 60, 70, 80, 90, 100]
+    labels = ['0-60 Low', '60-70 Avg', '70-80 Good', '80-90 VGood', '90-100 Best']
+    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
 
-    ws_output.update(f'A{len(payload)+2}', summary)
+    score_analysis = df_out.groupby('Score_Bucket').agg({
+        'Stock': 'count',
+        'pl_pct': ['sum', 'mean', 'median', lambda x: (x > 0).sum()]
+    }).round(2)
+    score_analysis.columns = ['Trades', 'Total_PL', 'Avg_PL', 'Median_PL', 'Wins']
+    score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
+    score_analysis = score_analysis.drop('Wins', axis=1)
+
+    # RANK ANALYSIS - Top 10%, 20%, 50%
+    rank_analysis = []
+    for pct in [10, 20, 50]:
+        count = int(len(df_out) * pct / 100)
+        top_df = df_out.head(count)
+        rank_analysis.append([
+            f'Top {pct}%', count,
+            round((top_df['pl_pct'] > 0).mean() * 100, 1),
+            round(top_df['pl_pct'].sum(), 2),
+            round(top_df['pl_pct'].mean(), 2)
+        ])
+    rank_df = pd.DataFrame(rank_analysis, columns=['Rank', 'Trades', 'Win_Rate', 'Total_PL', 'Avg_PL'])
+
+    # OUTPUT TO SHEET
+    current_row = len(payload) + 3
+    ws_output.update(f'A{current_row}', [['MAIN STATS']])
+    ws_output.update(f'A{current_row+1}', [['Total Trades', total_trades], ['Win Rate %', win_rate],
+                                           ['Total P&L %', total_pl], ['Avg P&L %', avg_pl]])
+
+    current_row += 6
+    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS - REAL DATA']])
+    ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
+
+    current_row += len(score_analysis) + 3
+    ws_output.update(f'A{current_row}', [['RANK ANALYSIS - REAL DATA']])
+    ws_output.update(f'A{current_row+1}', [rank_df.columns.values.tolist()] + rank_df.values.tolist())
+
     print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
+    print("\n=== SCORE BUCKET REAL DATA ===", flush=True)
+    print(score_analysis, flush=True)
+    print("\n=== RANK REAL DATA ===", flush=True)
+    print(rank_df, flush=True)
+
 else:
-    ws_output.update('A1', [["No Pullback Silent Found"]])
+    ws_output.update('A1', [["No Signals Found"]])
     print("\n=== DONE: 0 SIGNALS ===", flush=True)
-    print(f"Fail Log: {fail_log}", flush=True)
