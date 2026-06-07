@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.6 PERFECT BACKTEST FIXED ===", flush=True)
+print("=== V15.8 1 YEAR FAST BACKTEST ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -17,7 +17,26 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 2. PERFECT RULES - FIXED
+date_raw = str(ws_watchlist.acell('A1').value).split(' ')[0]
+date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']
+ref_date = None
+for fmt in date_formats:
+    try:
+        ref_date = datetime.strptime(date_raw, fmt)
+        break
+    except ValueError:
+        continue
+
+# Nifty check
+nifty_df = yf.download("^NSEI", period="5y", progress=False, auto_adjust=True)
+if ref_date.date() > nifty_df.index[-1].date():
+    ref_date = nifty_df.index[-1].to_pydatetime()
+
+# 1 SAAL KA WINDOW
+start_date = ref_date - timedelta(days=365)
+print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
+
+# 2. RULES
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
@@ -25,16 +44,21 @@ R = {
     'uptrend_days': 10,
     'vol_ma_days': 20,
     'scan_window': 60,
+    'silent_lookback': 10,
     'watchlist_days': 10,
     'target_pct': 15,
     'sl_pct': 8,
     'hold_days': 30,
-    'checks_per_stock': 1, # FIX 1: SIRF 1 BAAR CHECK KARO PER STOCK PER YEAR
-    'gap_between_checks': 1,
-    'min_vol_ratio': 1.0,
-    'min_pullback_pct': 10.0,
-    'max_52w_distance': 0.0,
+    'checks_per_stock': 1,
+    'gap_between_checks': 60,
+    # ACCUMULATION FILTERS
+    'accum_days': 10,
+    'max_price_drop_10d': -2.0,
+    'min_vol_growth': 0.9,
+    'min_green_red_ratio': 1.2,
 }
+
+fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0, 'No_Entry': 0, 'Distribution': 0}
 
 def add_indicators(df):
     df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
@@ -57,11 +81,13 @@ def check_liquidity(df):
     except:
         return False
 
-def find_perfect_pullback_silent(df, end_idx):
+def find_pullback_silent(df, end_idx):
     try:
         start_idx = max(0, end_idx - R['scan_window'] + 1)
         for i in range(start_idx, end_idx + 1):
             if i < 252: continue
+
+            # UPTREND CHECK
             uptrend_start = i - R['uptrend_days']
             if uptrend_start < 0: continue
             uptrend_zone = df.iloc[uptrend_start:i]
@@ -72,14 +98,11 @@ def find_perfect_pullback_silent(df, end_idx):
             uptrend = new_highs >= 3 and avg_vol > vol_20ma
             if not uptrend: continue
 
+            # PULLBACK MARK
             row = df.iloc[i]
             vol_max_10d = row['Vol_10D_Max']
             high_max_10d = row['High_10D_Max']
             if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
-
-            pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
-            if pullback_depth < R['min_pullback_pct']: continue
-
             pullback_cond1 = row['High'] < high_max_10d
             pullback_cond2 = row['Volume'] < vol_max_10d
             if not (pullback_cond1 and pullback_cond2): continue
@@ -93,27 +116,67 @@ def find_perfect_pullback_silent(df, end_idx):
                 high_max_10d_silent = silent_row['High_10D_Max']
                 if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent): continue
 
-                vol_ratio = silent_row['Volume'] / vol_max_10d_silent
-                if vol_ratio < R['min_vol_ratio']: continue
+                if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent:
+                    continue
 
                 silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
                 silent_cond2 = silent_row['High'] < high_max_10d_silent
+
                 if silent_cond1 and silent_cond2:
+
+                    # ACCUMULATION FILTER
+                    acc_start = max(0, j - R['accum_days'])
+                    acc_zone = df.iloc[acc_start:j]
+                    if len(acc_zone) < 5: continue
+
+                    price_change_10d = (silent_row['Close'] / acc_zone['Close'].iloc[0] - 1) * 100
+                    if price_change_10d < R['max_price_drop_10d']:
+                        fail_log['Distribution'] += 1
+                        continue
+
+                    first_half_vol = acc_zone['Volume'].iloc[:5].mean()
+                    second_half_vol = acc_zone['Volume'].iloc[5:].mean()
+                    if second_half_vol < first_half_vol * R['min_vol_growth']:
+                        fail_log['Distribution'] += 1
+                        continue
+
+                    green_vol = acc_zone[acc_zone['Close'] > acc_zone['Open']]['Volume'].sum()
+                    red_vol = acc_zone[acc_zone['Close'] < acc_zone['Open']]['Volume'].sum()
+                    green_red_ratio = green_vol / red_vol if red_vol > 0 else 99
+                    if green_red_ratio < R['min_green_red_ratio']:
+                        fail_log['Distribution'] += 1
+                        continue
+
+                    watchlist_date = df.index[j]
                     entry_price = high_max_10d_silent
+
+                    # QUALITY SCORE CALC
+                    pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
                     year_high = df['High'].iloc[max(0, j-252):j].max()
                     nearness_52w = ((year_high - entry_price) / year_high) * 100
-                    if nearness_52w > R['max_52w_distance']: continue
+                    vol_score = (silent_row['Volume'] / vol_max_10d_silent * 40)
+                    depth_score = (pullback_depth * 3)
+                    near_score = (max(0, 20-nearness_52w) * 1.5)
+                    score = vol_score + depth_score + near_score
 
                     details = {
                         'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
                         'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
-                        'watchlist_date': df.index[j].strftime('%Y-%m-%d'),
-                        'entry_price': round(entry_price, 2),
-                        'silent_vol_ratio': round(vol_ratio, 2),
+                        'pullback_high': round(row['High'], 2),
+                        'pullback_vol_ratio': round(row['Volume'] / vol_max_10d, 2),
+                        'watchlist_date': watchlist_date.strftime('%Y-%m-%d'),
+                        'watchlist_idx': j,
+                        'silent_vol': int(silent_row['Volume']),
+                        'silent_vol_10d_max': int(vol_max_10d_silent),
+                        'silent_vol_ratio': round(silent_row['Volume'] / vol_max_10d_silent, 2),
                         'pullback_depth': round(pullback_depth, 1),
                         'nearness_52w': round(nearness_52w, 1),
-                        'quality_score': 100.0,
-                        'year_high': round(year_high, 2)
+                        'quality_score': round(score, 1),
+                        'entry_price': round(entry_price, 2),
+                        'accum_check': 'PASS',
+                        'price_change_10d': round(price_change_10d, 1),
+                        'green_red_ratio': round(green_red_ratio, 2),
+                        'vol_growth': round(second_half_vol / first_half_vol, 2)
                     }
                     return details, j
         return None, {}
@@ -162,91 +225,125 @@ def check_entry_in_watchlist(df, watchlist_idx, entry_price):
     except:
         return False, {}
 
-def backtest_stock_perfect_only(df_daily, ticker, start_date, end_date):
+def backtest_stock_pullback_silent(df_daily, ticker, year_start, year_end):
     df_daily = add_indicators(df_daily)
-    if not check_liquidity(df_daily): return []
+    if not check_liquidity(df_daily):
+        fail_log['Liquidity'] += 1
+        return []
 
-    # FIX 2: Saal ke andar hi scan karo, poora history nahi
-    df_scan = df_daily[(df_daily.index >= start_date) & (df_daily.index <= end_date)]
-    if len(df_scan) < 50: return []
+    # 1 SAAL KA DATA HI FILTER KARO
+    df_year = df_daily[(df_daily.index >= year_start) & (df_daily.index <= year_end)]
+    if len(df_year) < 50: return []
 
     trades = []
-    # FIX 3: End se scan karo aur pehla signal milte hi break
-    for check_end_idx in range(len(df_daily)-1, 251, -1):
-        if df_daily.index[check_end_idx] < start_date: break
-        if df_daily.index[check_end_idx] > end_date: continue
+    total_len = len(df_daily)
+    if total_len < 252:
+        fail_log['Data'] += 1
+        return []
 
-        details, watchlist_idx = find_perfect_pullback_silent(df_daily, check_end_idx)
-        if details is None: continue
+    # Sirf year ke andar scan karo
+    for check_end_idx in range(total_len-1, 251, -1):
+        if df_daily.index[check_end_idx] < year_start: break
+        if df_daily.index[check_end_idx] > year_end: continue
+
+        details, watchlist_idx = find_pullback_silent(df_daily, check_end_idx)
+        if details is None:
+            fail_log['No_Silent'] += 1
+            continue
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, watchlist_idx, details['entry_price'])
-        if not entry_ok: continue
+        if not entry_ok:
+            fail_log['No_Entry'] += 1
+            continue
         trades.append({'Stock': ticker, **details, **trade_details})
-        break # FIX 4: Ek stock me 1 saal me 1 trade bas
+        break # 1 stock = 1 trade max
 
     return trades
 
-# MAIN LOOP - YEAR BY YEAR
+# MAIN LOOP - 1 YEAR ONLY
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
+signals = []
 
-years = [2024, 2025, 2026]
-all_year_results = []
+print(f"Scanning {len(stocks)} stocks for 1 YEAR only...", flush=True)
 
-for year in years:
-    print(f"\n=== SCANNING YEAR {year} ===", flush=True)
-    start_date = datetime(year, 1, 1)
-    end_date = datetime(year, 12, 31)
-    if year == 2026: end_date = datetime(2026, 6, 7)
+for i, stock in enumerate(stocks):
+    try:
+        if i % 50 == 0:
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Distribution Skip: {fail_log['Distribution']}", flush=True)
 
-    signals = []
-    for i, stock in enumerate(stocks):
-        try:
-            if i % 50 == 0:
-                print(f"Year {year} Progress: {i}/{len(stocks)} | Found: {len(signals)}", flush=True)
-            scan_start = start_date - timedelta(days=800)
-            df = yf.download(f"{stock}.NS", start=scan_start, end=end_date + timedelta(days=40),
-                            progress=False, auto_adjust=True, timeout=30)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if len(df) < 252: continue
-            trades = backtest_stock_perfect_only(df, stock, start_date, end_date)
-            signals.extend(trades)
-            time.sleep(0.2)
-        except:
+        # Data download: 365 din + 400 din extra for indicators
+        download_start = start_date - timedelta(days=400)
+        df = yf.download(f"{stock}.NS", start=download_start, end=ref_date + timedelta(days=1),
+                        progress=False, auto_adjust=True, timeout=10)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if len(df) < 252:
+            fail_log['Data'] += 1
             continue
 
-    if signals:
-        df_out = pd.DataFrame(signals)
-        total_trades = len(df_out)
-        win_trades = (df_out['pl_pct'] > 0).sum()
-        win_rate = round(win_trades / total_trades * 100, 1) if total_trades > 0 else 0
-        total_pl = round(df_out['pl_pct'].sum(), 2)
-        avg_pl = round(df_out['pl_pct'].mean(), 2)
+        trades = backtest_stock_pullback_silent(df, stock, start_date, ref_date)
+        signals.extend(trades)
+        time.sleep(0.2)
+    except:
+        continue
 
-        all_year_results.append({
-            'Year': year,
-            'Trades': total_trades,
-            'Win_Rate': win_rate,
-            'Total_PL': total_pl,
-            'Avg_PL': avg_pl
-        })
-        print(f"YEAR {year}: {total_trades} Trades | {win_rate}% Win | {total_pl}% Total | {avg_pl}% Avg", flush=True)
-    else:
-        all_year_results.append({
-            'Year': year, 'Trades': 0, 'Win_Rate': 0, 'Total_PL': 0, 'Avg_PL': 0
-        })
-        print(f"YEAR {year}: 0 Trades", flush=True)
+print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
+print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT TO SHEET
+# OUTPUT
 try:
-    ws_output = sh.worksheet("Perfect_YearWise")
+    ws_output = sh.worksheet("1Year_Fast")
 except:
-    ws_output = sh.add_worksheet(title="Perfect_YearWise", rows=100, cols=10)
+    ws_output = sh.add_worksheet(title="1Year_Fast", rows=2000, cols=35)
 
 ws_output.clear()
-df_year = pd.DataFrame(all_year_results)
-payload = [df_year.columns.values.tolist()] + df_year.values.tolist()
-ws_output.update('A1', payload)
+if signals:
+    df_out = pd.DataFrame(signals)
+    df_out = df_out.sort_values('quality_score', ascending=False)
 
-print("\n=== YEAR WISE SUMMARY ===", flush=True)
-print(df_year, flush=True)
+    def convert_to_native(val):
+        if isinstance(val, (np.integer, np.int64)): return int(val)
+        elif isinstance(val, (np.floating, np.float64)): return float(val)
+        else: return val
+    df_out = df_out.applymap(convert_to_native)
+
+    payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
+    ws_output.update('A1', payload)
+
+    # BASIC STATS
+    total_trades = len(df_out)
+    win_trades = (df_out['pl_pct'] > 0).sum()
+    win_rate = round(win_trades / total_trades * 100, 1)
+    total_pl = round(df_out['pl_pct'].sum(), 2)
+    avg_pl = round(df_out['pl_pct'].mean(), 1)
+
+    # SCORE BUCKET ANALYSIS
+    bins = [0, 60, 70, 80, 90, 100]
+    labels = ['0-60 Low', '60-70 Avg', '70-80 Good', '80-90 VGood', '90-100 Best']
+    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
+
+    score_analysis = df_out.groupby('Score_Bucket').agg({
+        'Stock': 'count',
+        'pl_pct': ['sum', 'mean', 'median', lambda x: (x > 0).sum()]
+    }).round(2)
+    score_analysis.columns = ['Trades', 'Total_PL', 'Avg_PL', 'Median_PL', 'Wins']
+    score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
+    score_analysis = score_analysis.drop('Wins', axis=1)
+
+    # OUTPUT TO SHEET
+    current_row = len(payload) + 3
+    ws_output.update(f'A{current_row}', [[f'1 YEAR STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row+1}', [['Total Trades', total_trades], ['Win Rate %', win_rate],
+                                           ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
+                                           ['Distribution Skipped', fail_log['Distribution']]])
+
+    current_row += 7
+    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS']])
+    ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
+
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
+    print(f"=== DISTRIBUTION SKIPPED: {fail_log['Distribution']} ===", flush=True)
+
+else:
+    ws_output.update('A1', [["No Signals Found"]])
+    print("\n=== DONE: 0 SIGNALS ===", flush=True)
