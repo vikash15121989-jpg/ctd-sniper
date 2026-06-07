@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V14.1 BUYER ACTIVATION POINT - 60D ME KAB JAAGA ===", flush=True)
+print("=== V14.6 AGGRESSIVE POINT DETECTOR ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -33,36 +33,36 @@ if ref_date.date() > nifty_df.index[-1].date():
 
 print(f"Scan Till: {ref_date.date()}", flush=True)
 
-# 2. RULES - ACTIVATION POINT
+# 2. RULES - TERA LOGIC
 R = {
     # LIQUIDITY
     'min_price': 50,
     'min_daily_value_cr': 0.5,
     'min_vol_shares': 100000,
 
-    # SCAN WINDOW
-    'scan_window': 60, # Pichle 60 din me dekho
-    'activation_lookback': 5, # Activation ke liye 5 din ka data
+    # STEP 1: AGGRESSIVE DETECTION - KITNA PICHLA DATA
+    'agg_lookback': 20, # Pichle 20 din check karo
+    'agg_up_days_min': 12, # 20 me 12 din green = 60%
+    'agg_up_vol_ratio': 1.3, # Up vol > 1.3x Down vol
+    'agg_close_pos': 0.60, # Avg close 60%+ range me
+    'agg_max_dd': 15, # 15% se zyada dip nahi
 
-    # BUYER ACTIVATION SIGNAL - Jis din buyer jaaga
-    'vol_spike': 2.0, # Vol 2x+ ho gaya
-    'price_gain': 3.0, # Din ka gain 3%+
-    'close_pos': 0.70, # High ke paas band
-    'green_candle': True, # Green candle
+    # STEP 2: SILENT ACTIVATION - AGGRESSIVE KE BAAD
+    'activation_lookback': 10, # Pichle 10 din se compare
+    'scan_window': 60, # Pichle 60 din me aggressive point dhoondo
+    'entry_window': 10, # Aggressive ke 10 din me entry
 
-    # BREAKOUT AFTER ACTIVATION
-    'breakout_confirm_days': 10, # Activation ke baad 10 din me breakout
-    'breakout_pct': 5, # Activation high + 5% = breakout
-    'target_pct': 15, # 15% target
-    'sl_pct': 6, # 6% SL from activation level
-    'hold_days': 30, # Max 30 din hold
+    # EXIT
+    'target_pct': 15,
+    'sl_pct': 6,
+    'hold_days': 30,
 
     # SAMPLING
-    'checks_per_stock': 4, # Har stock me 4 bar
-    'gap_between_checks': 60, # 60 din gap
+    'checks_per_stock': 4,
+    'gap_between_checks': 60,
 }
 
-fail_log = {'Liquidity': 0, 'Data': 0, 'No_Activation': 0, 'No_Breakout': 0}
+fail_log = {'Liquidity': 0, 'Data': 0, 'No_Aggressive': 0, 'No_Entry': 0}
 
 def add_indicators(df):
     df['Returns'] = df['Close'].pct_change() * 100
@@ -70,9 +70,10 @@ def add_indicators(df):
     df['Range'] = df['High'] - df['Low']
     df['Close_Pos'] = np.where(df['Range'] > 0, (df['Close'] - df['Low']) / df['Range'], 0.5)
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
-    df['Vol_Ratio'] = df['Volume'] / df['Vol_20MA']
     df['Daily_Value'] = df['Close'] * df['Volume']
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
+    df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
+    df['High_10D_Max'] = df['High'].rolling(10).max().shift(1)
     return df
 
 def check_liquidity(df):
@@ -87,110 +88,151 @@ def check_liquidity(df):
     except:
         return False
 
-def find_buyer_activation(df, end_idx):
+def find_aggressive_point(df, end_idx):
     """
-    60 DIN ME SCAN - JIS DIN BUYER ACTIVE HUA WO POINT DHUNDO
+    STEP 1: 60 DIN ME SCAN KARO
+    HAR DIN PE PICHLE 20 DIN CHECK KARO - KYA BUYER AGGRESSIVE HUA?
     """
     try:
         start_idx = max(0, end_idx - R['scan_window'] + 1)
-        window = df.iloc[start_idx:end_idx+1]
-        if len(window) < 20: return None, {}
 
-        # 60 din me har candle check karo
-        for i in range(len(window)):
-            idx = start_idx + i
-            row = df.iloc[idx]
+        # 60 din me har din check karo
+        for i in range(start_idx, end_idx + 1):
+            if i < R['agg_lookback']: continue # Shuru ke 20 din skip
 
-            # ACTIVATION SIGNAL - 4 condition
-            cond1 = row['Up_Day'] == True # Green candle
-            cond2 = row['Returns'] >= R['price_gain'] # 3%+ gain
-            cond3 = row['Vol_Ratio'] >= R['vol_spike'] # 2x+ volume
-            cond4 = row['Close_Pos'] >= R['close_pos'] # High close
+            # Is din tak ke pichle 20 din ka data
+            zone_start = i - R['agg_lookback'] + 1
+            zone = df.iloc[zone_start:i+1]
+
+            if len(zone) < 15: continue
+
+            up_days = zone[zone['Up_Day']]
+            down_days = zone[~zone['Up_Day']]
+
+            if len(up_days) < 5 or len(down_days) < 3: continue
+
+            # CONDITION 1: 20 me 12+ din green
+            up_count = len(up_days)
+            cond1 = up_count >= R['agg_up_days_min']
+
+            # CONDITION 2: Up vol > 1.3x Down vol
+            up_vol = up_days['Volume'].mean()
+            down_vol = down_days['Volume'].mean()
+            up_down_ratio = up_vol / down_vol if down_vol > 0 else 10
+            cond2 = up_down_ratio >= R['agg_up_vol_ratio']
+
+            # CONDITION 3: Avg close 60%+ range me
+            avg_close_pos = zone['Close_Pos'].mean()
+            cond3 = avg_close_pos >= R['agg_close_pos']
+
+            # CONDITION 4: Max DD < 15%
+            cumulative = (1 + zone['Returns']/100).cumprod()
+            running_max = cumulative.expanding().max()
+            drawdown = ((cumulative - running_max) / running_max * 100).min()
+            cond4 = drawdown >= -R['agg_max_dd']
 
             if cond1 and cond2 and cond3 and cond4:
-                # BUYER ACTIVE POINT MIL GAYA
-                activation_details = {
-                    'activation_date': df.index[idx].strftime('%Y-%m-%d'),
-                    'activation_idx': idx,
-                    'activation_price': round(row['Close'], 2),
-                    'activation_high': round(row['High'], 2),
-                    'activation_gain': round(row['Returns'], 1),
-                    'activation_vol': round(row['Vol_Ratio'], 1),
-                    'activation_close_pos': round(row['Close_Pos'], 2),
-                    'daily_val_cr': round(row['Daily_Value_20MA']/1e7, 1) if not pd.isna(row['Daily_Value_20MA']) else 0
+                # BUYER AGGRESSIVE POINT MIL GAYA
+                aggressive_details = {
+                    'agg_date': df.index[i].strftime('%Y-%m-%d'),
+                    'agg_idx': i,
+                    'agg_price': round(df['Close'].iloc[i], 2),
+                    'agg_up_days': int(up_count),
+                    'agg_up_down_vol': round(up_down_ratio, 2),
+                    'agg_close_pos': round(avg_close_pos, 2),
+                    'agg_max_dd': round(drawdown, 1),
+                    'agg_zone_gain': round((df['Close'].iloc[i] / df['Close'].iloc[zone_start] - 1) * 100, 1)
                 }
-                return activation_details, idx
+                return aggressive_details, i
 
         return None, {}
     except:
         return None, {}
 
-def check_breakout_from_activation(df, activation_idx, activation_high):
+def check_entry_after_aggressive(df, agg_idx):
     """
-    ACTIVATION POINT SE BREAKOUT HUA? KITNA RETURN?
+    STEP 2: AGGRESSIVE POINT KE BAAD 10 DIN ME
+    Volume > 10D Max AND High < 10D Max WALA DIN DHUNDO
+    USKE BAAD HIGH TOD DE TO ENTRY
     """
     try:
-        start_idx = activation_idx + 1
+        start_idx = agg_idx + 1
         if start_idx >= len(df): return False, {}
 
-        breakout_price = activation_high * (1 + R['breakout_pct']/100)
-        breakout_idx = None
-        breakout_date = None
+        # Aggressive ke baad 10 din scan karo
+        end_search = min(start_idx + R['entry_window'], len(df))
 
-        # Activation ke baad 10 din me breakout dekho
-        end_search = min(start_idx + R['breakout_confirm_days'], len(df))
-        window = df.iloc[start_idx:end_search]
+        for i in range(start_idx, end_search):
+            if i < 10: continue
 
-        for i in range(len(window)):
-            if window['High'].iloc[i] >= breakout_price:
-                breakout_idx = start_idx + i
-                breakout_date = window.index[i]
-                break
+            row = df.iloc[i]
 
-        if breakout_idx is None:
-            return False, {'reason': 'No_Breakout_10D'}
+            # SILENT ACTIVATION CHECK
+            vol_max_10d = row['Vol_10D_Max']
+            high_max_10d = row['High_10D_Max']
 
-        # BREAKOUT KE BAAD RETURN
-        entry_price = breakout_price
-        sl_price = entry_price * (1 - R['sl_pct']/100)
-        target_price = entry_price * (1 + R['target_pct']/100)
+            if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
 
-        exit_idx = min(breakout_idx + R['hold_days'], len(df) - 1)
-        exit_price = float(df['Close'].iloc[exit_idx])
-        exit_date = df.index[exit_idx]
-        result = f'Exit_{R["hold_days"]}D'
+            cond1 = row['Volume'] > vol_max_10d
+            cond2 = row['High'] < high_max_10d
 
-        for k in range(breakout_idx + 1, exit_idx + 1):
-            h, l = df['High'].iloc[k], df['Low'].iloc[k]
-            if l <= sl_price:
-                exit_price = sl_price
-                exit_date = df.index[k]
-                result = f'SL -{R["sl_pct"]}%'
-                break
-            if h >= target_price:
-                exit_price = target_price
-                exit_date = df.index[k]
-                result = f'Target +{R["target_pct"]}%'
-                break
+            if cond1 and cond2:
+                # SILENT POINT MILA - AB ENTRY CHECK
+                resistance = high_max_10d
 
-        pl_pct = ((exit_price - entry_price) / entry_price) * 100
-        hold_days = (exit_date - breakout_date).days
+                # Is din ke baad high tuta kya?
+                for j in range(i + 1, min(i + R['entry_window'], len(df))):
+                    if df['High'].iloc[j] > resistance:
+                        # ENTRY MIL GAYA
+                        entry_idx = j
+                        entry_date = df.index[j]
+                        entry_price = resistance
 
-        return True, {
-            'breakout_date': breakout_date.strftime('%Y-%m-%d'),
-            'breakout_price': round(entry_price, 2),
-            'exit_date': exit_date.strftime('%Y-%m-%d'),
-            'exit_price': round(exit_price, 2),
-            'hold_days': int(hold_days),
-            'pl_pct': round(pl_pct, 2),
-            'result': result
-        }
+                        # EXIT
+                        sl_price = entry_price * (1 - R['sl_pct']/100)
+                        target_price = entry_price * (1 + R['target_pct']/100)
+
+                        exit_idx = min(entry_idx + R['hold_days'], len(df) - 1)
+                        exit_price = float(df['Close'].iloc[exit_idx])
+                        exit_date = df.index[exit_idx]
+                        result = f'Exit_{R["hold_days"]}D'
+
+                        for k in range(entry_idx + 1, exit_idx + 1):
+                            h, l = df['High'].iloc[k], df['Low'].iloc[k]
+                            if l <= sl_price:
+                                exit_price = sl_price
+                                exit_date = df.index[k]
+                                result = f'SL -{R["sl_pct"]}%'
+                                break
+                            if h >= target_price:
+                                exit_price = target_price
+                                exit_date = df.index[k]
+                                result = f'Target +{R["target_pct"]}%'
+                                break
+
+                        pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                        hold_days = (exit_date - entry_date).days
+
+                        return True, {
+                            'silent_date': df.index[i].strftime('%Y-%m-%d'),
+                            'silent_vol_ratio': round(row['Volume'] / vol_max_10d, 2),
+                            'resistance_10d': round(resistance, 2),
+                            'entry_date': entry_date.strftime('%Y-%m-%d'),
+                            'entry_price': round(entry_price, 2),
+                            'exit_date': exit_date.strftime('%Y-%m-%d'),
+                            'exit_price': round(exit_price, 2),
+                            'hold_days': int(hold_days),
+                            'pl_pct': round(pl_pct, 2),
+                            'result': result
+                        }
+
+        return False, {'reason': 'No_Entry_10D'}
 
     except:
         return False, {}
 
-def backtest_stock_activation(df_daily, ticker):
-    """Har stock me 4 bar check - 60 din gap"""
+def backtest_stock_aggressive(df_daily, ticker):
+    """60 DIN ME AGGRESSIVE POINT DHUNDO, FIR ENTRY"""
     df_daily = add_indicators(df_daily)
 
     if not check_liquidity(df_daily):
@@ -203,30 +245,28 @@ def backtest_stock_activation(df_daily, ticker):
         fail_log['Data'] += 1
         return []
 
-    # 4 check points - peeche se
+    # 4 check points
     for i in range(R['checks_per_stock']):
         check_end_idx = total_len - 1 - (i * R['gap_between_checks'])
         if check_end_idx < R['scan_window']: continue
 
-        # STEP 1: 60 DIN ME ACTIVATION POINT DHUNDO
-        activation, act_idx = find_buyer_activation(df_daily, check_end_idx)
-        if activation is None:
-            fail_log['No_Activation'] += 1
+        # STEP 1: AGGRESSIVE POINT DHUNDO
+        agg_details, agg_idx = find_aggressive_point(df_daily, check_end_idx)
+        if agg_details is None:
+            fail_log['No_Aggressive'] += 1
             continue
 
-        # STEP 2: ACTIVATION SE BREAKOUT + RETURN
-        breakout_ok, trade_details = check_breakout_from_activation(
-            df_daily, act_idx, activation['activation_high']
-        )
+        # STEP 2: ENTRY DHUNDO
+        entry_ok, trade_details = check_entry_after_aggressive(df_daily, agg_idx)
 
-        if not breakout_ok:
-            fail_log['No_Breakout'] += 1
+        if not entry_ok:
+            fail_log['No_Entry'] += 1
             continue
 
         # TRADE BANA
         trades.append({
             'Stock': ticker,
-            **activation,
+            **agg_details,
             **trade_details
         })
 
@@ -237,12 +277,12 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks - 60D ACTIVATION POINT MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks - AGGRESSIVE POINT MODE...", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Fail: L:{fail_log['Liquidity']} A:{fail_log['No_Activation']} B:{fail_log['No_Breakout']}", flush=True)
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Fail: L:{fail_log['Liquidity']} Agg:{fail_log['No_Aggressive']} E:{fail_log['No_Entry']}", flush=True)
 
         start_date = ref_date - timedelta(days=730)
         df = yf.download(f"{stock}.NS", start=start_date, end=ref_date + timedelta(days=1),
@@ -254,24 +294,24 @@ for i, stock in enumerate(stocks):
             fail_log['Data'] += 1
             continue
 
-        trades = backtest_stock_activation(df, stock)
+        trades = backtest_stock_aggressive(df, stock)
         if len(trades) == 0: continue
 
         for trade in trades:
-            print(f"🎯 {stock} Act:{trade['activation_date']} +{trade['activation_gain']}% Vol:{trade['activation_vol']}x | BO:{trade['breakout_date']} | {trade['result']} {trade['pl_pct']}%", flush=True)
+            print(f"🎯 {stock} Agg:{trade['agg_date']} UpDays:{trade['agg_up_days']} Vol:{trade['agg_up_down_vol']}x | Entry:{trade['entry_date']} | {trade['result']} {trade['pl_pct']}%", flush=True)
             signals.append(trade)
         time.sleep(0.2)
     except Exception as e:
         continue
 
-print(f"\nScan Complete. Total Activation Signals: {len(signals)}", flush=True)
+print(f"\nScan Complete. Total Aggressive Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
 # 7. OUTPUT
 try:
-    ws_output = sh.worksheet("Buyer_Activation")
+    ws_output = sh.worksheet("Aggressive_Point")
 except:
-    ws_output = sh.add_worksheet(title="Buyer_Activation", rows=5000, cols=25)
+    ws_output = sh.add_worksheet(title="Aggressive_Point", rows=5000, cols=30)
 
 ws_output.clear()
 if signals:
@@ -292,28 +332,25 @@ if signals:
     win_rate = round(win_trades / total_trades * 100, 1)
     total_pl = round(df_out['pl_pct'].sum(), 2)
     avg_pl = round(df_out['pl_pct'].mean(), 1)
-    avg_act_gain = round(df_out['activation_gain'].mean(), 1)
-    avg_act_vol = round(df_out['activation_vol'].mean(), 1)
 
     summary = [
-        ['', ''], ['TOTAL ACTIVATION TRADES', int(total_trades)],
+        ['', ''], ['TOTAL AGGRESSIVE SIGNALS', int(total_trades)],
         ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', float(total_pl)],
         ['AVG P&L PER TRADE %', float(avg_pl)],
-        ['AVG ACTIVATION GAIN %', float(avg_act_gain)],
-        ['AVG ACTIVATION VOL', float(avg_act_vol)],
-        ['AVG HOLD DAYS', float(df_out['hold_days'].mean())],
+        ['AVG AGG UP DAYS', float(df_out['agg_up_days'].mean())],
+        ['AVG UP/DOWN VOL', float(df_out['agg_up_down_vol'].mean())],
         ['', ''], ['FAIL REASONS', ''],
         ['Liquidity Fail', int(fail_log['Liquidity'])],
-        ['No Activation in 60D', int(fail_log['No_Activation'])],
-        ['Activation But No Breakout', int(fail_log['No_Breakout'])],
+        ['No Aggressive Point in 60D', int(fail_log['No_Aggressive'])],
+        ['Aggressive But No Entry', int(fail_log['No_Entry'])],
         ['Data Error', int(fail_log['Data'])],
     ]
 
     ws_output.update(f'A{len(payload)+2}', summary)
     print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
-    print("\nTOP 10 ACTIVATION TRADES:", flush=True)
-    print(df_out[['Stock', 'activation_date', 'activation_gain', 'activation_vol', 'breakout_date', 'pl_pct', 'result']].head(10), flush=True)
+    print("\nTOP 10 AGGRESSIVE TRADES:", flush=True)
+    print(df_out[['Stock', 'agg_date', 'agg_up_days', 'agg_up_down_vol', 'entry_date', 'pl_pct', 'result']].head(10), flush=True)
 else:
-    ws_output.update('A1', [["No Buyer Activation Found"]])
+    ws_output.update('A1', [["No Aggressive Points Found"]])
     print("\n=== DONE: 0 SIGNALS ===", flush=True)
     print(f"Fail Log: {fail_log}", flush=True)
