@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V13.4 HYBRID DEMAND - SEHWAG + DRAVID MODE ===", flush=True)
+print("=== V14.1 BUYER ACTIVATION POINT - 60D ME KAB JAAGA ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -27,45 +27,42 @@ for fmt in date_formats:
     except ValueError:
         continue
 
-# 2. NIFTY CACHE
 nifty_df = yf.download("^NSEI", period="10y", progress=False, auto_adjust=True)
 if ref_date.date() > nifty_df.index[-1].date():
     ref_date = nifty_df.index[-1].to_pydatetime()
 
 print(f"Scan Till: {ref_date.date()}", flush=True)
 
-# 3. RULES - HYBRID MODE
+# 2. RULES - ACTIVATION POINT
 R = {
-    # RULE 0: LIQUIDITY - EK BAAR CHECK
-    'min_price': 50, # 50 Rs minimum
-    'min_daily_value_cr': 0.5, # 50 Lakh daily turnover minimum
-    'min_vol_shares': 100000, # 1 Lakh shares minimum
+    # LIQUIDITY
+    'min_price': 50,
+    'min_daily_value_cr': 0.5,
+    'min_vol_shares': 100000,
 
-    # RULE 1: HYBRID DEMAND
-    'lookback_grinder': 60, # DRAVID MODE
-    'lookback_spike': 5, # SEHWAG MODE
+    # SCAN WINDOW
+    'scan_window': 60, # Pichle 60 din me dekho
+    'activation_lookback': 5, # Activation ke liye 5 din ka data
 
-    # SEHWAG MODE - 5 Day Tabahi
-    'spike_gain': 15, # 5 din me 15%+ gain
-    'spike_vol': 2.0, # 5 din avg vol 2x+
-    'spike_green': 4, # 5 din me 4 din green
-    'spike_close': 0.70, # 5 din avg close 70%+ range
+    # BUYER ACTIVATION SIGNAL - Jis din buyer jaaga
+    'vol_spike': 2.0, # Vol 2x+ ho gaya
+    'price_gain': 3.0, # Din ka gain 3%+
+    'close_pos': 0.70, # High ke paas band
+    'green_candle': True, # Green candle
 
-    # DRAVID MODE - 60 Day Grinder - 7 condition me 5 pass
-    'up_vol_vs_down': 1.3, # Up day vol > 1.3x down day
-    'close_position': 0.60, # Avg close > 60% range
-    'down_day_vol_ratio': 0.8, # Down din vol < 0.8x avg
-    'accumulation_days': 32, # 60 me 32 din green
-    'max_drawdown': 15, # 15% se zyada dip nahi
-    'max_consecutive_red': 4, # Lagatar 4 din laal nahi
-    'gain_60d': 20, # 60 din me 20%+ gain
-    'min_score': 5, # 7 me se 5 pass
+    # BREAKOUT AFTER ACTIVATION
+    'breakout_confirm_days': 10, # Activation ke baad 10 din me breakout
+    'breakout_pct': 5, # Activation high + 5% = breakout
+    'target_pct': 15, # 15% target
+    'sl_pct': 6, # 6% SL from activation level
+    'hold_days': 30, # Max 30 din hold
+
+    # SAMPLING
+    'checks_per_stock': 4, # Har stock me 4 bar
+    'gap_between_checks': 60, # 60 din gap
 }
 
-fail_log = {
-    'Liquidity': 0, 'Data': 0, 'Sehwag_Fail': 0,
-    'Dravid_Fail': 0, 'Both_Fail': 0
-}
+fail_log = {'Liquidity': 0, 'Data': 0, 'No_Activation': 0, 'No_Breakout': 0}
 
 def add_indicators(df):
     df['Returns'] = df['Close'].pct_change() * 100
@@ -78,206 +75,160 @@ def add_indicators(df):
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
     return df
 
-def check_liquidity_ONCE(df):
-    """RULE 0: Sirf latest 20 din ka avg check karo - Ek baar"""
+def check_liquidity(df):
     try:
         close = df['Close'].iloc[-1]
         vol_20ma = df['Vol_20MA'].iloc[-1]
         daily_val = df['Daily_Value_20MA'].iloc[-1]
-
-        if pd.isna(close) or close < R['min_price']: return False, "Price"
-        if pd.isna(daily_val) or daily_val < R['min_daily_value_cr'] * 1e7: return False, "Value"
-        if pd.isna(vol_20ma) or vol_20ma < R['min_vol_shares']: return False, "Volume"
-        return True, "Liquid"
+        if pd.isna(close) or close < R['min_price']: return False
+        if pd.isna(daily_val) or daily_val < R['min_daily_value_cr'] * 1e7: return False
+        if pd.isna(vol_20ma) or vol_20ma < R['min_vol_shares']: return False
+        return True
     except:
-        return False, "Data"
+        return False
 
-def check_demand_hybrid(df, idx):
+def find_buyer_activation(df, end_idx):
     """
-    HYBRID: MODE B pehle, phir MODE A
-    MODE B: SEHWAG - 5 Day Spike
-    MODE A: DRAVID - 60 Day Grinder
+    60 DIN ME SCAN - JIS DIN BUYER ACTIVE HUA WO POINT DHUNDO
     """
     try:
-        details = {}
+        start_idx = max(0, end_idx - R['scan_window'] + 1)
+        window = df.iloc[start_idx:end_idx+1]
+        if len(window) < 20: return None, {}
 
-        # ===== MODE B: SEHWAG SPIKE CHECK =====
-        if idx >= R['lookback_spike']:
-            window_5d = df.iloc[idx-R['lookback_spike']+1:idx+1]
-            if len(window_5d) == R['lookback_spike']:
-                spike_gain = (window_5d['Close'].iloc[-1] / window_5d['Close'].iloc[0] - 1) * 100
-                spike_vol = window_5d['Vol_Ratio'].mean()
-                spike_close = window_5d['Close_Pos'].mean()
-                spike_green = window_5d['Up_Day'].sum()
+        # 60 din me har candle check karo
+        for i in range(len(window)):
+            idx = start_idx + i
+            row = df.iloc[idx]
 
-                sehwag_pass = (
-                    spike_gain >= R['spike_gain'] and
-                    spike_vol >= R['spike_vol'] and
-                    spike_green >= R['spike_green'] and
-                    spike_close >= R['spike_close']
-                )
+            # ACTIVATION SIGNAL - 4 condition
+            cond1 = row['Up_Day'] == True # Green candle
+            cond2 = row['Returns'] >= R['price_gain'] # 3%+ gain
+            cond3 = row['Vol_Ratio'] >= R['vol_spike'] # 2x+ volume
+            cond4 = row['Close_Pos'] >= R['close_pos'] # High close
 
-                if sehwag_pass:
-                    details = {
-                        'mode': 'SEHWAG_SPIKE',
-                        'gain_5d': round(spike_gain, 1),
-                        'vol_5d': round(spike_vol, 1),
-                        'green_5d': int(spike_green),
-                        'close_5d': round(spike_close, 2),
-                        'score': 10, # 10/7 = Full marks
-                        'daily_val_cr': round(df['Daily_Value_20MA'].iloc[idx]/1e7, 1)
-                    }
-                    return True, 10, details
-                else:
-                    fail_log['Sehwag_Fail'] += 1
+            if cond1 and cond2 and cond3 and cond4:
+                # BUYER ACTIVE POINT MIL GAYA
+                activation_details = {
+                    'activation_date': df.index[idx].strftime('%Y-%m-%d'),
+                    'activation_idx': idx,
+                    'activation_price': round(row['Close'], 2),
+                    'activation_high': round(row['High'], 2),
+                    'activation_gain': round(row['Returns'], 1),
+                    'activation_vol': round(row['Vol_Ratio'], 1),
+                    'activation_close_pos': round(row['Close_Pos'], 2),
+                    'daily_val_cr': round(row['Daily_Value_20MA']/1e7, 1) if not pd.isna(row['Daily_Value_20MA']) else 0
+                }
+                return activation_details, idx
 
-        # ===== MODE A: DRAVID GRINDER CHECK =====
-        if idx < R['lookback_grinder']:
-            return False, 0, {}
+        return None, {}
+    except:
+        return None, {}
 
-        window_60d = df.iloc[idx-R['lookback_grinder']+1:idx+1]
-        if len(window_60d) < 50: return False, 0, {}
+def check_breakout_from_activation(df, activation_idx, activation_high):
+    """
+    ACTIVATION POINT SE BREAKOUT HUA? KITNA RETURN?
+    """
+    try:
+        start_idx = activation_idx + 1
+        if start_idx >= len(df): return False, {}
 
-        up_days = window_60d[window_60d['Up_Day']]
-        down_days = window_60d[~window_60d['Up_Day']]
+        breakout_price = activation_high * (1 + R['breakout_pct']/100)
+        breakout_idx = None
+        breakout_date = None
 
-        if len(up_days) < 10 or len(down_days) < 5:
-            return False, 0, {}
+        # Activation ke baad 10 din me breakout dekho
+        end_search = min(start_idx + R['breakout_confirm_days'], len(df))
+        window = df.iloc[start_idx:end_search]
 
-        score = 0
-        details = {'mode': 'DRAVID_GRINDER'}
+        for i in range(len(window)):
+            if window['High'].iloc[i] >= breakout_price:
+                breakout_idx = start_idx + i
+                breakout_date = window.index[i]
+                break
 
-        # 1. Up Day Volume vs Down
-        up_vol = up_days['Volume'].mean()
-        down_vol = down_days['Volume'].mean()
-        up_down_ratio = up_vol / down_vol if down_vol > 0 else 10
-        if up_down_ratio >= R['up_vol_vs_down']: score += 1
-        details['up_down_vol'] = round(up_down_ratio, 2)
+        if breakout_idx is None:
+            return False, {'reason': 'No_Breakout_10D'}
 
-        # 2. Close Position
-        avg_close_pos = window_60d['Close_Pos'].mean()
-        if avg_close_pos >= R['close_position']: score += 1
-        details['close_pos'] = round(avg_close_pos, 2)
+        # BREAKOUT KE BAAD RETURN
+        entry_price = breakout_price
+        sl_price = entry_price * (1 - R['sl_pct']/100)
+        target_price = entry_price * (1 + R['target_pct']/100)
 
-        # 3. Down Day Volume Low
-        down_vol_ratio = down_days['Vol_Ratio'].mean()
-        if down_vol_ratio <= R['down_day_vol_ratio']: score += 1
-        details['down_vol_ratio'] = round(down_vol_ratio, 2)
+        exit_idx = min(breakout_idx + R['hold_days'], len(df) - 1)
+        exit_price = float(df['Close'].iloc[exit_idx])
+        exit_date = df.index[exit_idx]
+        result = f'Exit_{R["hold_days"]}D'
 
-        # 4. Accumulation Days
-        accumulation = len(up_days)
-        if accumulation >= R['accumulation_days']: score += 1
-        details['accum_days'] = int(accumulation)
+        for k in range(breakout_idx + 1, exit_idx + 1):
+            h, l = df['High'].iloc[k], df['Low'].iloc[k]
+            if l <= sl_price:
+                exit_price = sl_price
+                exit_date = df.index[k]
+                result = f'SL -{R["sl_pct"]}%'
+                break
+            if h >= target_price:
+                exit_price = target_price
+                exit_date = df.index[k]
+                result = f'Target +{R["target_pct"]}%'
+                break
 
-        # 5. Max Drawdown
-        cumulative = (1 + window_60d['Returns']/100).cumprod()
-        running_max = cumulative.expanding().max()
-        drawdown = ((cumulative - running_max) / running_max * 100).min()
-        if drawdown >= -R['max_drawdown']: score += 1
-        details['max_dd'] = round(drawdown, 1)
+        pl_pct = ((exit_price - entry_price) / entry_price) * 100
+        hold_days = (exit_date - breakout_date).days
 
-        # 6. Consecutive Red
-        red_streak = 0
-        max_red_streak = 0
-        for ret in window_60d['Returns']:
-            if ret < 0:
-                red_streak += 1
-                max_red_streak = max(max_red_streak, red_streak)
-            else:
-                red_streak = 0
-        if max_red_streak <= R['max_consecutive_red']: score += 1
-        details['red_streak'] = int(max_red_streak)
+        return True, {
+            'breakout_date': breakout_date.strftime('%Y-%m-%d'),
+            'breakout_price': round(entry_price, 2),
+            'exit_date': exit_date.strftime('%Y-%m-%d'),
+            'exit_price': round(exit_price, 2),
+            'hold_days': int(hold_days),
+            'pl_pct': round(pl_pct, 2),
+            'result': result
+        }
 
-        # 7. 60 Day Gain
-        gain_60d = (window_60d['Close'].iloc[-1] / window_60d['Close'].iloc[0] - 1) * 100
-        if gain_60d >= R['gain_60d']: score += 1
-        details['gain_60d'] = round(gain_60d, 1)
+    except:
+        return False, {}
 
-        details['score'] = score
-        details['daily_val_cr'] = round(df['Daily_Value_20MA'].iloc[idx]/1e7, 1)
-
-        if score >= R['min_score']:
-            return True, score, details
-        else:
-            fail_log['Dravid_Fail'] += 1
-            fail_log['Both_Fail'] += 1
-            return False, score, details
-
-    except Exception as e:
-        fail_log['Data'] += 1
-        return False, 0, {}
-
-def backtest_hybrid(df_daily, end_date, ticker):
-    df_daily = df_daily[df_daily.index <= end_date].copy()
-    if len(df_daily) < 90:
-        fail_log['Data'] += 1
-        return []
-
+def backtest_stock_activation(df_daily, ticker):
+    """Har stock me 4 bar check - 60 din gap"""
     df_daily = add_indicators(df_daily)
 
-    # STEP 1: LIQUIDITY EK BAAR CHECK
-    liquid_ok, liquid_reason = check_liquidity_ONCE(df_daily)
-    if not liquid_ok:
+    if not check_liquidity(df_daily):
         fail_log['Liquidity'] += 1
         return []
 
     trades = []
-    i = 90
+    total_len = len(df_daily)
+    if total_len < 200:
+        fail_log['Data'] += 1
+        return []
 
-    while i < len(df_daily) - 15: # 15 din hold minimum
-        # STEP 2: HYBRID DEMAND CHECK
-        demand_ok, score, details = check_demand_hybrid(df_daily, i)
-        if not demand_ok:
-            i += 3; continue # 3 din skip karo
+    # 4 check points - peeche se
+    for i in range(R['checks_per_stock']):
+        check_end_idx = total_len - 1 - (i * R['gap_between_checks'])
+        if check_end_idx < R['scan_window']: continue
 
-        # ENTRY
-        entry_price = float(df_daily['Close'].iloc[i])
-        entry_date = df_daily.index[i]
-        mode = details['mode']
+        # STEP 1: 60 DIN ME ACTIVATION POINT DHUNDO
+        activation, act_idx = find_buyer_activation(df_daily, check_end_idx)
+        if activation is None:
+            fail_log['No_Activation'] += 1
+            continue
 
-        # EXIT LOGIC - Mode ke hisaab se
-        if mode == 'SEHWAG_SPIKE':
-            hold_days = 10 # Spike me 10 din hold
-            target_pct = 1.12 # 12% target
-            sl_pct = 0.94 # 6% SL
-        else: # DRAVID_GRINDER
-            hold_days = 20 # Grinder me 20 din
-            target_pct = 1.15 # 15% target
-            sl_pct = 0.94 # 6% SL
+        # STEP 2: ACTIVATION SE BREAKOUT + RETURN
+        breakout_ok, trade_details = check_breakout_from_activation(
+            df_daily, act_idx, activation['activation_high']
+        )
 
-        exit_idx = min(i + hold_days, len(df_daily) - 1)
-        sl_price = entry_price * sl_pct
-        target_price = entry_price * target_pct
+        if not breakout_ok:
+            fail_log['No_Breakout'] += 1
+            continue
 
-        result = f'Time Exit {hold_days}D'
-        exit_price = float(df_daily['Close'].iloc[exit_idx])
-        exit_date = df_daily.index[exit_idx]
-
-        for k in range(i+1, exit_idx+1):
-            h, l = df_daily['High'].iloc[k], df_daily['Low'].iloc[k]
-            if l <= sl_price:
-                exit_price, exit_date, result = sl_price, df_daily.index[k], 'SL -6%'; break
-            if h >= target_price:
-                exit_price, exit_date, result = target_price, df_daily.index[k], f'Target +{int((target_pct-1)*100)}%'; break
-
-        pl_pct = ((exit_price - entry_price) / entry_price) * 100
-        days = (exit_date - entry_date).days
-
+        # TRADE BANA
         trades.append({
-            'entry_date': entry_date.strftime('%Y-%m-%d'),
-            'mode': mode,
-            'score': score,
-            'daily_val_cr': details['daily_val_cr'],
-            **{k: v for k, v in details.items() if k not in ['mode', 'score', 'daily_val_cr']},
-            'entry_price': round(entry_price, 2),
-            'exit_price': round(exit_price, 2),
-            'days': int(days),
-            'pl_pct': round(pl_pct, 2),
-            'result': result
+            'Stock': ticker,
+            **activation,
+            **trade_details
         })
-
-        i = k + 5 # Signal ke baad 5 din gap
-        continue
 
     return trades
 
@@ -286,12 +237,12 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks for HYBRID DEMAND...", flush=True)
+print(f"Scanning {len(stocks)} stocks - 60D ACTIVATION POINT MODE...", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
-        if i % 100 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Fail: L:{fail_log['Liquidity']} S:{fail_log['Sehwag_Fail']} D:{fail_log['Dravid_Fail']}", flush=True)
+        if i % 50 == 0:
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Fail: L:{fail_log['Liquidity']} A:{fail_log['No_Activation']} B:{fail_log['No_Breakout']}", flush=True)
 
         start_date = ref_date - timedelta(days=730)
         df = yf.download(f"{stock}.NS", start=start_date, end=ref_date + timedelta(days=1),
@@ -299,27 +250,28 @@ for i, stock in enumerate(stocks):
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 90: continue
+        if len(df) < 200:
+            fail_log['Data'] += 1
+            continue
 
-        trades = backtest_hybrid(df, ref_date, stock)
+        trades = backtest_stock_activation(df, stock)
         if len(trades) == 0: continue
 
         for trade in trades:
-            mode_icon = "⚡" if trade['mode'] == 'SEHWAG_SPIKE' else "📈"
-            print(f"{mode_icon} {stock} {trade['entry_date']} | {trade['mode']} | Score:{trade['score']} | Val:{trade['daily_val_cr']}Cr | {trade['result']} {trade['pl_pct']}%", flush=True)
-            signals.append({'Stock': stock, **trade})
+            print(f"🎯 {stock} Act:{trade['activation_date']} +{trade['activation_gain']}% Vol:{trade['activation_vol']}x | BO:{trade['breakout_date']} | {trade['result']} {trade['pl_pct']}%", flush=True)
+            signals.append(trade)
         time.sleep(0.2)
     except Exception as e:
         continue
 
-print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
+print(f"\nScan Complete. Total Activation Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
 # 7. OUTPUT
 try:
-    ws_output = sh.worksheet("Demand_Hybrid")
+    ws_output = sh.worksheet("Buyer_Activation")
 except:
-    ws_output = sh.add_worksheet(title="Demand_Hybrid", rows=5000, cols=25)
+    ws_output = sh.add_worksheet(title="Buyer_Activation", rows=5000, cols=25)
 
 ws_output.clear()
 if signals:
@@ -339,28 +291,29 @@ if signals:
     win_trades = (df_out['pl_pct'] > 0).sum()
     win_rate = round(win_trades / total_trades * 100, 1)
     total_pl = round(df_out['pl_pct'].sum(), 2)
-
-    sehwag_count = (df_out['mode'] == 'SEHWAG_SPIKE').sum()
-    dravid_count = (df_out['mode'] == 'DRAVID_GRINDER').sum()
+    avg_pl = round(df_out['pl_pct'].mean(), 1)
+    avg_act_gain = round(df_out['activation_gain'].mean(), 1)
+    avg_act_vol = round(df_out['activation_vol'].mean(), 1)
 
     summary = [
-        ['', ''], ['TOTAL SIGNALS', int(total_trades)],
+        ['', ''], ['TOTAL ACTIVATION TRADES', int(total_trades)],
         ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', float(total_pl)],
-        ['SEHWAG SPIKES', int(sehwag_count)], ['DRAVID GRINDERS', int(dravid_count)],
-        ['AVG DAILY VALUE CR', float(df_out['daily_val_cr'].mean())],
+        ['AVG P&L PER TRADE %', float(avg_pl)],
+        ['AVG ACTIVATION GAIN %', float(avg_act_gain)],
+        ['AVG ACTIVATION VOL', float(avg_act_vol)],
+        ['AVG HOLD DAYS', float(df_out['hold_days'].mean())],
         ['', ''], ['FAIL REASONS', ''],
         ['Liquidity Fail', int(fail_log['Liquidity'])],
-        ['Sehwag Mode Fail', int(fail_log['Sehwag_Fail'])],
-        ['Dravid Mode Fail', int(fail_log['Dravid_Fail'])],
+        ['No Activation in 60D', int(fail_log['No_Activation'])],
+        ['Activation But No Breakout', int(fail_log['No_Breakout'])],
         ['Data Error', int(fail_log['Data'])],
     ]
 
     ws_output.update(f'A{len(payload)+2}', summary)
-    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN ===", flush=True)
-    print(f"SEHWAG: {sehwag_count} | DRAVID: {dravid_count}", flush=True)
-    print("\nTOP 10:", flush=True)
-    print(df_out[['Stock', 'entry_date', 'mode', 'score', 'daily_val_cr', 'pl_pct']].head(10), flush=True)
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
+    print("\nTOP 10 ACTIVATION TRADES:", flush=True)
+    print(df_out[['Stock', 'activation_date', 'activation_gain', 'activation_vol', 'breakout_date', 'pl_pct', 'result']].head(10), flush=True)
 else:
-    ws_output.update('A1', [["No Signals Found - Market Dry Hai"]])
+    ws_output.update('A1', [["No Buyer Activation Found"]])
     print("\n=== DONE: 0 SIGNALS ===", flush=True)
     print(f"Fail Log: {fail_log}", flush=True)
