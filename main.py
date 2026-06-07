@@ -9,9 +9,9 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V10.3I RS KILLER - AB 100% HERO ===", flush=True)
+print("=== V11.0 BUYER AGGRESSION - SELLER KAMJOR ===", flush=True)
 
-# 1. SETUP
+# 1. SETUP - Same as before
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
@@ -36,160 +36,164 @@ print(f"Nifty Done. Last Trading Date: {nifty_df.index[-1].date()}", flush=True)
 
 if ref_date.date() > nifty_df.index[-1].date():
     ref_date = nifty_df.index[-1].to_pydatetime()
-    print(f"Date fix, {ref_date.date()} use kar raha", flush=True)
 
 print(f"Final Scan Till: {ref_date.date()}", flush=True)
 
-# 3. RULES - RS BILKUL LOOSE
+# 3. NEW RULES - BUYER AGGRESSION ONLY
 R = {
-    'rs_normal': 0.5, # Nifty se aadha bhi chalega
-    'rs_hero': 0.8, # Nifty se 20% kam bhi HERO
-    'rs_god': 1.5, # Nifty se 50% tez = GOD
-    'extension': 100, # 60 se 100 - Kitna bhi door
-    'base_min': 0, # 1 se 0 - No base bhi chalega
-    'base_max_normal': 50, 'base_max_hero': 50, 'base_max_god': 50,
-    'vol_normal': 0.5, 'vol_hero': 0.5, 'vol_god': 0.5, # Avg se aadha bhi chalega
+    'up_vol_vs_down': 2.0, # Up day avg vol > 2x Down day avg vol
+    'close_in_range': 0.70, # Close > 70% of daily range = High close
+    'accumulation_days': 7, # 10 din me 7 din upar close
+    'ema50_min': 1.05, # EMA50 se 5% upar minimum
+    'ema50_max': 1.25, # EMA50 se 25% upar maximum - Fresh
+    'breakout_vol': 2.0, # Breakout din 2x volume
+    'higher_low': 3, # Har dip 3% upar
 }
 
-fail_log = {'RS_Fail': 0, 'Ext_Fail': 0, 'Base_Fail': 0, 'Vol_Fail': 0, 'Data_Fail': 0}
-
-# 4. FIXED RS - DATE ALIGN KIYA
-def check_relative_strength(stock_df, check_date):
-    try:
-        periods = {'1M': 21, '3M': 63, '6M': 126}
-        best_rs = 0
-        best_stock_ret = 0
-        best_nifty_ret = 0
-
-        for period_name, days in periods.items():
-            # FIX: Common dates nikalo dono me
-            stock_window = stock_df.loc[:check_date].iloc[-days:].copy()
-            nifty_window = nifty_df.loc[:check_date].iloc[-days:].copy()
-
-            # Dono ko same dates pe align karo
-            common_dates = stock_window.index.intersection(nifty_window.index)
-            if len(common_dates) < 15: continue # 15 din minimum
-
-            stock_window = stock_window.loc[common_dates]
-            nifty_window = nifty_window.loc[common_dates]
-
-            stock_ret = (stock_window['Close'].iloc[-1] / stock_window['Close'].iloc[0] - 1) * 100
-            nifty_ret = (nifty_window['Close'].iloc[-1] / nifty_window['Close'].iloc[0] - 1) * 100
-
-            if nifty_ret <= -50: # Nifty -50% crash me
-                rs = 10 if stock_ret > -20 else 0 # Stock -20% se upar = GOD
-            elif nifty_ret <= 0:
-                rs = (stock_ret - nifty_ret) / 5 if stock_ret > nifty_ret else 0
-            else:
-                rs = stock_ret / nifty_ret if nifty_ret!= 0 else 0
-
-            if rs > best_rs:
-                best_rs = rs
-                best_stock_ret = stock_ret
-                best_nifty_ret = nifty_ret
-
-        # RS Grade - ULTRA LOOSE
-        if best_rs >= R['rs_god'] or best_stock_ret > 5:
-            grade = 'GOD'; rs_ok = True
-        elif best_rs >= R['rs_hero'] or best_stock_ret > 0:
-            grade = 'HERO'; rs_ok = True
-        elif best_rs >= R['rs_normal'] or best_stock_ret > -10:
-            grade = 'NORMAL'; rs_ok = True
-        else:
-            grade = 'WEAK'; rs_ok = False
-
-        return rs_ok, grade, round(best_stock_ret, 1), round(best_nifty_ret, 1), round(best_rs, 2)
-    except Exception as e:
-        return False, 'WEAK', 0, 0, 0
-
-def check_base_breakout(df, idx, rs_grade):
-    window = df.iloc[max(0, idx-9):idx+1] # 10 din window
-    lookback = df.iloc[max(0, idx-60):idx]
-    if len(lookback) < 10: return True, True, 0, 0, 0, 0 # Data kam = Pass kar do
-
-    base_high, base_low = lookback['High'].max(), lookback['Low'].min()
-    base_range_pct = (base_high - base_low) / base_low * 100 if base_low > 0 else 0
-
-    if rs_grade == 'GOD': base_max = R['base_max_god']
-    elif rs_grade == 'HERO': base_max = R['base_max_hero']
-    else: base_max = R['base_max_normal']
-
-    tight_base = base_range_pct <= base_max # Min check hata diya
-    breakout = (window['Close'] > base_high * 0.90).any() # 10% neeche bhi chalega
-    near_high = True # Hamesha pass
-
-    return tight_base, breakout, near_high, base_high, base_low, round(base_range_pct, 1), base_max
-
-def check_buyer_dominance(df, idx, rs_grade):
-    window = df.iloc[max(0, idx-9):idx+1] # 10 din avg
-    avg_vol = window['Volume'].mean()
-    vol_20ma = df['Vol_20MA'].iloc[idx]
-
-    if rs_grade == 'GOD': vol_needed = R['vol_god']
-    elif rs_grade == 'HERO': vol_needed = R['vol_hero']
-    else: vol_needed = R['vol_normal']
-
-    vol_spike = avg_vol >= vol_20ma * vol_needed
-    return vol_spike, round(avg_vol / vol_20ma, 1), vol_needed
-
-def check_not_extended(df, idx):
-    return True, 0 # Extension check hata diya - Kitna bhi door chalega
+fail_log = {'Vol_Fail': 0, 'Close_Fail': 0, 'EMA_Fail': 0, 'Structure_Fail': 0, 'Data_Fail': 0}
 
 def add_indicators(df):
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
+    df['Daily_Range'] = df['High'] - df['Low']
+    df['Close_Position'] = (df['Close'] - df['Low']) / df['Daily_Range'] # 0-1, 1=High pe close
+    df['Up_Day'] = df['Close'] > df['Close'].shift(1)
     return df
 
-def backtest_final(df_daily, end_date, ticker):
+def check_buyer_aggression(df, idx):
+    """Rule 1: Up days pe volume, Down days se 2x"""
+    try:
+        window = df.iloc[idx-9:idx+1] # 10 din
+        if len(window) < 10: return False, 0
+
+        up_vol = window[window['Up_Day']]['Volume'].mean()
+        down_vol = window[~window['Up_Day']]['Volume'].mean()
+
+        if pd.isna(down_vol) or down_vol == 0:
+            ratio = 10 # Down din hue hi nahi = Full buyer
+        else:
+            ratio = up_vol / down_vol
+
+        return ratio >= R['up_vol_vs_down'], round(ratio, 2)
+    except:
+        return False, 0
+
+def check_close_strength(df, idx):
+    """Rule 2: Close hamesha range ke top me + 7/10 din upar"""
+    try:
+        window = df.iloc[idx-9:idx+1]
+        if len(window) < 10: return False, 0, 0
+
+        avg_close_pos = window['Close_Position'].mean() # 0.7+ chahiye
+        up_days = window['Up_Day'].sum() # 7+ chahiye
+
+        cond1 = avg_close_pos >= R['close_in_range']
+        cond2 = up_days >= R['accumulation_days']
+
+        return cond1 and cond2, round(avg_close_pos, 2), up_days
+    except:
+        return False, 0, 0
+
+def check_fresh_momentum(df, idx):
+    """Rule 3: EMA50 se 5-25% upar = Fresh, Extended nahi"""
+    try:
+        close = df['Close'].iloc[idx]
+        ema50 = df['EMA50'].iloc[idx]
+        if pd.isna(ema50) or ema50 == 0: return False, 0
+
+        dist = close / ema50
+        cond = R['ema50_min'] <= dist <= R['ema50_max']
+        return cond, round((dist-1)*100, 1)
+    except:
+        return False, 0
+
+def check_higher_low_structure(df, idx):
+    """Rule 4: Dip kam vol pe, aur har dip pichle se upar"""
+    try:
+        window = df.iloc[idx-19:idx+1] # 20 din
+        if len(window) < 20: return True, 0 # Data kam = Pass
+
+        # 3 dips nikalo
+        lows = window['Low'].rolling(5).min().dropna()
+        if len(lows) < 3: return True, 0
+
+        last_3_lows = lows.tail(3).values
+        # Har low pichle se upar?
+        hl_ok = last_3_lows[2] > last_3_lows[1] * (1 + R['higher_low']/100) > last_3_lows[0] * (1 + R['higher_low']/100)
+
+        return hl_ok, round((last_3_lows[2]/last_3_lows[0]-1)*100, 1)
+    except:
+        return True, 0
+
+def check_breakout_volume(df, idx):
+    """Rule 5: Aaj ka volume 20MA se 2x"""
+    try:
+        vol = df['Volume'].iloc[idx]
+        vol_20ma = df['Vol_20MA'].iloc[idx]
+        if pd.isna(vol_20ma) or vol_20ma == 0: return True, 0
+
+        ratio = vol / vol_20ma
+        return ratio >= R['breakout_vol'], round(ratio, 2)
+    except:
+        return False, 0
+
+def backtest_aggression(df_daily, end_date, ticker):
     global fail_log
     df_daily = df_daily[df_daily.index <= end_date].copy()
-    if len(df_daily) < 30:
+    if len(df_daily) < 60:
         fail_log['Data_Fail'] += 1
         return []
 
     df_daily = add_indicators(df_daily)
     trades = []
-    i = 30 # 30 din se start
+    i = 60 # 60 din data chahiye
 
     while i < len(df_daily) - 5:
         today = df_daily.iloc[i]
 
-        rs_ok, rs_grade, stock_ret, nifty_ret, rs_ratio = check_relative_strength(df_daily, today.name)
-        if not rs_ok:
-            fail_log['RS_Fail'] += 1
-            i += 5; continue
-
-        not_ext, ext_pct = check_not_extended(df_daily, i)
-        if not not_ext:
-            fail_log['Ext_Fail'] += 1
-            i += 5; continue
-
-        base_ok, breakout, near_high, base_high, base_low, base_pct, base_max_used = check_base_breakout(df_daily, i, rs_grade)
-        if not base_ok or not breakout:
-            fail_log['Base_Fail'] += 1
-            i += 5; continue
-
-        buyer_ok, vol_ratio, vol_needed = check_buyer_dominance(df_daily, i, rs_grade)
-        if not buyer_ok:
+        # 5 CHECK - SAB PASS HONE CHAHIYE
+        vol_ok, up_down_ratio = check_buyer_aggression(df_daily, i)
+        if not vol_ok:
             fail_log['Vol_Fail'] += 1
-            i += 5; continue
+            i += 3; continue
 
+        close_ok, close_pos, up_days = check_close_strength(df_daily, i)
+        if not close_ok:
+            fail_log['Close_Fail'] += 1
+            i += 3; continue
+
+        ema_ok, ema_dist = check_fresh_momentum(df_daily, i)
+        if not ema_ok:
+            fail_log['EMA_Fail'] += 1
+            i += 3; continue
+
+        struct_ok, hl_pct = check_higher_low_structure(df_daily, i)
+        if not struct_ok:
+            fail_log['Structure_Fail'] += 1
+            i += 3; continue
+
+        breakout_ok, vol_x = check_breakout_volume(df_daily, i)
+        if not breakout_ok:
+            fail_log['Vol_Fail'] += 1
+            i += 3; continue
+
+        # ENTRY
         entry_price = float(today['Close'])
-        sl = float(base_low) if base_low > 0 else entry_price * 0.9
+        sl = float(df_daily['Low'].iloc[i-10:i].min()) # 10 din ka low
         risk = entry_price - sl
-        if risk <= 0: i += 5; continue
+        if risk <= 0: i += 3; continue
 
-        target = entry_price + (risk * 2.0)
+        target = entry_price + (risk * 2.5) # 2.5R kyunki strong buyer
 
+        # EXIT SIMULATION
         exit_price, exit_date, days, result = entry_price, today.name, 0, 'Running'
-        for k in range(i + 1, min(i + 90, len(df_daily))):
+        for k in range(i + 1, min(i + 60, len(df_daily))):
             days += 1
             h, l, c = df_daily['High'].iloc[k], df_daily['Low'].iloc[k], df_daily['Close'].iloc[k]
             if l <= sl:
                 exit_price, exit_date, result = sl, df_daily.index[k], 'SL Hit'; break
             if h >= target:
                 exit_price, exit_date, result = target, df_daily.index[k], 'Target Hit'; break
-            if days > 90:
-                exit_price, exit_date, result = float(c), df_daily.index[k], 'Time Stop'; break
             if k == len(df_daily) - 1:
                 exit_price, exit_date, result = float(c), df_daily.index[k], 'Running'
 
@@ -197,13 +201,12 @@ def backtest_final(df_daily, end_date, ticker):
 
         trades.append({
             'entry_date': today.name.strftime('%Y-%m-%d'),
-            'rs_grade': rs_grade,
-            'stock_ret': stock_ret,
-            'nifty_ret': nifty_ret,
-            'rs_ratio': rs_ratio,
-            'ext_50dma': ext_pct,
-            'base_pct': base_pct,
-            'vol_x': vol_ratio,
+            'up_down_vol': up_down_ratio,
+            'close_pos': close_pos,
+            'up_days': up_days,
+            'ema50_dist': ema_dist,
+            'hl_structure': hl_pct,
+            'breakout_vol': vol_x,
             'entry_price': round(entry_price, 2),
             'sl': round(sl, 2),
             'target': round(target, 2),
@@ -213,7 +216,7 @@ def backtest_final(df_daily, end_date, ticker):
             'result': result
         })
 
-        i = k + 5
+        i = k + 3
         continue
 
     return trades
@@ -223,7 +226,7 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks...", flush=True)
+print(f"Scanning {len(stocks)} stocks for BUYER AGGRESSION...", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
@@ -236,17 +239,16 @@ for i, stock in enumerate(stocks):
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 30:
+        if len(df) < 60:
             fail_log['Data_Fail'] += 1
             continue
 
-        trades = backtest_final(df, ref_date, stock)
+        trades = backtest_aggression(df, ref_date, stock)
         if len(trades) == 0:
             continue
 
         for trade in trades:
-            tag = f"🦸{trade['rs_grade']}"
-            print(f" {stock} {trade['entry_date']} {tag} | RS:{trade['rs_ratio']}x | {trade['stock_ret']}% vs Nifty {trade['nifty_ret']}% | {trade['result']} {trade['pl_pct']}%", flush=True)
+            print(f"🔥 {stock} {trade['entry_date']} | UpVol:{trade['up_down_vol']}x | Close:{trade['close_pos']} | EMA50:{trade['ema50_dist']}% | {trade['result']} {trade['pl_pct']}%", flush=True)
             signals.append({'Stock': stock, **trade})
         time.sleep(0.2)
     except Exception as e:
@@ -254,14 +256,14 @@ for i, stock in enumerate(stocks):
             print(f"Error {stock}: {str(e)[:60]}", flush=True)
         continue
 
-print(f"Scan Complete. Total Hero: {len(signals)}", flush=True)
+print(f"Scan Complete. Total Aggression Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
 # 7. OUTPUT
 try:
-    ws_output = sh.worksheet("RS_Base_Buyer_Final")
+    ws_output = sh.worksheet("Buyer_Aggression")
 except:
-    ws_output = sh.add_worksheet(title="RS_Base_Buyer_Final", rows=5000, cols=20)
+    ws_output = sh.add_worksheet(title="Buyer_Aggression", rows=5000, cols=20)
 
 ws_output.clear()
 if signals:
@@ -281,23 +283,19 @@ if signals:
     win_trades = (df_out['pl_pct'] > 0).sum()
     win_rate = round(win_trades / total_trades * 100, 1)
     total_pl = round(df_out['pl_pct'].sum(), 2)
-    grade_stats = df_out.groupby('rs_grade')['pl_pct'].agg(['count', 'sum', 'mean']).round(2)
 
     summary = [
-        ['', ''], ['TOTAL HERO', int(total_trades)],
+        ['', ''], ['TOTAL SIGNALS', int(total_trades)],
         ['WIN RATE %', float(win_rate)], ['TOTAL P&L %', float(total_pl)],
-        ['', ''], ['RS_GRADE', 'TRADES', 'TOTAL_P&L', 'AVG_P&L']
+        ['AVG Up/Down Vol', float(df_out['up_down_vol'].mean())],
+        ['AVG Close Position', float(df_out['close_pos'].mean())]
     ]
-    for grade, row in grade_stats.iterrows():
-        summary.append([grade, int(row['count']), float(row['sum']), float(row['mean'])])
 
     ws_output.update(f'A{len(payload)+2}', summary)
-    print(f"\n=== DONE: {total_trades} HERO FOUND | {win_rate}% WIN ===", flush=True)
-    print("\nGRADE WISE:", flush=True)
-    print(grade_stats, flush=True)
-    print("\nTOP 10 HERO:", flush=True)
-    print(df_out[['Stock', 'entry_date', 'rs_grade', 'pl_pct']].head(10), flush=True)
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN ===", flush=True)
+    print("\nTOP 10 AGGRESSION:", flush=True)
+    print(df_out[['Stock', 'entry_date', 'up_down_vol', 'ema50_dist', 'pl_pct']].head(10), flush=True)
 else:
-    ws_output.update('A1', [["No Hero Found - Check Fail Log"]])
-    print("\n=== DONE: 0 HERO ===", flush=True)
+    ws_output.update('A1', [["No Buyer Aggression Found - Market Weak"]])
+    print("\n=== DONE: 0 SIGNALS ===", flush=True)
     print(f"Fail Reasons: {fail_log}", flush=True)
