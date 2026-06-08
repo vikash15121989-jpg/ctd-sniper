@@ -9,7 +9,7 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== CTD SNIPER V15.20 - 3 SHEET FUNNEL ===", flush=True)
+print("=== CTD SNIPER V15.20 - CLEAN RETAIN ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -17,12 +17,14 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-ref_date = datetime.now()
-start_date = ref_date - timedelta(days=400)
-print(f"Scanning for: {ref_date.date()}", flush=True)
+end_date = datetime.now()
+start_date = end_date - timedelta(days=400)
+lookback_days = 10
+
+print(f"Backfill: {lookback_days} trading days till {end_date.date()}", flush=True)
 
 # 2. NIFTY REGIME CHECK
-nifty = yf.download("^NSEI", start=start_date - timedelta(days=250), end=ref_date + timedelta(days=1), progress=False)
+nifty = yf.download("^NSEI", start=start_date - timedelta(days=250), end=end_date + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 if nifty.empty or len(nifty) < 200:
@@ -68,11 +70,11 @@ def add_indicators(df):
     df['New_High_10D'] = df['High'] > df['High'].shift(1).rolling(10).max()
     return df
 
-def check_liquidity(df):
+def check_liquidity(df, idx):
     try:
-        close = df['Close'].iloc[-1]
-        vol_20ma = df['Vol_20MA'].iloc[-1]
-        daily_val = df['Daily_Value_20MA'].iloc[-1]
+        close = df['Close'].iloc[idx]
+        vol_20ma = df['Vol_20MA'].iloc[idx]
+        daily_val = df['Daily_Value_20MA'].iloc[idx]
         if pd.isna(close) or close < R['min_price']: return False
         if pd.isna(daily_val) or daily_val < R['min_daily_value_cr'] * 1e7: return False
         if pd.isna(vol_20ma) or vol_20ma < R['min_vol_shares']: return False
@@ -80,27 +82,26 @@ def check_liquidity(df):
     except:
         return False
 
-def check_uptrend(df):
-    j = len(df) - 1
-    uptrend_start = j - R['uptrend_days']
+def check_uptrend(df, idx):
+    uptrend_start = idx - R['uptrend_days']
     if uptrend_start < 0: return False, {}
-    uptrend_zone = df.iloc[uptrend_start:j]
+    uptrend_zone = df.iloc[uptrend_start:idx]
     new_highs = uptrend_zone['New_High_10D'].sum()
     avg_vol = uptrend_zone['Volume'].mean()
-    vol_20ma = df['Vol_20MA'].iloc[j]
+    vol_20ma = df['Vol_20MA'].iloc[idx]
     if pd.isna(vol_20ma): return False, {}
     uptrend = new_highs >= 3 and avg_vol > vol_20ma
     if uptrend:
         return True, {
+            'Date': df.index[idx].strftime('%Y-%m-%d'),
             'New_Highs_10D': int(new_highs),
-            'CMP': round(df['Close'].iloc[j], 2),
-            'From_52W_High_%': round((df['High'].iloc[max(0, j-252):j].max() / df['Close'].iloc[j] - 1) * 100, 1)
+            'CMP': round(df['Close'].iloc[idx], 2),
+            'From_52W_High_%': round((df['High'].iloc[max(0, idx-252):idx].max() / df['Close'].iloc[idx] - 1) * 100, 1)
         }
     return False, {}
 
-def check_silent(df):
-    j = len(df) - 1
-    silent_row = df.iloc[j]
+def check_silent(df, idx):
+    silent_row = df.iloc[idx]
     vol_max_10d_silent = silent_row['Vol_10D_Max']
     high_max_10d_silent = silent_row['High_10D_Max']
     if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent): return False, {}
@@ -109,8 +110,8 @@ def check_silent(df):
     silent_cond2 = silent_row['High'] < high_max_10d_silent
     if not (silent_cond1 and silent_cond2): return False, {}
 
-    acc_start = max(0, j - R['accum_days'])
-    acc_zone = df.iloc[acc_start:j]
+    acc_start = max(0, idx - R['accum_days'])
+    acc_zone = df.iloc[acc_start:idx]
     if len(acc_zone) < 5: return False, {}
 
     price_change_10d = (silent_row['Close'] / acc_zone['Close'].iloc[0] - 1) * 100
@@ -125,9 +126,15 @@ def check_silent(df):
     green_red_ratio = green_vol / red_vol if red_vol > 0 else 99
     if green_red_ratio < R['min_green_red_ratio']: return False, {}
 
+    # SILENT CANDIDATE KE LIYE SIRF 4 FIELD
+    entry_price = high_max_10d_silent
+    sl_price = entry_price * (1 - R['sl_pct'] / 100)
+
     return True, {
-        'Vol_Ratio': round(silent_row['Volume'] / vol_max_10d_silent, 2),
-        'CMP': round(silent_row['Close'], 2)
+        'Date': df.index[idx].strftime('%Y-%m-%d'),
+        'Stock': '',
+        'Entry': round(entry_price, 2),
+        'SL': round(sl_price, 2)
     }
 
 def is_score_allowed(score):
@@ -136,15 +143,14 @@ def is_score_allowed(score):
             return True
     return False
 
-def check_final_signal(df):
-    j = len(df) - 1
-    silent_row = df.iloc[j]
+def check_final_signal(df, idx):
+    silent_row = df.iloc[idx]
     vol_max_10d_silent = silent_row['Vol_10D_Max']
     high_max_10d_silent = silent_row['High_10D_Max']
     if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent): return None
 
-    pullback_depth = ((high_max_10d_silent - df['Low'].iloc[j-1]) / high_max_10d_silent) * 100
-    year_high = df['High'].iloc[max(0, j-252):j].max()
+    pullback_depth = ((high_max_10d_silent - df['Low'].iloc[idx-1]) / high_max_10d_silent) * 100
+    year_high = df['High'].iloc[max(0, idx-252):idx].max()
     entry_price = high_max_10d_silent
     nearness_52w = ((year_high - entry_price) / year_high) * 100
 
@@ -159,14 +165,14 @@ def check_final_signal(df):
     target_price = entry_price * (1 + R['target_pct'] / 100)
 
     return {
-        'Stock': '', 'Signal_Date': ref_date.strftime('%Y-%m-%d'), 'Regime': regime,
+        'Stock': '', 'Signal_Date': df.index[idx].strftime('%Y-%m-%d'), 'Regime': regime,
         'Entry': round(entry_price, 2), 'SL': round(sl_price, 2), 'Target': round(target_price, 2),
         'RR': round(R['target_pct'] / R['sl_pct'], 2), 'Score': round(score, 1),
         'CMP': round(silent_row['Close'], 2),
-        'Expiry_Date': (ref_date + timedelta(days=10)).strftime('%Y-%m-%d'), 'Status': 'ACTIVE',
+        'Expiry_Date': (df.index[idx] + timedelta(days=10)).strftime('%Y-%m-%d'), 'Status': 'ACTIVE',
     }
 
-# ===== MAIN SCAN =====
+# ===== MAIN SCAN - 10 DIN KA BACKFILL =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 
@@ -174,14 +180,14 @@ uptrend_list = []
 silent_list = []
 final_signals = []
 
-print(f"Scanning {len(stocks)} stocks...", flush=True)
+print(f"Scanning {len(stocks)} stocks for {lookback_days} days...", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
             print(f"Progress: {i}/{len(stocks)}", flush=True)
 
-        df = yf.download(f"{stock}.NS", start=start_date, end=ref_date + timedelta(days=1),
+        df = yf.download(f"{stock}.NS", start=start_date, end=end_date + timedelta(days=1),
                         progress=False, auto_adjust=True, timeout=10)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -189,53 +195,57 @@ for i, stock in enumerate(stocks):
             continue
 
         df = add_indicators(df)
-        if not check_liquidity(df): continue
 
-        # STEP 1: UPTREND CHECK
-        is_up, uptrend_data = check_uptrend(df)
-        if not is_up: continue
+        # PICHLE 10 TRADING DAYS CHECK KARO
+        for day_offset in range(lookback_days):
+            idx = len(df) - 1 - day_offset
+            if idx < 252: continue
 
-        # STEP 2: SILENT CHECK
-        is_silent, silent_data = check_silent(df)
+            if not check_liquidity(df, idx): continue
 
-        # STEP 3: FINAL SIGNAL CHECK
-        signal = check_final_signal(df) if is_silent else None
+            is_up, uptrend_data = check_uptrend(df, idx)
+            if not is_up: continue
 
-        # SHEET ALLOCATION
-        if signal:
-            signal['Stock'] = stock
-            final_signals.append(signal)
-        elif is_silent:
-            silent_list.append({'Stock': stock, 'Date': ref_date.strftime('%Y-%m-%d'), **silent_data})
-        else:
-            uptrend_list.append({'Stock': stock, 'Date': ref_date.strftime('%Y-%m-%d'), **uptrend_data})
+            is_silent, silent_data = check_silent(df, idx)
+            signal = check_final_signal(df, idx) if is_silent else None
+
+            if signal:
+                signal['Stock'] = stock
+                final_signals.append(signal)
+            elif is_silent:
+                silent_data['Stock'] = stock
+                silent_list.append(silent_data)
+            else:
+                uptrend_list.append({'Stock': stock, **uptrend_data})
 
         time.sleep(0.2)
     except:
         continue
 
 # ===== UPDATE 3 SHEETS =====
-def update_sheet(sheet_name, data_list, sort_col='Stock'):
+def update_sheet_final(sheet_name, data_list, date_col='Date'):
     try:
         ws = sh.worksheet(sheet_name)
     except:
-        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=20)
+        ws = sh.add_worksheet(title=sheet_name, rows=5000, cols=20)
+
     ws.clear()
     if data_list:
         df_out = pd.DataFrame(data_list)
-        df_out = df_out.sort_values(sort_col, ascending=False if sort_col in ['Score', 'New_Highs_10D', 'Vol_Ratio', 'From_52W_High_%'] else True)
+        df_out = df_out.drop_duplicates(subset=['Stock', date_col], keep='last')
+        df_out = df_out.sort_values([date_col, 'Stock'], ascending=[False, True])
         payload = [df_out.columns.values.tolist()] + df_out.values.tolist()
         ws.update('A1', payload)
         return len(df_out)
     else:
-        ws.update('A1', [[f"No data for {ref_date.date()}"]])
+        ws.update('A1', [[f"No data for last {lookback_days} trading days"]])
         return 0
 
-count1 = update_sheet('UPTREND_STOCKS', uptrend_list, 'From_52W_High_%')
-count2 = update_sheet('SILENT_CANDIDATES', silent_list, 'Vol_Ratio')
-count3 = update_sheet('ACTIVE_SIGNALS', final_signals, 'Score')
+count1 = update_sheet_final('UPTREND_STOCKS', uptrend_list, 'Date')
+count2 = update_sheet_final('SILENT_CANDIDATES', silent_list, 'Date')
+count3 = update_sheet_final('ACTIVE_SIGNALS', final_signals, 'Signal_Date')
 
 print(f"\n=== DONE ===", flush=True)
-print(f"UPTREND_STOCKS: {count1} - Breakout nahi diye", flush=True)
-print(f"SILENT_CANDIDATES: {count2} - Volume bada, high nahi toda", flush=True)
-print(f"ACTIVE_SIGNALS: {count3} - Final entry signals", flush=True)
+print(f"UPTREND_STOCKS: {count1} - Last {lookback_days} trading days", flush=True)
+print(f"SILENT_CANDIDATES: {count2} - Last {lookback_days} trading days", flush=True)
+print(f"ACTIVE_SIGNALS: {count3} - Last {lookback_days} trading days", flush=True)
