@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.18 BEAR KILLER ===", flush=True)
+print("=== V15.18 BEAR KILLER FIXED ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -55,14 +55,14 @@ print(f"Market Regime: {regime} | Nifty: {close_now:.0f} | 200DMA: {dma200_now:.
 # 3. TWEAKED RULES - BEAR OPTIMIZED
 if regime == "BULL":
     R = {
-        'score_ranges': [(80, 90)], # Full 80-90 bull me
+        'score_ranges': [(80, 90)],
         'sl_pct': 3.0, 'target_pct': 6.0,
         'hold_days': 10, 'min_gap': 0,
         'min_vol_growth': 0.85, 'max_price_drop_10d': -3.0,
     }
-else: # BEAR - 82-86 SKIP + TIGHT TP/SL
+else: # BEAR
     R = {
-        'score_ranges': [(80, 82), (86, 90)], # 82-86 SKIP KAR DIYA
+        'score_ranges': [(80, 82), (86, 90)], # 82-86 SKIP
         'sl_pct': 2.5, 'target_pct': 4.0, # 4% TP, 2.5% SL
         'hold_days': 5, 'min_gap': 10,
         'min_vol_growth': 1.0, 'max_price_drop_10d': -1.0,
@@ -102,7 +102,6 @@ def check_liquidity(df):
         return False
 
 def is_score_allowed(score):
-    """82-86 skip karo bear me"""
     for min_score, max_score in R['score_ranges']:
         if min_score <= score <= max_score:
             return True
@@ -182,12 +181,10 @@ def find_all_pullback_silent(df, year_start, year_end):
                 near_score = (max(0, 20-nearness_52w) * 1.5)
                 score = vol_score + depth_score + near_score
 
-                # 82-86 SKIP
                 if not is_score_allowed(score):
                     fail_log['Score_Filter'] += 1
                     continue
 
-                # FIXED % SL/TP
                 sl_price = entry_price * (1 - R['sl_pct'] / 100)
                 target_price = entry_price * (1 + R['target_pct'] / 100)
 
@@ -308,7 +305,7 @@ for i, stock in enumerate(stocks):
 print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT - FIXED BINS ERROR
+# OUTPUT - PANDAS ERROR FIXED
 try:
     ws_output = sh.worksheet(f"Killer_{regime}")
 except:
@@ -337,10 +334,16 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1) if total_trades > 0 else 0
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
 
-    # FIXED: Bins aur labels match kar diye - 82-86 hata diya
-    bins = [80, 82, 86, 88, 90]
-    labels = ['80-82', '86-88', '88-90']
-    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
+    # FIXED: pd.cut hata diya. Direct function use kiya
+    def get_score_bucket(score):
+        if 80 <= score < 82: return '80-82'
+        elif 86 <= score < 88: return '86-88'
+        elif 88 <= score <= 90: return '88-90'
+        else: return 'Other'
+
+    df_out['Score_Bucket'] = df_out['quality_score'].apply(get_score_bucket)
+    df_out = df_out[df_out['Score_Bucket']!= 'Other']
+
     score_analysis = df_out.groupby('Score_Bucket').agg({
         'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
     }).round(2)
