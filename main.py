@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.13 ATR BASED SL/TP ===", flush=True)
+print("=== V15.14 MULTI-ENTRY PER STOCK ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -30,7 +30,7 @@ for fmt in date_formats:
 start_date = ref_date - timedelta(days=365)
 print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
 
-# 2. RULES - ATR BASED
+# 2. RULES - MULTI ENTRY
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
@@ -40,14 +40,16 @@ R = {
     'scan_window': 60,
     'silent_lookback': 10,
     'watchlist_days': 10,
-    'hold_days': 10, # Max hold
+    'hold_days': 10,
     # ATR RULES
-    'atr_period': 14, # 14 din ka ATR
-    'sl_atr_mult': 1.0, # 1x ATR = SL
-    'target_atr_mult': 2.0, # 2x ATR = Target. RR = 2:1
-    # SCORE FILTER
-    'score_min': 80,
-    'score_max': 90,
+    'atr_period': 14,
+    'sl_atr_mult': 1.0,
+    'target_atr_mult': 2.0,
+    # SCORE FILTER - 84-88 ONLY
+    'score_min': 84,
+    'score_max': 88,
+    # MULTI ENTRY RULE
+    'min_days_between_trades': 30, # Ek trade ke baad 30 din wait
     # ACCUMULATION FILTERS
     'accum_days': 10,
     'max_price_drop_10d': -3.0,
@@ -56,7 +58,7 @@ R = {
 }
 
 fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0,
-            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
+            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0, 'Gap_Skip': 0}
 
 def add_indicators(df):
     df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
@@ -66,7 +68,6 @@ def add_indicators(df):
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
     df['New_High_10D'] = df['High'] > df['High'].shift(1).rolling(10).max()
 
-    # ATR CALCULATION
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -88,123 +89,130 @@ def check_liquidity(df):
     except:
         return False
 
-def find_pullback_silent(df, end_idx):
-    try:
-        start_idx = max(0, end_idx - R['scan_window'] + 1)
-        for i in range(start_idx, end_idx + 1):
-            if i < 252: continue
+def find_all_pullback_silent(df, year_start, year_end):
+    """Ab sab silent accumulation dhundhega, ek nahi"""
+    setups = []
+    total_len = len(df)
 
-            # UPTREND CHECK
-            uptrend_start = i - R['uptrend_days']
-            if uptrend_start < 0: continue
-            uptrend_zone = df.iloc[uptrend_start:i]
-            new_highs = uptrend_zone['New_High_10D'].sum()
-            avg_vol = uptrend_zone['Volume'].mean()
-            vol_20ma = df['Vol_20MA'].iloc[i]
-            if pd.isna(vol_20ma): continue
-            uptrend = new_highs >= 3 and avg_vol > vol_20ma
-            if not uptrend: continue
+    for i in range(252, total_len): # 252 din data chahiye
+        if df.index[i] < year_start or df.index[i] > year_end:
+            continue
 
-            # PULLBACK MARK
-            row = df.iloc[i]
-            vol_max_10d = row['Vol_10D_Max']
-            high_max_10d = row['High_10D_Max']
-            if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
-            pullback_cond1 = row['High'] < high_max_10d
-            pullback_cond2 = row['Volume'] < vol_max_10d
-            if not (pullback_cond1 and pullback_cond2): continue
+        # UPTREND CHECK
+        uptrend_start = i - R['uptrend_days']
+        if uptrend_start < 0: continue
+        uptrend_zone = df.iloc[uptrend_start:i]
+        new_highs = uptrend_zone['New_High_10D'].sum()
+        avg_vol = uptrend_zone['Volume'].mean()
+        vol_20ma = df['Vol_20MA'].iloc[i]
+        if pd.isna(vol_20ma): continue
+        uptrend = new_highs >= 3 and avg_vol > vol_20ma
+        if not uptrend:
+            fail_log['No_Uptrend'] += 1
+            continue
 
-            pullback_idx = i
-            search_end = min(pullback_idx + 1 + R['watchlist_days'], len(df))
+        # PULLBACK MARK
+        row = df.iloc[i]
+        vol_max_10d = row['Vol_10D_Max']
+        high_max_10d = row['High_10D_Max']
+        if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
+        pullback_cond1 = row['High'] < high_max_10d
+        pullback_cond2 = row['Volume'] < vol_max_10d
+        if not (pullback_cond1 and pullback_cond2):
+            fail_log['No_Pullback'] += 1
+            continue
 
-            for j in range(pullback_idx + 1, search_end):
-                silent_row = df.iloc[j]
-                vol_max_10d_silent = silent_row['Vol_10D_Max']
-                high_max_10d_silent = silent_row['High_10D_Max']
-                atr = silent_row['ATR']
-                if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent) or pd.isna(atr): continue
+        pullback_idx = i
+        search_end = min(pullback_idx + 1 + R['watchlist_days'], len(df))
 
-                if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent:
+        for j in range(pullback_idx + 1, search_end):
+            silent_row = df.iloc[j]
+            vol_max_10d_silent = silent_row['Vol_10D_Max']
+            high_max_10d_silent = silent_row['High_10D_Max']
+            atr = silent_row['ATR']
+            if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent) or pd.isna(atr): continue
+
+            if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent:
+                continue
+
+            silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
+            silent_cond2 = silent_row['High'] < high_max_10d_silent
+
+            if silent_cond1 and silent_cond2:
+                # ACCUMULATION FILTER
+                acc_start = max(0, j - R['accum_days'])
+                acc_zone = df.iloc[acc_start:j]
+                if len(acc_zone) < 5: continue
+
+                price_change_10d = (silent_row['Close'] / acc_zone['Close'].iloc[0] - 1) * 100
+                if price_change_10d < R['max_price_drop_10d']:
+                    fail_log['Distribution'] += 1
                     continue
 
-                silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
-                silent_cond2 = silent_row['High'] < high_max_10d_silent
+                first_half_vol = acc_zone['Volume'].iloc[:5].mean()
+                second_half_vol = acc_zone['Volume'].iloc[5:].mean()
+                if second_half_vol < first_half_vol * R['min_vol_growth']:
+                    fail_log['Distribution'] += 1
+                    continue
 
-                if silent_cond1 and silent_cond2:
+                green_vol = acc_zone[acc_zone['Close'] > acc_zone['Open']]['Volume'].sum()
+                red_vol = acc_zone[acc_zone['Close'] < acc_zone['Open']]['Volume'].sum()
+                green_red_ratio = green_vol / red_vol if red_vol > 0 else 99
+                if green_red_ratio < R['min_green_red_ratio']:
+                    fail_log['Distribution'] += 1
+                    continue
 
-                    # ACCUMULATION FILTER
-                    acc_start = max(0, j - R['accum_days'])
-                    acc_zone = df.iloc[acc_start:j]
-                    if len(acc_zone) < 5: continue
+                entry_price = high_max_10d_silent
 
-                    price_change_10d = (silent_row['Close'] / acc_zone['Close'].iloc[0] - 1) * 100
-                    if price_change_10d < R['max_price_drop_10d']:
-                        fail_log['Distribution'] += 1
-                        continue
+                # QUALITY SCORE CALC
+                pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
+                year_high = df['High'].iloc[max(0, j-252):j].max()
+                nearness_52w = ((year_high - entry_price) / year_high) * 100
+                vol_score = (silent_row['Volume'] / vol_max_10d_silent * 40)
+                depth_score = (pullback_depth * 3)
+                near_score = (max(0, 20-nearness_52w) * 1.5)
+                score = vol_score + depth_score + near_score
 
-                    first_half_vol = acc_zone['Volume'].iloc[:5].mean()
-                    second_half_vol = acc_zone['Volume'].iloc[5:].mean()
-                    if second_half_vol < first_half_vol * R['min_vol_growth']:
-                        fail_log['Distribution'] += 1
-                        continue
+                if score < R['score_min'] or score > R['score_max']:
+                    fail_log['Score_Filter'] += 1
+                    continue
 
-                    green_vol = acc_zone[acc_zone['Close'] > acc_zone['Open']]['Volume'].sum()
-                    red_vol = acc_zone[acc_zone['Close'] < acc_zone['Open']]['Volume'].sum()
-                    green_red_ratio = green_vol / red_vol if red_vol > 0 else 99
-                    if green_red_ratio < R['min_green_red_ratio']:
-                        fail_log['Distribution'] += 1
-                        continue
+                # ATR BASED SL/TP
+                sl_price = entry_price - (atr * R['sl_atr_mult'])
+                target_price = entry_price + (atr * R['target_atr_mult'])
+                sl_pct = ((entry_price - sl_price) / entry_price) * 100
+                target_pct = ((target_price - entry_price) / entry_price) * 100
 
-                    watchlist_date = df.index[j]
-                    entry_price = high_max_10d_silent
+                setups.append({
+                    'watchlist_date': df.index[j],
+                    'watchlist_idx': j,
+                    'entry_price': round(entry_price, 2),
+                    'atr': round(atr, 2),
+                    'sl_price': round(sl_price, 2),
+                    'target_price': round(target_price, 2),
+                    'sl_pct': round(sl_pct, 2),
+                    'target_pct': round(target_pct, 2),
+                    'rr_ratio': round(R['target_atr_mult'] / R['sl_atr_mult'], 2),
+                    'quality_score': round(score, 1),
+                    'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
+                    'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
+                })
+                break # Ek pullback me ek hi silent
 
-                    # QUALITY SCORE CALC
-                    pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
-                    year_high = df['High'].iloc[max(0, j-252):j].max()
-                    nearness_52w = ((year_high - entry_price) / year_high) * 100
-                    vol_score = (silent_row['Volume'] / vol_max_10d_silent * 40)
-                    depth_score = (pullback_depth * 3)
-                    near_score = (max(0, 20-nearness_52w) * 1.5)
-                    score = vol_score + depth_score + near_score
+    return setups
 
-                    if score < R['score_min'] or score > R['score_max']:
-                        fail_log['Score_Filter'] += 1
-                        continue
-
-                    # ATR BASED SL/TP
-                    sl_price = entry_price - (atr * R['sl_atr_mult'])
-                    target_price = entry_price + (atr * R['target_atr_mult'])
-                    sl_pct = ((entry_price - sl_price) / entry_price) * 100
-                    target_pct = ((target_price - entry_price) / entry_price) * 100
-
-                    details = {
-                        'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
-                        'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
-                        'watchlist_date': watchlist_date.strftime('%Y-%m-%d'),
-                        'watchlist_idx': j,
-                        'entry_price': round(entry_price, 2),
-                        'atr': round(atr, 2),
-                        'sl_price': round(sl_price, 2),
-                        'target_price': round(target_price, 2),
-                        'sl_pct': round(sl_pct, 2),
-                        'target_pct': round(target_pct, 2),
-                        'rr_ratio': round(R['target_atr_mult'] / R['sl_atr_mult'], 2),
-                        'quality_score': round(score, 1),
-                        'pullback_depth': round(pullback_depth, 1),
-                        'nearness_52w': round(nearness_52w, 1),
-                        'accum_check': 'PASS'
-                    }
-                    return details, j
-        return None, {}
-    except:
-        return None, {}
-
-def check_entry_in_watchlist(df, watchlist_idx, entry_price, sl_price, target_price):
+def check_entry_in_watchlist(df, setup):
     try:
+        watchlist_idx = setup['watchlist_idx']
+        entry_price = setup['entry_price']
+        sl_price = setup['sl_price']
+        target_price = setup['target_price']
+
         start_idx = watchlist_idx + 1
         if start_idx >= len(df): return False, {}
         end_search = min(start_idx + R['watchlist_days'], len(df))
         window = df.iloc[start_idx:end_search]
+
         for i in range(len(window)):
             if window['High'].iloc[i] > entry_price:
                 entry_idx = start_idx + i
@@ -241,38 +249,34 @@ def check_entry_in_watchlist(df, watchlist_idx, entry_price, sl_price, target_pr
     except:
         return False, {}
 
-def backtest_stock_pullback_silent(df_daily, ticker, year_start, year_end):
+def backtest_stock_multi_entry(df_daily, ticker, year_start, year_end):
     df_daily = add_indicators(df_daily)
     if not check_liquidity(df_daily):
         fail_log['Liquidity'] += 1
         return []
 
-    df_year = df_daily[(df_daily.index >= year_start) & (df_daily.index <= year_end)]
-    if len(df_year) < 50: return []
-
-    trades = []
-    total_len = len(df_daily)
-    if total_len < 252:
-        fail_log['Data'] += 1
+    # Saare setups nikalo
+    all_setups = find_all_pullback_silent(df_daily, year_start, year_end)
+    if not all_setups:
+        fail_log['No_Silent'] += 1
         return []
 
-    for check_end_idx in range(total_len-1, 251, -1):
-        if df_daily.index[check_end_idx] < year_start: break
-        if df_daily.index[check_end_idx] > year_end: continue
+    trades = []
+    last_exit_date = pd.Timestamp('2000-01-01') # Pehla trade kabhi bhi
 
-        details, watchlist_idx = find_pullback_silent(df_daily, check_end_idx)
-        if details is None:
-            fail_log['No_Silent'] += 1
+    for setup in all_setups:
+        # Gap check: last exit ke 30 din baad hi naya trade
+        if (setup['watchlist_date'] - last_exit_date).days < R['min_days_between_trades']:
+            fail_log['Gap_Skip'] += 1
             continue
-        entry_ok, trade_details = check_entry_in_watchlist(
-            df_daily, watchlist_idx, details['entry_price'],
-            details['sl_price'], details['target_price']
-        )
+
+        entry_ok, trade_details = check_entry_in_watchlist(df_daily, setup)
         if not entry_ok:
             fail_log['No_Entry'] += 1
             continue
-        trades.append({'Stock': ticker, **details, **trade_details})
-        break
+
+        trades.append({'Stock': ticker, **setup, **trade_details})
+        last_exit_date = pd.to_datetime(trade_details['exit_date'])
 
     return trades
 
@@ -281,12 +285,12 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks - ATR SL/TP", flush=True)
+print(f"Scanning {len(stocks)} stocks - MULTI ENTRY + 84-88 SCORE", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Score_Skip: {fail_log['Score_Filter']}", flush=True)
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Gap_Skip: {fail_log['Gap_Skip']}", flush=True)
 
         download_start = start_date - timedelta(days=400)
         df = yf.download(f"{stock}.NS", start=download_start, end=ref_date + timedelta(days=1),
@@ -297,7 +301,7 @@ for i, stock in enumerate(stocks):
             fail_log['Data'] += 1
             continue
 
-        trades = backtest_stock_pullback_silent(df, stock, start_date, ref_date)
+        trades = backtest_stock_multi_entry(df, stock, start_date, ref_date)
         signals.extend(trades)
         time.sleep(0.2)
     except:
@@ -308,18 +312,20 @@ print(f"Fail Log: {fail_log}", flush=True)
 
 # OUTPUT
 try:
-    ws_output = sh.worksheet("ATR_SLTP")
+    ws_output = sh.worksheet("Multi_Entry_84_88")
 except:
-    ws_output = sh.add_worksheet(title="ATR_SLTP", rows=2000, cols=40)
+    ws_output = sh.add_worksheet(title="Multi_Entry_84_88", rows=5000, cols=40)
 
 ws_output.clear()
 if signals:
     df_out = pd.DataFrame(signals)
-    df_out = df_out.sort_values('quality_score', ascending=False)
+    df_out['watchlist_date'] = pd.to_datetime(df_out['watchlist_date'])
+    df_out = df_out.sort_values(['Stock', 'watchlist_date'])
 
     def convert_to_native(val):
         if isinstance(val, (np.integer, np.int64)): return int(val)
         elif isinstance(val, (np.floating, np.float64)): return float(val)
+        elif isinstance(val, pd.Timestamp): return val.strftime('%Y-%m-%d')
         else: return val
     df_out = df_out.applymap(convert_to_native)
 
@@ -333,37 +339,24 @@ if signals:
     total_pl = round(df_out['pl_pct'].sum(), 2)
     avg_pl = round(df_out['pl_pct'].mean(), 1)
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
-    avg_sl = round(df_out['sl_pct'].mean(), 2)
-    avg_target = round(df_out['target_pct'].mean(), 2)
 
-    # SCORE BUCKET ANALYSIS
-    bins = [80, 82, 84, 86, 88, 90]
-    labels = ['80-82', '82-84', '84-86', '86-88', '88-90']
-    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
-
-    score_analysis = df_out.groupby('Score_Bucket').agg({
-        'Stock': 'count',
-        'pl_pct': ['sum', 'mean', 'median', lambda x: (x > 0).sum()]
-    }).round(2)
-    score_analysis.columns = ['Trades', 'Total_PL', 'Avg_PL', 'Median_PL', 'Wins']
-    score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
-    score_analysis = score_analysis.drop('Wins', axis=1)
+    # Stock wise count
+    stock_counts = df_out['Stock'].value_counts().head(10)
 
     current_row = len(payload) + 3
-    ws_output.update(f'A{current_row}', [[f'ATR SL/TP STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row}', [[f'MULTI ENTRY 84-88 STATS: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [
         ['Total Trades', total_trades], ['Win Rate %', win_rate],
         ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
-        ['Avg RR Ratio', avg_rr], ['Avg SL %', avg_sl], ['Avg Target %', avg_target],
-        ['SL Mult', f"{R['sl_atr_mult']}x ATR"], ['Target Mult', f"{R['target_atr_mult']}x ATR"],
-        ['Score Filtered', fail_log['Score_Filter']]
+        ['Avg RR', avg_rr], ['Gap Skipped', fail_log['Gap_Skip']],
+        ['Unique Stocks', df_out['Stock'].nunique()]
     ])
 
-    current_row += 12
-    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS 80-90']])
-    ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
+    current_row += 9
+    ws_output.update(f'A{current_row}', [['TOP 10 STOCKS BY TRADE COUNT']])
+    ws_output.update(f'A{current_row+1}', [['Stock', 'Trades']] + [[k, int(v)] for k, v in stock_counts.items()])
 
-    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL | RR {avg_rr} ===", flush=True)
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL | {df_out['Stock'].nunique()} STOCKS ===", flush=True)
 
 else:
     ws_output.update('A1', [["No Signals Found"]])
