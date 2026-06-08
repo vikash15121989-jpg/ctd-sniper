@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.18 BEAR KILLER FIXED ===", flush=True)
+print("=== V15.20 DUAL MODE WITH SCORE ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -52,18 +52,18 @@ is_bull = close_now > dma200_now and dma50_now > dma200_now
 regime = "BULL" if is_bull else "BEAR"
 print(f"Market Regime: {regime} | Nifty: {close_now:.0f} | 200DMA: {dma200_now:.0f}", flush=True)
 
-# 3. TWEAKED RULES - BEAR OPTIMIZED
+# 3. V15.20 DUAL MODE RULES
 if regime == "BULL":
     R = {
-        'score_ranges': [(80, 90)],
+        'score_ranges': [(80, 82), (88, 90)], # 86-88 HATA DIYA - BULL ME LOSS
         'sl_pct': 3.0, 'target_pct': 6.0,
         'hold_days': 10, 'min_gap': 0,
         'min_vol_growth': 0.85, 'max_price_drop_10d': -3.0,
     }
 else: # BEAR
     R = {
-        'score_ranges': [(80, 82), (86, 90)], # 82-86 SKIP
-        'sl_pct': 2.5, 'target_pct': 4.0, # 4% TP, 2.5% SL
+        'score_ranges': [(86, 90)], # 80-82 HATA DIYA - BEAR ME LOSS
+        'sl_pct': 2.5, 'target_pct': 4.0,
         'hold_days': 5, 'min_gap': 10,
         'min_vol_growth': 1.0, 'max_price_drop_10d': -1.0,
     }
@@ -102,6 +102,7 @@ def check_liquidity(df):
         return False
 
 def is_score_allowed(score):
+    """V15.20: BEAR/BULL ke hisab se bucket check"""
     for min_score, max_score in R['score_ranges']:
         if min_score <= score <= max_score:
             return True
@@ -172,14 +173,23 @@ def find_all_pullback_silent(df, year_start, year_end):
                     fail_log['Distribution'] += 1
                     continue
 
+                # ===== SCORE CALCULATION V15.20 =====
                 entry_price = high_max_10d_silent
                 pullback_depth = ((high_max_10d - row['Low']) / high_max_10d) * 100
                 year_high = df['High'].iloc[max(0, j-252):j].max()
                 nearness_52w = ((year_high - entry_price) / year_high) * 100
+
+                # 1. VOLUME SCORE: 0-40 points
                 vol_score = (silent_row['Volume'] / vol_max_10d_silent * 40)
+
+                # 2. DEPTH SCORE: 0-30+ points
                 depth_score = (pullback_depth * 3)
+
+                # 3. 52W NEARNESS SCORE: 0-30 points
                 near_score = (max(0, 20-nearness_52w) * 1.5)
+
                 score = vol_score + depth_score + near_score
+                # ===== SCORE END =====
 
                 if not is_score_allowed(score):
                     fail_log['Score_Filter'] += 1
@@ -195,6 +205,9 @@ def find_all_pullback_silent(df, year_start, year_end):
                     'sl_pct': R['sl_pct'], 'target_pct': R['target_pct'],
                     'rr_ratio': round(R['target_pct'] / R['sl_pct'], 2),
                     'quality_score': round(score, 1),
+                    'vol_score': round(vol_score, 1),
+                    'depth_score': round(depth_score, 1),
+                    'near_score': round(near_score, 1),
                     'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
                 })
                 break
@@ -305,7 +318,7 @@ for i, stock in enumerate(stocks):
 print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT - PANDAS ERROR FIXED
+# OUTPUT
 try:
     ws_output = sh.worksheet(f"Killer_{regime}")
 except:
@@ -334,16 +347,15 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1) if total_trades > 0 else 0
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
 
-    # FIXED: pd.cut hata diya. Direct function use kiya
+    # SCORE BUCKET ANALYSIS
     def get_score_bucket(score):
         if 80 <= score < 82: return '80-82'
+        elif 82 <= score < 86: return '82-86'
         elif 86 <= score < 88: return '86-88'
         elif 88 <= score <= 90: return '88-90'
         else: return 'Other'
 
     df_out['Score_Bucket'] = df_out['quality_score'].apply(get_score_bucket)
-    df_out = df_out[df_out['Score_Bucket']!= 'Other']
-
     score_analysis = df_out.groupby('Score_Bucket').agg({
         'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
     }).round(2)
@@ -352,7 +364,7 @@ if signals:
     score_analysis = score_analysis.drop('Wins', axis=1)
 
     current_row = len(payload) + 3
-    ws_output.update(f'A{current_row}', [[f'KILLER {regime} STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row}', [[f'KILLER {regime} V15.20: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [
         ['Total Trades', total_trades], ['Win Rate %', win_rate],
         ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
