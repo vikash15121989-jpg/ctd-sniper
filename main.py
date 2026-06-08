@@ -27,6 +27,9 @@ for fmt in date_formats:
     except ValueError:
         continue
 
+if ref_date is None:
+    raise ValueError(f"Date format not recognized: {date_raw}")
+
 start_date = ref_date - timedelta(days=365)
 print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
 
@@ -57,7 +60,7 @@ if regime == "BULL":
         'hold_days': 10, 'min_gap': 0,
         'min_vol_growth': 0.85, 'max_price_drop_10d': -3.0,
     }
-else: # BEAR - TWEAK 1 + TWEAK 2
+else: # BEAR - 82-86 SKIP + TIGHT TP/SL
     R = {
         'score_ranges': [(80, 82), (86, 90)], # 82-86 SKIP KAR DIYA
         'sl_pct': 2.5, 'target_pct': 4.0, # 4% TP, 2.5% SL
@@ -99,7 +102,7 @@ def check_liquidity(df):
         return False
 
 def is_score_allowed(score):
-    """TWEAK 1: 82-86 skip karo bear me"""
+    """82-86 skip karo bear me"""
     for min_score, max_score in R['score_ranges']:
         if min_score <= score <= max_score:
             return True
@@ -179,7 +182,7 @@ def find_all_pullback_silent(df, year_start, year_end):
                 near_score = (max(0, 20-nearness_52w) * 1.5)
                 score = vol_score + depth_score + near_score
 
-                # TWEAK 1: 82-86 SKIP
+                # 82-86 SKIP
                 if not is_score_allowed(score):
                     fail_log['Score_Filter'] += 1
                     continue
@@ -291,7 +294,7 @@ for i, stock in enumerate(stocks):
                         progress=False, auto_adjust=True, timeout=10)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 252:
+        if len(df) < 252 or df['Close'].isna().all():
             fail_log['Data'] += 1
             continue
 
@@ -305,7 +308,7 @@ for i, stock in enumerate(stocks):
 print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT
+# OUTPUT - FIXED BINS ERROR
 try:
     ws_output = sh.worksheet(f"Killer_{regime}")
 except:
@@ -334,9 +337,9 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1) if total_trades > 0 else 0
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
 
-    # Score bucket analysis
-    bins = [80, 82, 86, 88, 90, 100]
-    labels = ['80-82', '86-88', '88-90', '90+']
+    # FIXED: Bins aur labels match kar diye - 82-86 hata diya
+    bins = [80, 82, 86, 88, 90]
+    labels = ['80-82', '86-88', '88-90']
     df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
     score_analysis = df_out.groupby('Score_Bucket').agg({
         'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
