@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.16 REGIME ADAPTIVE ===", flush=True)
+print("=== V15.18 BEAR KILLER ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -27,17 +27,12 @@ for fmt in date_formats:
     except ValueError:
         continue
 
-if ref_date is None:
-    raise ValueError(f"Date format not recognized: {date_raw}")
-
 start_date = ref_date - timedelta(days=365)
 print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
 
-# 2. NIFTY REGIME CHECK - NAYA ADD KIYA
+# 2. NIFTY REGIME CHECK
 print("Checking Nifty Regime...", flush=True)
 nifty = yf.download("^NSEI", start=start_date - timedelta(days=250), end=ref_date + timedelta(days=1), progress=False)
-
-# Fix: MultiIndex + NaN handle
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 if nifty.empty or len(nifty) < 200:
@@ -54,31 +49,30 @@ is_bull = close_now > dma200_now and dma50_now > dma200_now
 regime = "BULL" if is_bull else "BEAR"
 print(f"Market Regime: {regime} | Nifty: {close_now:.0f} | 200DMA: {dma200_now:.0f}", flush=True)
 
-# 3. ADAPTIVE RULES - REGIME KE HISAB SE BADALTA HAI
+# 3. TWEAKED RULES - BEAR OPTIMIZED
 if regime == "BULL":
     R = {
-        'score_min': 80, 'score_max': 90,
-        'sl_atr_mult': 1.0, 'target_atr_mult': 2.0,
-        'hold_days': 10, 'min_gap': 0, # No gap bull me
+        'score_ranges': [(80, 90)], # Full 80-90 bull me
+        'sl_pct': 3.0, 'target_pct': 6.0,
+        'hold_days': 10, 'min_gap': 0,
         'min_vol_growth': 0.85, 'max_price_drop_10d': -3.0,
     }
-else: # BEAR
+else: # BEAR - TWEAK 1 + TWEAK 2
     R = {
-        'score_min': 80, 'score_max': 82, # Sirf best bucket bear me
-        'sl_atr_mult': 0.8, 'target_atr_mult': 1.5, # Tight SL/TP
-        'hold_days': 5, # Jaldi nikal bear me
-        'min_gap': 10, # Overtrade se bacho
-        'min_vol_growth': 1.0, 'max_price_drop_10d': -1.0, # Strict accumulation
+        'score_ranges': [(80, 82), (86, 90)], # 82-86 SKIP KAR DIYA
+        'sl_pct': 2.5, 'target_pct': 4.0, # 4% TP, 2.5% SL
+        'hold_days': 5, 'min_gap': 10,
+        'min_vol_growth': 1.0, 'max_price_drop_10d': -1.0,
     }
 
 R.update({
     'min_price': 50, 'min_daily_value_cr': 0.5, 'min_vol_shares': 100000,
-    'uptrend_days': 10, 'vol_ma_days': 20, 'atr_period': 14,
+    'uptrend_days': 10, 'vol_ma_days': 20,
     'accum_days': 10, 'min_green_red_ratio': 1.1,
     'scan_window': 60, 'silent_lookback': 10, 'watchlist_days': 10,
 })
 
-print(f"Using Rules: Score {R['score_min']}-{R['score_max']} | SL {R['sl_atr_mult']}x | TP {R['target_atr_mult']}x | Hold {R['hold_days']}D", flush=True)
+print(f"Using Rules: Score {R['score_ranges']} | SL {R['sl_pct']}% | TP {R['target_pct']}% | Hold {R['hold_days']}D", flush=True)
 
 fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0,
             'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
@@ -90,13 +84,6 @@ def add_indicators(df):
     df['Daily_Value'] = df['Close'] * df['Volume']
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
     df['New_High_10D'] = df['High'] > df['High'].shift(1).rolling(10).max()
-
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    df['ATR'] = true_range.rolling(R['atr_period']).mean()
     return df
 
 def check_liquidity(df):
@@ -110,6 +97,13 @@ def check_liquidity(df):
         return True
     except:
         return False
+
+def is_score_allowed(score):
+    """TWEAK 1: 82-86 skip karo bear me"""
+    for min_score, max_score in R['score_ranges']:
+        if min_score <= score <= max_score:
+            return True
+    return False
 
 def find_all_pullback_silent(df, year_start, year_end):
     setups = []
@@ -147,8 +141,7 @@ def find_all_pullback_silent(df, year_start, year_end):
             silent_row = df.iloc[j]
             vol_max_10d_silent = silent_row['Vol_10D_Max']
             high_max_10d_silent = silent_row['High_10D_Max']
-            atr = silent_row['ATR']
-            if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent) or pd.isna(atr): continue
+            if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent): continue
             if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent: continue
 
             silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
@@ -186,24 +179,23 @@ def find_all_pullback_silent(df, year_start, year_end):
                 near_score = (max(0, 20-nearness_52w) * 1.5)
                 score = vol_score + depth_score + near_score
 
-                if score < R['score_min'] or score > R['score_max']:
+                # TWEAK 1: 82-86 SKIP
+                if not is_score_allowed(score):
                     fail_log['Score_Filter'] += 1
                     continue
 
-                sl_price = entry_price - (atr * R['sl_atr_mult'])
-                target_price = entry_price + (atr * R['target_atr_mult'])
-                sl_pct = ((entry_price - sl_price) / entry_price) * 100
-                target_pct = ((target_price - entry_price) / entry_price) * 100
+                # FIXED % SL/TP
+                sl_price = entry_price * (1 - R['sl_pct'] / 100)
+                target_price = entry_price * (1 + R['target_pct'] / 100)
 
                 setups.append({
                     'watchlist_date': df.index[j], 'watchlist_idx': j,
-                    'entry_price': round(entry_price, 2), 'atr': round(atr, 2),
+                    'entry_price': round(entry_price, 2),
                     'sl_price': round(sl_price, 2), 'target_price': round(target_price, 2),
-                    'sl_pct': round(sl_pct, 2), 'target_pct': round(target_pct, 2),
-                    'rr_ratio': round(R['target_atr_mult'] / R['sl_atr_mult'], 2),
+                    'sl_pct': R['sl_pct'], 'target_pct': R['target_pct'],
+                    'rr_ratio': round(R['target_pct'] / R['sl_pct'], 2),
                     'quality_score': round(score, 1),
                     'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
-                    'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
                 })
                 break
     return setups
@@ -271,7 +263,6 @@ def backtest_stock_adaptive(df_daily, ticker, year_start, year_end):
     last_exit_date = pd.Timestamp('2000-01-01')
 
     for setup in all_setups:
-        # GAP CHECK - BEAR ME LAGU, BULL ME 0
         if (setup['watchlist_date'] - last_exit_date).days < R['min_gap']: continue
 
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, setup)
@@ -314,11 +305,11 @@ for i, stock in enumerate(stocks):
 print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
 print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT - REGIME KE NAAM SE SHEET
+# OUTPUT
 try:
-    ws_output = sh.worksheet(f"Adaptive_{regime}")
+    ws_output = sh.worksheet(f"Killer_{regime}")
 except:
-    ws_output = sh.add_worksheet(title=f"Adaptive_{regime}", rows=10000, cols=40)
+    ws_output = sh.add_worksheet(title=f"Killer_{regime}", rows=10000, cols=40)
 
 ws_output.clear()
 if signals:
@@ -343,8 +334,9 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1) if total_trades > 0 else 0
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
 
-    bins = [80, 82, 84, 86, 88, 90]
-    labels = ['80-82', '82-84', '84-86', '86-88', '88-90']
+    # Score bucket analysis
+    bins = [80, 82, 86, 88, 90, 100]
+    labels = ['80-82', '86-88', '88-90', '90+']
     df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
     score_analysis = df_out.groupby('Score_Bucket').agg({
         'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
@@ -353,27 +345,19 @@ if signals:
     score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
     score_analysis = score_analysis.drop('Wins', axis=1)
 
-    stock_counts = df_out['Stock'].value_counts().head(15)
-
     current_row = len(payload) + 3
-    ws_output.update(f'A{current_row}', [[f'ADAPTIVE {regime} STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row}', [[f'KILLER {regime} STATS: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [
         ['Total Trades', total_trades], ['Win Rate %', win_rate],
         ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
-        ['Avg RR', avg_rr], ['Unique Stocks', df_out['Stock'].nunique()],
-        ['Score Range', f"{R['score_min']}-{R['score_max']}"],
-        ['SL/TP', f"{R['sl_atr_mult']}x/{R['target_atr_mult']}x"]
+        ['Avg RR', avg_rr], ['SL/TP %', f"{R['sl_pct']}/{R['target_pct']}"]
     ])
 
     current_row += 9
     ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS']])
     ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
 
-    current_row += 8
-    ws_output.update(f'A{current_row}', [['TOP 15 STOCKS BY TRADE COUNT']])
-    ws_output.update(f'A{current_row+1}', [['Stock', 'Trades']] + [[k, int(v)] for k, v in stock_counts.items()])
-
-    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL | {df_out['Stock'].nunique()} STOCKS ===", flush=True)
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
 
 else:
     ws_output.update('A1', [["No Signals Found"]])
