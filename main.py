@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.14 MULTI-ENTRY PER STOCK ===", flush=True)
+print("=== V15.15 NO GAP MULTI-ENTRY ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -30,7 +30,7 @@ for fmt in date_formats:
 start_date = ref_date - timedelta(days=365)
 print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
 
-# 2. RULES - MULTI ENTRY
+# 2. RULES - NO GAP
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
@@ -45,11 +45,10 @@ R = {
     'atr_period': 14,
     'sl_atr_mult': 1.0,
     'target_atr_mult': 2.0,
-    # SCORE FILTER - 84-88 ONLY
-    'score_min': 84,
-    'score_max': 88,
-    # MULTI ENTRY RULE
-    'min_days_between_trades': 30, # Ek trade ke baad 30 din wait
+    # SCORE FILTER - 80-90 FULL RANGE
+    'score_min': 80,
+    'score_max': 90,
+    # GAP RULE HATA DIYA - min_days_between_trades: 0
     # ACCUMULATION FILTERS
     'accum_days': 10,
     'max_price_drop_10d': -3.0,
@@ -58,7 +57,7 @@ R = {
 }
 
 fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0,
-            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0, 'Gap_Skip': 0}
+            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
 
 def add_indicators(df):
     df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
@@ -90,11 +89,10 @@ def check_liquidity(df):
         return False
 
 def find_all_pullback_silent(df, year_start, year_end):
-    """Ab sab silent accumulation dhundhega, ek nahi"""
     setups = []
     total_len = len(df)
 
-    for i in range(252, total_len): # 252 din data chahiye
+    for i in range(252, total_len):
         if df.index[i] < year_start or df.index[i] > year_end:
             continue
 
@@ -197,7 +195,7 @@ def find_all_pullback_silent(df, year_start, year_end):
                     'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
                     'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
                 })
-                break # Ek pullback me ek hi silent
+                break
 
     return setups
 
@@ -249,34 +247,25 @@ def check_entry_in_watchlist(df, setup):
     except:
         return False, {}
 
-def backtest_stock_multi_entry(df_daily, ticker, year_start, year_end):
+def backtest_stock_no_gap(df_daily, ticker, year_start, year_end):
     df_daily = add_indicators(df_daily)
     if not check_liquidity(df_daily):
         fail_log['Liquidity'] += 1
         return []
 
-    # Saare setups nikalo
     all_setups = find_all_pullback_silent(df_daily, year_start, year_end)
     if not all_setups:
         fail_log['No_Silent'] += 1
         return []
 
     trades = []
-    last_exit_date = pd.Timestamp('2000-01-01') # Pehla trade kabhi bhi
-
+    # GAP CHECK HATA DIYA - HAR SETUP LE LO
     for setup in all_setups:
-        # Gap check: last exit ke 30 din baad hi naya trade
-        if (setup['watchlist_date'] - last_exit_date).days < R['min_days_between_trades']:
-            fail_log['Gap_Skip'] += 1
-            continue
-
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, setup)
         if not entry_ok:
             fail_log['No_Entry'] += 1
             continue
-
         trades.append({'Stock': ticker, **setup, **trade_details})
-        last_exit_date = pd.to_datetime(trade_details['exit_date'])
 
     return trades
 
@@ -285,12 +274,12 @@ stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks - MULTI ENTRY + 84-88 SCORE", flush=True)
+print(f"Scanning {len(stocks)} stocks - NO GAP + 80-90 SCORE", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Gap_Skip: {fail_log['Gap_Skip']}", flush=True)
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)}", flush=True)
 
         download_start = start_date - timedelta(days=400)
         df = yf.download(f"{stock}.NS", start=download_start, end=ref_date + timedelta(days=1),
@@ -301,7 +290,7 @@ for i, stock in enumerate(stocks):
             fail_log['Data'] += 1
             continue
 
-        trades = backtest_stock_multi_entry(df, stock, start_date, ref_date)
+        trades = backtest_stock_no_gap(df, stock, start_date, ref_date)
         signals.extend(trades)
         time.sleep(0.2)
     except:
@@ -312,9 +301,9 @@ print(f"Fail Log: {fail_log}", flush=True)
 
 # OUTPUT
 try:
-    ws_output = sh.worksheet("Multi_Entry_84_88")
+    ws_output = sh.worksheet("NoGap_80_90")
 except:
-    ws_output = sh.add_worksheet(title="Multi_Entry_84_88", rows=5000, cols=40)
+    ws_output = sh.add_worksheet(title="NoGap_80_90", rows=10000, cols=40)
 
 ws_output.clear()
 if signals:
@@ -340,20 +329,35 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1)
     avg_rr = round(df_out['rr_ratio'].mean(), 2)
 
+    # Score bucket analysis
+    bins = [80, 82, 84, 86, 88, 90]
+    labels = ['80-82', '82-84', '84-86', '86-88', '88-90']
+    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
+    score_analysis = df_out.groupby('Score_Bucket').agg({
+        'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
+    }).round(2)
+    score_analysis.columns = ['Trades', 'Total_PL', 'Avg_PL', 'Wins']
+    score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
+    score_analysis = score_analysis.drop('Wins', axis=1)
+
     # Stock wise count
-    stock_counts = df_out['Stock'].value_counts().head(10)
+    stock_counts = df_out['Stock'].value_counts().head(15)
 
     current_row = len(payload) + 3
-    ws_output.update(f'A{current_row}', [[f'MULTI ENTRY 84-88 STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row}', [[f'NO GAP 80-90 STATS: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [
         ['Total Trades', total_trades], ['Win Rate %', win_rate],
         ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
-        ['Avg RR', avg_rr], ['Gap Skipped', fail_log['Gap_Skip']],
-        ['Unique Stocks', df_out['Stock'].nunique()]
+        ['Avg RR', avg_rr], ['Unique Stocks', df_out['Stock'].nunique()],
+        ['Avg Trades/Stock', round(total_trades/df_out['Stock'].nunique(), 1)]
     ])
 
     current_row += 9
-    ws_output.update(f'A{current_row}', [['TOP 10 STOCKS BY TRADE COUNT']])
+    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS']])
+    ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
+
+    current_row += 8
+    ws_output.update(f'A{current_row}', [['TOP 15 STOCKS BY TRADE COUNT']])
     ws_output.update(f'A{current_row+1}', [['Stock', 'Trades']] + [[k, int(v)] for k, v in stock_counts.items()])
 
     print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL | {df_out['Stock'].nunique()} STOCKS ===", flush=True)
