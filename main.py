@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V15.8 1 YEAR FAST BACKTEST ===", flush=True)
+print("=== V15.12 TIGHT SCORE + LOW TARGET ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -27,16 +27,14 @@ for fmt in date_formats:
     except ValueError:
         continue
 
-# Nifty check
 nifty_df = yf.download("^NSEI", period="5y", progress=False, auto_adjust=True)
 if ref_date.date() > nifty_df.index[-1].date():
     ref_date = nifty_df.index[-1].to_pydatetime()
 
-# 1 SAAL KA WINDOW
 start_date = ref_date - timedelta(days=365)
 print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
 
-# 2. RULES
+# 2. RULES - TIGHT SCORE + CHOTA TARGET
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
@@ -46,19 +44,23 @@ R = {
     'scan_window': 60,
     'silent_lookback': 10,
     'watchlist_days': 10,
-    'target_pct': 15,
-    'sl_pct': 8,
-    'hold_days': 30,
+    'target_pct': 5, # 8 se 5 kar diya - jaldi book
+    'sl_pct': 3, # 5 se 3 kar diya - aur tight
+    'hold_days': 7, # 10 se 7 kar diya - aur jaldi nikal
     'checks_per_stock': 1,
     'gap_between_checks': 60,
     # ACCUMULATION FILTERS
     'accum_days': 10,
-    'max_price_drop_10d': -2.0,
-    'min_vol_growth': 0.9,
-    'min_green_red_ratio': 1.2,
+    'max_price_drop_10d': -3.0,
+    'min_vol_growth': 0.85,
+    'min_green_red_ratio': 1.1,
+    # SCORE FILTER - TIGHT
+    'score_min': 80, # 60 se 80 kar diya
+    'score_max': 90, # 100 se 90 - 90+ trap skip
 }
 
-fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0, 'No_Entry': 0, 'Distribution': 0}
+fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0,
+            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
 
 def add_indicators(df):
     df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
@@ -159,6 +161,11 @@ def find_pullback_silent(df, end_idx):
                     near_score = (max(0, 20-nearness_52w) * 1.5)
                     score = vol_score + depth_score + near_score
 
+                    # TIGHT SCORE FILTER - 80-90 HI
+                    if score < R['score_min'] or score > R['score_max']:
+                        fail_log['Score_Filter'] += 1
+                        continue
+
                     details = {
                         'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
                         'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
@@ -231,7 +238,6 @@ def backtest_stock_pullback_silent(df_daily, ticker, year_start, year_end):
         fail_log['Liquidity'] += 1
         return []
 
-    # 1 SAAL KA DATA HI FILTER KARO
     df_year = df_daily[(df_daily.index >= year_start) & (df_daily.index <= year_end)]
     if len(df_year) < 50: return []
 
@@ -241,7 +247,6 @@ def backtest_stock_pullback_silent(df_daily, ticker, year_start, year_end):
         fail_log['Data'] += 1
         return []
 
-    # Sirf year ke andar scan karo
     for check_end_idx in range(total_len-1, 251, -1):
         if df_daily.index[check_end_idx] < year_start: break
         if df_daily.index[check_end_idx] > year_end: continue
@@ -255,23 +260,22 @@ def backtest_stock_pullback_silent(df_daily, ticker, year_start, year_end):
             fail_log['No_Entry'] += 1
             continue
         trades.append({'Stock': ticker, **details, **trade_details})
-        break # 1 stock = 1 trade max
+        break
 
     return trades
 
-# MAIN LOOP - 1 YEAR ONLY
+# MAIN LOOP
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
 signals = []
 
-print(f"Scanning {len(stocks)} stocks for 1 YEAR only...", flush=True)
+print(f"Scanning {len(stocks)} stocks - SCORE 80-90 + 5% TARGET", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         if i % 50 == 0:
-            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Distribution Skip: {fail_log['Distribution']}", flush=True)
+            print(f"Progress: {i}/{len(stocks)} | Found: {len(signals)} | Score_Skip: {fail_log['Score_Filter']}", flush=True)
 
-        # Data download: 365 din + 400 din extra for indicators
         download_start = start_date - timedelta(days=400)
         df = yf.download(f"{stock}.NS", start=download_start, end=ref_date + timedelta(days=1),
                         progress=False, auto_adjust=True, timeout=10)
@@ -292,9 +296,9 @@ print(f"Fail Log: {fail_log}", flush=True)
 
 # OUTPUT
 try:
-    ws_output = sh.worksheet("1Year_Fast")
+    ws_output = sh.worksheet("Tight_80_90")
 except:
-    ws_output = sh.add_worksheet(title="1Year_Fast", rows=2000, cols=35)
+    ws_output = sh.add_worksheet(title="Tight_80_90", rows=2000, cols=35)
 
 ws_output.clear()
 if signals:
@@ -318,8 +322,8 @@ if signals:
     avg_pl = round(df_out['pl_pct'].mean(), 1)
 
     # SCORE BUCKET ANALYSIS
-    bins = [0, 60, 70, 80, 90, 100]
-    labels = ['0-60 Low', '60-70 Avg', '70-80 Good', '80-90 VGood', '90-100 Best']
+    bins = [80, 82, 84, 86, 88, 90]
+    labels = ['80-82', '82-84', '84-86', '86-88', '88-90']
     df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
 
     score_analysis = df_out.groupby('Score_Bucket').agg({
@@ -332,17 +336,17 @@ if signals:
 
     # OUTPUT TO SHEET
     current_row = len(payload) + 3
-    ws_output.update(f'A{current_row}', [[f'1 YEAR STATS: {start_date.date()} to {ref_date.date()}']])
+    ws_output.update(f'A{current_row}', [[f'TIGHT 80-90 STATS: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [['Total Trades', total_trades], ['Win Rate %', win_rate],
                                            ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
-                                           ['Distribution Skipped', fail_log['Distribution']]])
+                                           ['Target', f"{R['target_pct']}%"], ['SL', f"{R['sl_pct']}%"],
+                                           ['Hold Days', R['hold_days']], ['Score Filtered', fail_log['Score_Filter']]])
 
-    current_row += 7
-    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS']])
+    current_row += 10
+    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS 80-90']])
     ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
 
     print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
-    print(f"=== DISTRIBUTION SKIPPED: {fail_log['Distribution']} ===", flush=True)
 
 else:
     ws_output.update('A1', [["No Signals Found"]])
