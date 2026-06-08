@@ -27,31 +27,46 @@ for fmt in date_formats:
     except ValueError:
         continue
 
-start_date = ref_date - timedelta(days=365)
+if ref_date is None:
+    raise ValueError(f"Date format not recognized: {date_raw}")
 
-# 2. NIFTY REGIME CHECK
+start_date = ref_date - timedelta(days=365)
+print(f"Scan Range: {start_date.date()} to {ref_date.date()}", flush=True)
+
+# 2. NIFTY REGIME CHECK - NAYA ADD KIYA
 print("Checking Nifty Regime...", flush=True)
-nifty = yf.download("^NSEI", start=start_date - timedelta(days=250), end=ref_date, progress=False)
+nifty = yf.download("^NSEI", start=start_date - timedelta(days=250), end=ref_date + timedelta(days=1), progress=False)
+
+# Fix: MultiIndex + NaN handle
+if isinstance(nifty.columns, pd.MultiIndex):
+    nifty.columns = nifty.columns.droplevel(1)
+if nifty.empty or len(nifty) < 200:
+    raise ValueError("Nifty data nahi mila")
+
 nifty['200DMA'] = nifty['Close'].rolling(200).mean()
 nifty['50DMA'] = nifty['Close'].rolling(50).mean()
 
-is_bull = nifty['Close'].iloc[-1] > nifty['200DMA'].iloc[-1] and nifty['50DMA'].iloc[-1] > nifty['200DMA'].iloc[-1]
-regime = "BULL" if is_bull else "BEAR"
-print(f"Market Regime: {regime} | Nifty: {nifty['Close'].iloc[-1]:.0f} | 200DMA: {nifty['200DMA'].iloc[-1]:.0f}", flush=True)
+close_now = float(nifty['Close'].iloc[-1])
+dma200_now = float(nifty['200DMA'].iloc[-1])
+dma50_now = float(nifty['50DMA'].iloc[-1])
 
-# 3. ADAPTIVE RULES
+is_bull = close_now > dma200_now and dma50_now > dma200_now
+regime = "BULL" if is_bull else "BEAR"
+print(f"Market Regime: {regime} | Nifty: {close_now:.0f} | 200DMA: {dma200_now:.0f}", flush=True)
+
+# 3. ADAPTIVE RULES - REGIME KE HISAB SE BADALTA HAI
 if regime == "BULL":
     R = {
         'score_min': 80, 'score_max': 90,
         'sl_atr_mult': 1.0, 'target_atr_mult': 2.0,
-        'hold_days': 10, 'min_gap': 0,
+        'hold_days': 10, 'min_gap': 0, # No gap bull me
         'min_vol_growth': 0.85, 'max_price_drop_10d': -3.0,
     }
 else: # BEAR
     R = {
-        'score_min': 80, 'score_max': 82, # Sirf best bucket
+        'score_min': 80, 'score_max': 82, # Sirf best bucket bear me
         'sl_atr_mult': 0.8, 'target_atr_mult': 1.5, # Tight SL/TP
-        'hold_days': 5, # Jaldi nikal
+        'hold_days': 5, # Jaldi nikal bear me
         'min_gap': 10, # Overtrade se bacho
         'min_vol_growth': 1.0, 'max_price_drop_10d': -1.0, # Strict accumulation
     }
@@ -60,11 +75,13 @@ R.update({
     'min_price': 50, 'min_daily_value_cr': 0.5, 'min_vol_shares': 100000,
     'uptrend_days': 10, 'vol_ma_days': 20, 'atr_period': 14,
     'accum_days': 10, 'min_green_red_ratio': 1.1,
+    'scan_window': 60, 'silent_lookback': 10, 'watchlist_days': 10,
 })
 
-print(f"Using Rules: Score {R['score_min']}-{R['score_max']} | SL {R['sl_atr_mult']}x | TP {R['target_atr_mult']}x", flush=True)
+print(f"Using Rules: Score {R['score_min']}-{R['score_max']} | SL {R['sl_atr_mult']}x | TP {R['target_atr_mult']}x | Hold {R['hold_days']}D", flush=True)
 
-fail_log = {'Liquidity': 0, 'Data': 0, 'No_Silent': 0, 'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
+fail_log = {'Liquidity': 0, 'Data': 0, 'No_Uptrend': 0, 'No_Pullback': 0, 'No_Silent': 0,
+            'No_Entry': 0, 'Distribution': 0, 'Score_Filter': 0}
 
 def add_indicators(df):
     df['Vol_10D_Max'] = df['Volume'].rolling(10).max().shift(1)
@@ -109,16 +126,22 @@ def find_all_pullback_silent(df, year_start, year_end):
         vol_20ma = df['Vol_20MA'].iloc[i]
         if pd.isna(vol_20ma): continue
         uptrend = new_highs >= 3 and avg_vol > vol_20ma
-        if not uptrend: continue
+        if not uptrend:
+            fail_log['No_Uptrend'] += 1
+            continue
 
         row = df.iloc[i]
         vol_max_10d = row['Vol_10D_Max']
         high_max_10d = row['High_10D_Max']
         if pd.isna(vol_max_10d) or pd.isna(high_max_10d): continue
-        if not (row['High'] < high_max_10d and row['Volume'] < vol_max_10d): continue
+        pullback_cond1 = row['High'] < high_max_10d
+        pullback_cond2 = row['Volume'] < vol_max_10d
+        if not (pullback_cond1 and pullback_cond2):
+            fail_log['No_Pullback'] += 1
+            continue
 
         pullback_idx = i
-        search_end = min(pullback_idx + 1 + 10, len(df))
+        search_end = min(pullback_idx + 1 + R['watchlist_days'], len(df))
 
         for j in range(pullback_idx + 1, search_end):
             silent_row = df.iloc[j]
@@ -128,7 +151,10 @@ def find_all_pullback_silent(df, year_start, year_end):
             if pd.isna(vol_max_10d_silent) or pd.isna(high_max_10d_silent) or pd.isna(atr): continue
             if silent_row['High'] > high_max_10d_silent and silent_row['Volume'] < vol_max_10d_silent: continue
 
-            if silent_row['Volume'] > vol_max_10d_silent and silent_row['High'] < high_max_10d_silent:
+            silent_cond1 = silent_row['Volume'] > vol_max_10d_silent
+            silent_cond2 = silent_row['High'] < high_max_10d_silent
+
+            if silent_cond1 and silent_cond2:
                 acc_start = max(0, j - R['accum_days'])
                 acc_zone = df.iloc[acc_start:j]
                 if len(acc_zone) < 5: continue
@@ -176,6 +202,8 @@ def find_all_pullback_silent(df, year_start, year_end):
                     'sl_pct': round(sl_pct, 2), 'target_pct': round(target_pct, 2),
                     'rr_ratio': round(R['target_atr_mult'] / R['sl_atr_mult'], 2),
                     'quality_score': round(score, 1),
+                    'pullback_date': df.index[pullback_idx].strftime('%Y-%m-%d'),
+                    'uptrend_start_date': df.index[uptrend_start].strftime('%Y-%m-%d'),
                 })
                 break
     return setups
@@ -189,7 +217,7 @@ def check_entry_in_watchlist(df, setup):
 
         start_idx = watchlist_idx + 1
         if start_idx >= len(df): return False, {}
-        end_search = min(start_idx + 10, len(df))
+        end_search = min(start_idx + R['watchlist_days'], len(df))
         window = df.iloc[start_idx:end_search]
 
         for i in range(len(window)):
@@ -243,6 +271,7 @@ def backtest_stock_adaptive(df_daily, ticker, year_start, year_end):
     last_exit_date = pd.Timestamp('2000-01-01')
 
     for setup in all_setups:
+        # GAP CHECK - BEAR ME LAGU, BULL ME 0
         if (setup['watchlist_date'] - last_exit_date).days < R['min_gap']: continue
 
         entry_ok, trade_details = check_entry_in_watchlist(df_daily, setup)
@@ -278,12 +307,14 @@ for i, stock in enumerate(stocks):
         trades = backtest_stock_adaptive(df, stock, start_date, ref_date)
         signals.extend(trades)
         time.sleep(0.2)
-    except:
+    except Exception as e:
+        print(f"Error {stock}: {e}", flush=True)
         continue
 
 print(f"\nScan Complete. Total Signals: {len(signals)}", flush=True)
+print(f"Fail Log: {fail_log}", flush=True)
 
-# OUTPUT
+# OUTPUT - REGIME KE NAAM SE SHEET
 try:
     ws_output = sh.worksheet(f"Adaptive_{regime}")
 except:
@@ -307,21 +338,43 @@ if signals:
 
     total_trades = len(df_out)
     win_trades = (df_out['pl_pct'] > 0).sum()
-    win_rate = round(win_trades / total_trades * 100, 1)
+    win_rate = round(win_trades / total_trades * 100, 1) if total_trades > 0 else 0
     total_pl = round(df_out['pl_pct'].sum(), 2)
-    avg_pl = round(df_out['pl_pct'].mean(), 1)
+    avg_pl = round(df_out['pl_pct'].mean(), 1) if total_trades > 0 else 0
+    avg_rr = round(df_out['rr_ratio'].mean(), 2)
+
+    bins = [80, 82, 84, 86, 88, 90]
+    labels = ['80-82', '82-84', '84-86', '86-88', '88-90']
+    df_out['Score_Bucket'] = pd.cut(df_out['quality_score'], bins=bins, labels=labels, include_lowest=True)
+    score_analysis = df_out.groupby('Score_Bucket').agg({
+        'Stock': 'count', 'pl_pct': ['sum', 'mean', lambda x: (x > 0).sum()]
+    }).round(2)
+    score_analysis.columns = ['Trades', 'Total_PL', 'Avg_PL', 'Wins']
+    score_analysis['Win_Rate'] = (score_analysis['Wins'] / score_analysis['Trades'] * 100).round(1)
+    score_analysis = score_analysis.drop('Wins', axis=1)
+
+    stock_counts = df_out['Stock'].value_counts().head(15)
 
     current_row = len(payload) + 3
     ws_output.update(f'A{current_row}', [[f'ADAPTIVE {regime} STATS: {start_date.date()} to {ref_date.date()}']])
     ws_output.update(f'A{current_row+1}', [
         ['Total Trades', total_trades], ['Win Rate %', win_rate],
         ['Total P&L %', total_pl], ['Avg P&L %', avg_pl],
+        ['Avg RR', avg_rr], ['Unique Stocks', df_out['Stock'].nunique()],
         ['Score Range', f"{R['score_min']}-{R['score_max']}"],
-        ['SL Mult', f"{R['sl_atr_mult']}x"], ['TP Mult', f"{R['target_atr_mult']}x"],
-        ['Hold Days', R['hold_days']]
+        ['SL/TP', f"{R['sl_atr_mult']}x/{R['target_atr_mult']}x"]
     ])
 
-    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL ===", flush=True)
+    current_row += 9
+    ws_output.update(f'A{current_row}', [['SCORE BUCKET ANALYSIS']])
+    ws_output.update(f'A{current_row+1}', [score_analysis.reset_index().columns.values.tolist()] + score_analysis.reset_index().values.tolist())
+
+    current_row += 8
+    ws_output.update(f'A{current_row}', [['TOP 15 STOCKS BY TRADE COUNT']])
+    ws_output.update(f'A{current_row+1}', [['Stock', 'Trades']] + [[k, int(v)] for k, v in stock_counts.items()])
+
+    print(f"\n=== DONE: {total_trades} SIGNALS | {win_rate}% WIN | {total_pl}% TOTAL | {df_out['Stock'].nunique()} STOCKS ===", flush=True)
+
 else:
     ws_output.update('A1', [["No Signals Found"]])
     print("\n=== DONE: 0 SIGNALS ===", flush=True)
