@@ -9,7 +9,7 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== CTD SNIPER V15.20 - CLEAN RETAIN ===", flush=True)
+print("=== CTD SNIPER V15.21 - CLIMAX ADDED ===", flush=True)
 
 # 1. SETUP
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -41,7 +41,7 @@ is_bull = close_now > dma200_now and dma50_now > dma200_now
 regime = "BULL" if is_bull else "BEAR"
 print(f"Market Regime: {regime}", flush=True)
 
-# 3. V15.20 RULES
+# 3. V15.21 RULES
 if regime == "BULL":
     R = {
         'score_ranges': [(80, 82), (88, 90)],
@@ -59,6 +59,10 @@ R.update({
     'min_price': 50, 'min_daily_value_cr': 0.5, 'min_vol_shares': 100000,
     'uptrend_days': 10, 'vol_ma_days': 20,
     'accum_days': 10, 'min_green_red_ratio': 1.1,
+    # CLIMAX RULES
+    'sc_body_pct': 2.0, 'sc_vol_multiple': 2.0, 'sc_wick_pct': 15.0,
+    'sc_pullback_min': 8.0, 'sc_pullback_max': 20.0, 'sc_lookback': 60,
+    'sc_gap_days': 5, # Buying Climax ke kitne din baad SC dhoondhna hai
 })
 
 def add_indicators(df):
@@ -68,6 +72,11 @@ def add_indicators(df):
     df['Daily_Value'] = df['Close'] * df['Volume']
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
     df['New_High_10D'] = df['High'] > df['High'].shift(1).rolling(10).max()
+    # CLIMAX HELPERS
+    df['Body'] = abs(df['Close'] - df['Open']) / df['Open'] * 100
+    df['Upper_Wick'] = (df['High'] - df[['Close','Open']].max(axis=1)) / (df['High'] - df['Low'] + 0.01) * 100
+    df['Lower_Wick'] = (df[['Close','Open']].min(axis=1) - df['Low']) / (df['High'] - df['Low'] + 0.01) * 100
+    df['Vol_1D_Ago'] = df['Volume'].shift(1)
     return df
 
 def check_liquidity(df, idx):
@@ -100,6 +109,55 @@ def check_uptrend(df, idx):
         }
     return False, {}
 
+# === NAYA FUNCTION: BUYING CLIMAX CHECK ===
+def check_buying_climax(df, idx):
+    if idx < 1: return False
+    row = df.iloc[idx]
+    # Cond 1: 2%+ green body + Close near High
+    cond1 = row['Body'] >= R['sc_body_pct'] and row['Close'] > row['Open'] and row['Upper_Wick'] < R['sc_wick_pct']
+    # Cond 2: 2x Volume
+    cond2 = row['Volume'] >= row['Vol_1D_Ago'] * R['sc_vol_multiple']
+    return cond1 and cond2
+
+# === NAYA FUNCTION: SELLING CLIMAX CHECK ===
+def check_selling_climax(df, idx, bc_idx):
+    if idx <= bc_idx + R['sc_gap_days']: return False, {} # BC ke 5 din baad hi check karo
+
+    row = df.iloc[idx]
+    bc_high = df['High'].iloc[bc_idx]
+
+    # Cond 1: Pullback zone 8-20% from BC High
+    pullback = (bc_high - row['Close']) / bc_high * 100
+    cond1 = R['sc_pullback_min'] <= pullback <= R['sc_pullback_max']
+
+    # Cond 2: 2%+ body + 2x Volume + Upar wick kam
+    cond2 = row['Body'] >= R['sc_body_pct'] and row['Volume'] >= row['Vol_1D_Ago'] * R['sc_vol_multiple']
+    cond3 = row['Upper_Wick'] < R['sc_wick_pct']
+
+    if not (cond1 and cond2 and cond3): return False, {}
+
+    # Cond 3: 50 DMA ke upar
+    sma50 = df['Close'].rolling(50).mean().iloc[idx]
+    if pd.isna(sma50) or row['Close'] < sma50: return False, {}
+
+    # Weight: Green SC = 100, Red SC = 70
+    is_green = row['Close'] > row['Open']
+    weight = 100 if is_green else 70
+
+    return True, {
+        'Date': df.index[idx].strftime('%Y-%m-%d'),
+        'Stock': '',
+        'SC_Type': 'GREEN' if is_green else 'RED',
+        'Weight': weight,
+        'BC_Date': df.index[bc_idx].strftime('%Y-%m-%d'),
+        'BC_High': round(bc_high, 2),
+        'SC_Low': round(row['Low'], 2),
+        'Pullback_%': round(pullback, 1),
+        'Volume_x': round(row['Volume'] / row['Vol_1D_Ago'], 1),
+        'Entry_Above': round(row['High'], 2),
+        'SL': round(row['Low'] * 0.99, 2) # Low ke 1% neeche
+    }
+
 def check_silent(df, idx):
     silent_row = df.iloc[idx]
     vol_max_10d_silent = silent_row['Vol_10D_Max']
@@ -126,7 +184,6 @@ def check_silent(df, idx):
     green_red_ratio = green_vol / red_vol if red_vol > 0 else 99
     if green_red_ratio < R['min_green_red_ratio']: return False, {}
 
-    # SILENT CANDIDATE KE LIYE SIRF 4 FIELD
     entry_price = high_max_10d_silent
     sl_price = entry_price * (1 - R['sl_pct'] / 100)
 
@@ -179,6 +236,7 @@ stocks = [s.strip().upper() for s in stocks if s.strip()]
 uptrend_list = []
 silent_list = []
 final_signals = []
+climax_list = [] # NAYA LIST
 
 print(f"Scanning {len(stocks)} stocks for {lookback_days} days...", flush=True)
 
@@ -206,6 +264,26 @@ for i, stock in enumerate(stocks):
             is_up, uptrend_data = check_uptrend(df, idx)
             if not is_up: continue
 
+            # === CLIMAX LOGIC ===
+            # 1. Pichle 60 din me Buying Climax dhoondo
+            bc_found = False
+            bc_idx = -1
+            for j in range(idx - R['sc_lookback'], idx - R['sc_gap_days']):
+                if j < 0: continue
+                if check_buying_climax(df, j):
+                    bc_found = True
+                    bc_idx = j
+                    break # Latest BC le lo
+
+            # 2. Agar BC mila aur aaj SC bana
+            if bc_found:
+                is_sc, sc_data = check_selling_climax(df, idx, bc_idx)
+                if is_sc:
+                    sc_data['Stock'] = stock
+                    climax_list.append(sc_data)
+                    continue # SC mil gaya to baaki CTD check mat karo
+
+            # === PURANA CTD LOGIC ===
             is_silent, silent_data = check_silent(df, idx)
             signal = check_final_signal(df, idx) if is_silent else None
 
@@ -219,10 +297,10 @@ for i, stock in enumerate(stocks):
                 uptrend_list.append({'Stock': stock, **uptrend_data})
 
         time.sleep(0.2)
-    except:
+    except Exception as e:
         continue
 
-# ===== UPDATE 3 SHEETS =====
+# ===== UPDATE 4 SHEETS =====
 def update_sheet_final(sheet_name, data_list, date_col='Date'):
     try:
         ws = sh.worksheet(sheet_name)
@@ -244,8 +322,10 @@ def update_sheet_final(sheet_name, data_list, date_col='Date'):
 count1 = update_sheet_final('UPTREND_STOCKS', uptrend_list, 'Date')
 count2 = update_sheet_final('SILENT_CANDIDATES', silent_list, 'Date')
 count3 = update_sheet_final('ACTIVE_SIGNALS', final_signals, 'Signal_Date')
+count4 = update_sheet_final('CLIMAX_CANDIDATES', climax_list, 'Date') # NAYA SHEET
 
-print(f"\n=== DONE ===", flush=True)
-print(f"UPTREND_STOCKS: {count1} - Last {lookback_days} trading days", flush=True)
-print(f"SILENT_CANDIDATES: {count2} - Last {lookback_days} trading days", flush=True)
-print(f"ACTIVE_SIGNALS: {count3} - Last {lookback_days} trading days", flush=True)
+print(f"\n=== DONE V15.21 ===", flush=True)
+print(f"UPTREND_STOCKS: {count1}", flush=True)
+print(f"SILENT_CANDIDATES: {count2}", flush=True)
+print(f"ACTIVE_SIGNALS: {count3}", flush=True)
+print(f"CLIMAX_CANDIDATES: {count4} - SC after BC", flush=True)
