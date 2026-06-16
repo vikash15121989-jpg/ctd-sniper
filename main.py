@@ -7,10 +7,9 @@ import os
 from datetime import datetime, timedelta
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
-print("=== CTD SNIPER V16.4 PROOF - BACKTEST TO GSHEET ===", flush=True)
+print("=== CTD SNIPER BACKTEST - SIRF HISTORICAL SETUP ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -24,44 +23,13 @@ BACKTEST_END = datetime(2026, 5, 30)
 
 print(f"Backtest Period: {BACKTEST_START.date()} to {BACKTEST_END.date()}", flush=True)
 
-# ===== 2. NIFTY DATA FOR REGIME =====
-nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
-if isinstance(nifty.columns, pd.MultiIndex):
-    nifty.columns = nifty.columns.droplevel(1)
-if nifty.empty or len(nifty) < 250:
-    raise ValueError("Nifty data nahi mila")
-
-nifty['200DMA'] = nifty['Close'].rolling(200).mean()
-nifty['50DMA'] = nifty['Close'].rolling(50).mean()
-nifty = nifty.dropna()
-
-def detect_regime(date):
-    df = nifty[nifty.index <= date].tail(250)
-    if len(df) < 200: return "BEAR"
-    close = float(df['Close'].iloc[-1])
-    dma200 = float(df['200DMA'].iloc[-1])
-    dma50 = float(df['50DMA'].iloc[-1])
-    if close > dma200 and dma50 > dma200: return "BULL"
-    return "BEAR"
-
-# ===== 3. PROOF RULES =====
-def get_rules(regime):
-    if regime == "BULL":
-        return {
-            'min_price': 100, 'min_daily_value_cr': 2.0, 'min_vol_shares': 300000,
-            'swing_lookback': 90, 'swing_pullback_min': 12.0, 'swing_pullback_max': 28.0,
-            'swing_vol_dry_pct': 0.20, 'swing_sl_buffer': 0.10, 'swing_target_r': 2.5,
-            'swing_min_rr_pct': 12.0, 'swing_max_risk_pct': 15.0, 'swing_min_drop_pct': 20.0,
-            'choch_zone_pct': 5.0, 'rs_vs_nifty': 5.0, 'vol_spike_choch': 1.5,
-        }
-    else: # BEAR - PROOF MODE
-        return {
-            'min_price': 100, 'min_daily_value_cr': 1.0, 'min_vol_shares': 200000,
-            'swing_lookback': 60, 'swing_pullback_min': 10.0, 'swing_pullback_max': 25.0,
-            'swing_vol_dry_pct': 0.25, 'swing_sl_buffer': 0.12, 'swing_target_r': 2.0,
-            'swing_min_rr_pct': 10.0, 'swing_max_risk_pct': 18.0, 'swing_min_drop_pct': 15.0,
-            'choch_zone_pct': 7.0, 'rs_vs_nifty': 10.0, 'vol_spike_choch': 2.0,
-        }
+# ===== 2. BASIC RULES - Koi proof nahi =====
+R = {
+    'min_price': 20, 'min_daily_value_cr': 0.2, 'min_vol_shares': 50000,
+    'swing_lookback': 60, 'swing_pullback_min': 5.0, 'swing_pullback_max': 40.0,
+    'swing_vol_dry_pct': 0.50, 'swing_sl_buffer': 0.10, 'swing_target_r': 2.0,
+    'swing_min_rr_pct': 5.0, 'swing_max_risk_pct': 20.0, 'swing_min_drop_pct': 10.0,
+}
 
 def add_indicators(df):
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
@@ -69,13 +37,9 @@ def add_indicators(df):
     df['Daily_Value_20MA'] = df['Daily_Value'].rolling(20).mean()
     df['50DMA'] = df['Close'].rolling(50).mean()
     df['200DMA'] = df['Close'].rolling(200).mean()
-    df['Range'] = df['High'] - df['Low']
-    df_weekly = df.resample('W-FRI').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
-    df_weekly['50WMA'] = df_weekly['Close'].rolling(50).mean()
-    df['50WMA'] = df_weekly['50WMA'].reindex(df.index, method='ffill')
     return df
 
-def check_liquidity(df, idx, R):
+def check_liquidity(df, idx):
     try:
         close = df['Close'].iloc[idx]
         vol_20ma = df['Vol_20MA'].iloc[idx]
@@ -87,86 +51,72 @@ def check_liquidity(df, idx, R):
     except:
         return False
 
-def detect_proof_choch(df, idx, R):
-    if idx < 120: return False, {}
+# ===== BASIC CHOCH - Koi volume spike nahi =====
+def detect_basic_choch(df, idx):
+    if idx < 60: return False, {}
     lookback = R['swing_lookback']
     recent = df.iloc[idx-lookback:idx]
-    if len(recent) < 50: return False, {}
+    if len(recent) < 30: return False, {}
 
-    high_90d = recent['High'].max()
-    low_90d = recent['Low'].min()
-    drop_pct = (high_90d - low_90d) / high_90d * 100
+    high_lookback = recent['High'].max()
+    low_lookback = recent['Low'].min()
+    drop_pct = (high_lookback - low_lookback) / high_lookback * 100
     if drop_pct < R['swing_min_drop_pct']: return False, {}
 
+    # Last LH - 5 day swing
     swing_highs = []
-    for i in range(7, len(recent)-7):
-        if recent['High'].iloc[i] == recent['High'].iloc[i-7:i+8].max():
+    for i in range(5, len(recent)-5):
+        if recent['High'].iloc[i] == recent['High'].iloc[i-5:i+6].max():
             swing_highs.append(i)
     if len(swing_highs) < 1: return False, {}
 
     last_lh_idx = swing_highs[-1]
     last_lh_price = recent['High'].iloc[last_lh_idx]
 
+    # CHOCH: Close above LH
     choch_idx = None
-    for i in range(last_lh_idx + 3, len(recent)):
-        if recent['Close'].iloc[i] > last_lh_price * 1.015:
-            vol_avg_20 = recent['Vol_20MA'].iloc[i]
-            if pd.isna(vol_avg_20): continue
-            if recent['Volume'].iloc[i] > vol_avg_20 * R['vol_spike_choch']:
-                choch_idx = i
-                break
+    for i in range(last_lh_idx + 1, len(recent)):
+        if recent['Close'].iloc[i] > last_lh_price:
+            choch_idx = i
+            break
     if choch_idx is None: return False, {}
-
-    after_choch_high = recent.iloc[choch_idx:]['High'].max()
-    if after_choch_high < last_lh_price * 1.08: return False, {}
 
     return True, {
         'choch_date': recent.index[choch_idx].strftime('%Y-%m-%d'),
         'bos_level': round(last_lh_price, 2),
         'choch_idx': idx - lookback + choch_idx,
-        'choch_high': round(after_choch_high, 2),
-        'choch_vol': recent['Volume'].iloc[choch_idx:choch_idx+5].mean(),
-        'choch_day_vol_spike': round(recent['Volume'].iloc[choch_idx] / recent['Vol_20MA'].iloc[choch_idx], 1)
+        'choch_high': round(recent.iloc[choch_idx:]['High'].max(), 2),
+        'choch_vol': recent['Volume'].iloc[choch_idx:choch_idx+3].mean()
     }
 
-def check_proof_pullback(df, idx, choch_data, R):
+# ===== BASIC PULLBACK - Koi RS/50DMA nahi =====
+def check_basic_pullback(df, idx, choch_data):
     bos_level = choch_data['bos_level']
     choch_high = choch_data['choch_high']
     choch_vol = choch_data['choch_vol']
 
-    if idx <= choch_data['choch_idx'] + 5: return False, {}
+    if idx <= choch_data['choch_idx'] + 2: return False, {}
     row = df.iloc[idx]
 
     pullback_pct = (choch_high - row['Low']) / choch_high * 100
     if not (R['swing_pullback_min'] <= pullback_pct <= R['swing_pullback_max']):
         return False, {}
 
-    low_since_choch = df['Low'].iloc[choch_data['choch_idx']:idx+1].min()
-    idx_low = df['Low'].iloc[choch_data['choch_idx']:idx+1].idxmin()
-    dma50_at_low = df.loc[idx_low, '50DMA']
-    if pd.isna(dma50_at_low) or low_since_choch > dma50_at_low * 0.98: return False, {}
-    if row['Close'] < row['50DMA']: return False, {}
+    # Bas BOS ke paas ho
+    zone_low = bos_level * 0.90
+    zone_high = bos_level * 1.10
+    if not (zone_low <= row['Low'] <= zone_high):
+        return False, {}
 
-    if row['Volume'] > choch_vol * R['swing_vol_dry_pct']: return False, {}
+    # Volume dry basic
+    if row['Volume'] > choch_vol * R['swing_vol_dry_pct']:
+        return False, {}
 
-    try:
-        nifty_close_choch = nifty.loc[df.index[choch_data['choch_idx']], 'Close']
-        nifty_close_now = nifty.loc[df.index[idx], 'Close']
-        nifty_ret = (nifty_close_now / nifty_close_choch - 1) * 100
-        stock_ret = (row['Close'] / df['Close'].iloc[choch_data['choch_idx']] - 1) * 100
-        rs_score = stock_ret - nifty_ret
-        if rs_score < R['rs_vs_nifty']: return False, {}
-    except: return False, {}
-
-    if row['Close'] < row['Open']: return False, {}
-    if idx > 0 and row['Low'] <= df['Low'].iloc[idx-1]: return False, {}
-
-    swing_low = df['Low'].iloc[idx-15:idx+1].min()
+    # SL & Target
+    swing_low = df['Low'].iloc[idx-10:idx+1].min()
     sl_price = swing_low * (1 - R['swing_sl_buffer'])
-    sl_200dma = df['200DMA'].iloc[idx] * 0.98
-    final_sl = min(sl_price, sl_200dma)
 
-    risk = row['Close'] - final_sl
+    risk = row['Close'] - sl_price
     risk_pct = risk / row['Close'] * 100
     if risk_pct > R['swing_max_risk_pct'] or risk_pct <= 0: return False, {}
 
@@ -176,17 +126,16 @@ def check_proof_pullback(df, idx, choch_data, R):
 
     return True, {
         'Entry_Date': df.index[idx].strftime('%Y-%m-%d'),
-        'Entry': round(row['Close'], 2), 'SL': round(final_sl, 2),
+        'Entry': round(row['Close'], 2), 'SL': round(sl_price, 2),
         'Target': round(target, 2), 'Risk_%': round(risk_pct, 1),
         'Reward_%': round(target_pct, 1), 'RR': round(target_pct / risk_pct, 1),
         'Pullback_%': round(pullback_pct, 1),
         'Vol_Dry_%': round(row['Volume'] / choch_vol * 100, 1),
-        'CHOCH_Vol_Spike': choch_data['choch_day_vol_spike'],
-        'RS_vs_Nifty_%': round(rs_score, 1),
         'BOS_Level': bos_level,
         'CHOCH_Date': choch_data['choch_date']
     }
 
+# ===== SIMULATE TRADE =====
 def simulate_trade(df, entry_idx, sl, target):
     for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
         if df['Low'].iloc[i] <= sl:
@@ -197,42 +146,38 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
+# ===== SCAN ONE STOCK =====
 def scan_stock_backtest(stock):
     try:
-        df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=400),
+        df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=200),
                         end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True, timeout=10)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if len(df) < 300 or df['Close'].isna().all():
+        if len(df) < 100 or df['Close'].isna().all():
             return []
 
         df = df[(df.index >= BACKTEST_START) & (df.index <= BACKTEST_END)]
-        if len(df) < 100: return []
+        if len(df) < 50: return []
         df = add_indicators(df)
         results = []
 
-        for i in range(120, len(df)):
-            date = df.index[i]
-            regime = detect_regime(date)
-            R = get_rules(regime)
+        for i in range(60, len(df)):
+            if not check_liquidity(df, i): continue
 
-            if not check_liquidity(df, i, R): continue
-
-            is_choch, choch_data = detect_proof_choch(df, i, R)
+            is_choch, choch_data = detect_basic_choch(df, i)
             if not is_choch: continue
 
-            is_pb, pb_data = check_proof_pullback(df, i, choch_data, R)
+            is_pb, pb_data = check_basic_pullback(df, i, choch_data)
             if not is_pb: continue
 
             result, exit_date, pnl = simulate_trade(df, i, pb_data['SL'], pb_data['Target'])
             pb_data.update({
-                'Stock': stock, 'Regime': regime, 'Result': result,
+                'Stock': stock, 'Result': result,
                 'Exit_Date': exit_date, 'PnL_%': pnl
             })
             results.append(pb_data)
         return results
     except Exception as e:
-        print(f"Error {stock}: {e}")
         return []
 
 # ===== MAIN BACKTEST =====
@@ -241,14 +186,12 @@ stocks = [s.strip().upper() for s in stocks if s.strip()]
 print(f"Scanning {len(stocks)} stocks from CTD_Sniper Watchlist...", flush=True)
 
 all_results = []
-with ProcessPoolExecutor(max_workers=8) as executor:
-    futures = [executor.submit(scan_stock_backtest, stock) for stock in stocks]
-    for i, future in enumerate(as_completed(futures)):
-        all_results.extend(future.result())
-        if i % 50 == 0: print(f"Done {i}/{len(stocks)}", flush=True)
+for i, stock in enumerate(stocks):
+    all_results.extend(scan_stock_backtest(stock))
+    if i % 50 == 0: print(f"Done {i}/{len(stocks)}", flush=True)
 
 if not all_results:
-    print("0 SETUP MILA - Filter tight ya market khatam")
+    print("0 SETUP MILA - Is period me kuch nahi bana")
     exit()
 
 df_res = pd.DataFrame(all_results)
@@ -260,13 +203,10 @@ wins = len(df_res[df_res['Result'] == 'WIN'])
 loss = len(df_res[df_res['Result'] == 'LOSS'])
 winrate = round(wins / total * 100, 1) if total else 0
 total_pnl = df_res['PnL_%'].sum()
-avg_win = df_res[df_res['PnL_%'] > 0]['PnL_%'].mean()
-avg_loss = df_res[df_res['PnL_%'] < 0]['PnL_%'].mean()
 
 summary = pd.DataFrame([{
     'Total_Setups': total, 'Wins': wins, 'Loss': loss, 'Winrate_%': winrate,
-    'Total_PnL_%': round(total_pnl, 1), 'Avg_Win_%': round(avg_win, 1),
-    'Avg_Loss_%': round(avg_loss, 1),
+    'Total_PnL_%': round(total_pnl, 1),
     'Period': f"{BACKTEST_START.date()} to {BACKTEST_END.date()}"
 }])
 
@@ -287,11 +227,11 @@ def update_gsheet(sheet_name, df):
         ws.update('A1', [['No data']])
         return 0
 
-count_trades = update_gsheet('PROOF_BACKTEST_TRADES', df_res)
-count_summary = update_gsheet('PROOF_BACKTEST_SUMMARY', summary)
+count_trades = update_gsheet('BACKTEST_ALL_TRADES', df_res)
+count_summary = update_gsheet('BACKTEST_SUMMARY', summary)
 
 print(f"\n=== BACKTEST COMPLETE ===", flush=True)
 print(f"Total Setups: {total} | Winrate: {winrate}% | Net P&L: {total_pnl}%", flush=True)
-print(f"CTD_Sniper sheet me 2 nayi sheet bani:", flush=True)
-print(f"1. PROOF_BACKTEST_TRADES: {count_trades} trades", flush=True)
-print(f"2. PROOF_BACKTEST_SUMMARY: Summary stats", flush=True)
+print(f"CTD_Sniper me 2 sheet bani:", flush=True)
+print(f"1. BACKTEST_ALL_TRADES: {count_trades} trades", flush=True)
+print(f"2. BACKTEST_SUMMARY: Summary", flush=True)
