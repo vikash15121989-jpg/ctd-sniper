@@ -5,11 +5,10 @@ import gspread
 import json
 import os
 from datetime import datetime, timedelta
-import time
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== CTD SNIPER BACKTEST - SIRF HISTORICAL SETUP ===", flush=True)
+print("=== CTD SNIPER BACKTEST V16.6 SANE MODE ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -17,18 +16,30 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# BACKTEST DATES - Yaha change kar
+# BACKTEST DATES
 BACKTEST_START = datetime(2024, 10, 1)
-BACKTEST_END = datetime(2026, 5, 30)
+BACKTEST_END = datetime(2026, 5, 30) # May 2026 tak
 
 print(f"Backtest Period: {BACKTEST_START.date()} to {BACKTEST_END.date()}", flush=True)
 
-# ===== 2. BASIC RULES - Koi proof nahi =====
+# ===== 2. NIFTY DATA =====
+nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
+if isinstance(nifty.columns, pd.MultiIndex):
+    nifty.columns = nifty.columns.droplevel(1)
+if nifty.empty or len(nifty) < 250:
+    raise ValueError("Nifty data nahi mila")
+nifty = nifty.dropna()
+
+# ===== 3. SANE RULES - BEAR KE LIYE REALISTIC =====
 R = {
-    'min_price': 20, 'min_daily_value_cr': 0.2, 'min_vol_shares': 50000,
-    'swing_lookback': 60, 'swing_pullback_min': 5.0, 'swing_pullback_max': 40.0,
-    'swing_vol_dry_pct': 0.50, 'swing_sl_buffer': 0.10, 'swing_target_r': 2.0,
-    'swing_min_rr_pct': 5.0, 'swing_max_risk_pct': 20.0, 'swing_min_drop_pct': 10.0,
+    'min_price': 50, 'min_daily_value_cr': 0.5, 'min_vol_shares': 100000,
+    'swing_lookback': 60, 'swing_pullback_min': 8.0, 'swing_pullback_max': 30.0,
+    'swing_vol_dry_pct': 0.40, 'swing_sl_buffer': 0.12, 'swing_target_r': 1.5,
+    'swing_min_rr_pct': 6.0, 'swing_max_risk_pct': 20.0, 'swing_min_drop_pct': 12.0,
+    # 3 SANE FILTER
+    'must_close_above_50dma': True,
+    'must_have_rs_vs_nifty': 0.0,
+    'vol_spike_choch': 1.2,
 }
 
 def add_indicators(df):
@@ -51,7 +62,6 @@ def check_liquidity(df, idx):
     except:
         return False
 
-# ===== BASIC CHOCH - Koi volume spike nahi =====
 def detect_basic_choch(df, idx):
     if idx < 60: return False, {}
     lookback = R['swing_lookback']
@@ -63,7 +73,6 @@ def detect_basic_choch(df, idx):
     drop_pct = (high_lookback - low_lookback) / high_lookback * 100
     if drop_pct < R['swing_min_drop_pct']: return False, {}
 
-    # Last LH - 5 day swing
     swing_highs = []
     for i in range(5, len(recent)-5):
         if recent['High'].iloc[i] == recent['High'].iloc[i-5:i+6].max():
@@ -73,7 +82,6 @@ def detect_basic_choch(df, idx):
     last_lh_idx = swing_highs[-1]
     last_lh_price = recent['High'].iloc[last_lh_idx]
 
-    # CHOCH: Close above LH
     choch_idx = None
     for i in range(last_lh_idx + 1, len(recent)):
         if recent['Close'].iloc[i] > last_lh_price:
@@ -89,7 +97,6 @@ def detect_basic_choch(df, idx):
         'choch_vol': recent['Volume'].iloc[choch_idx:choch_idx+3].mean()
     }
 
-# ===== BASIC PULLBACK - Koi RS/50DMA nahi =====
 def check_basic_pullback(df, idx, choch_data):
     bos_level = choch_data['bos_level']
     choch_high = choch_data['choch_high']
@@ -102,14 +109,31 @@ def check_basic_pullback(df, idx, choch_data):
     if not (R['swing_pullback_min'] <= pullback_pct <= R['swing_pullback_max']):
         return False, {}
 
-    # Bas BOS ke paas ho
     zone_low = bos_level * 0.90
     zone_high = bos_level * 1.10
     if not (zone_low <= row['Low'] <= zone_high):
         return False, {}
 
-    # Volume dry basic
     if row['Volume'] > choch_vol * R['swing_vol_dry_pct']:
+        return False, {}
+
+    # ===== 3 SANE FILTER =====
+    # 1. 50DMA reclaim
+    if R['must_close_above_50dma'] and row['Close'] < row['50DMA']:
+        return False, {}
+
+    # 2. RS vs Nifty
+    try:
+        nifty_close_choch = nifty.loc[df.index[choch_data['choch_idx']], 'Close']
+        nifty_close_now = nifty.loc[df.index[idx], 'Close']
+        nifty_ret = (nifty_close_now / nifty_close_choch - 1) * 100
+        stock_ret = (row['Close'] / df['Close'].iloc[choch_data['choch_idx']] - 1) * 100
+        rs_score = stock_ret - nifty_ret
+        if rs_score < R['must_have_rs_vs_nifty']: return False, {}
+    except: return False, {}
+
+    # 3. CHOCH pe volume spike
+    if df['Volume'].iloc[choch_data['choch_idx']] < df['Vol_20MA'].iloc[choch_data['choch_idx']] * R['vol_spike_choch']:
         return False, {}
 
     # SL & Target
@@ -131,11 +155,11 @@ def check_basic_pullback(df, idx, choch_data):
         'Reward_%': round(target_pct, 1), 'RR': round(target_pct / risk_pct, 1),
         'Pullback_%': round(pullback_pct, 1),
         'Vol_Dry_%': round(row['Volume'] / choch_vol * 100, 1),
+        'RS_vs_Nifty_%': round(rs_score, 1),
         'BOS_Level': bos_level,
         'CHOCH_Date': choch_data['choch_date']
     }
 
-# ===== SIMULATE TRADE =====
 def simulate_trade(df, entry_idx, sl, target):
     for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
         if df['Low'].iloc[i] <= sl:
@@ -146,7 +170,6 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
-# ===== SCAN ONE STOCK =====
 def scan_stock_backtest(stock):
     try:
         df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=200),
@@ -203,10 +226,13 @@ wins = len(df_res[df_res['Result'] == 'WIN'])
 loss = len(df_res[df_res['Result'] == 'LOSS'])
 winrate = round(wins / total * 100, 1) if total else 0
 total_pnl = df_res['PnL_%'].sum()
+avg_win = df_res[df_res['PnL_%'] > 0]['PnL_%'].mean()
+avg_loss = df_res[df_res['PnL_%'] < 0]['PnL_%'].mean()
 
 summary = pd.DataFrame([{
     'Total_Setups': total, 'Wins': wins, 'Loss': loss, 'Winrate_%': winrate,
-    'Total_PnL_%': round(total_pnl, 1),
+    'Total_PnL_%': round(total_pnl, 1), 'Avg_Win_%': round(avg_win, 1),
+    'Avg_Loss_%': round(avg_loss, 1),
     'Period': f"{BACKTEST_START.date()} to {BACKTEST_END.date()}"
 }])
 
@@ -216,7 +242,7 @@ def update_gsheet(sheet_name, df):
         ws = sh.worksheet(sheet_name)
         ws.clear()
     except:
-        ws = sh.add_worksheet(title=sheet_name, rows=5000, cols=25)
+        ws = sh.add_worksheet(title=sheet_name, rows=10000, cols=25)
         ws.clear()
 
     if not df.empty:
