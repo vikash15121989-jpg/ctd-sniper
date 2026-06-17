@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.5 - HYBRID BALANCED ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.5 - HYBRID BALANCED FIXED ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -32,21 +32,20 @@ R = {
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
     'target_r': 1.0,
-    'max_risk_pct': 35.0, # 35% cap
+    'max_risk_pct': 35.0,
     'vol_blast_ratio': 1.2,
-    'rs_days': 45, # 45d RS
+    'rs_days': 45,
 }
 
 debug_fund = []
 debug_tech = []
 
-# Nifty data - SIMPLEST FIX
+# Nifty data - Working Fix
 nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 
 nifty['52W_High'] = nifty['High'].rolling(252).max()
-# FIX: Loop se date nikal - 100% working
 nifty['52W_High_Date'] = pd.NaT
 for i in range(252, len(nifty)):
     window = nifty['High'].iloc[i-252:i]
@@ -152,7 +151,8 @@ def scan_stock_v8_5(stock):
             is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_5(df, i)
             if is_bo:
                 entry_price = df['Close'].iloc[i]
-                sl_price = df['Low'].iloc[i-20:i+1].min() * 0.97
+                # BUG FIX 1: SL buffer R se le
+                sl_price = df['Low'].iloc[i-20:i+1].min() * (1 - R['sl_buffer_pct']/100)
                 risk = entry_price - sl_price
                 risk_pct = risk / entry_price * 100
 
@@ -213,7 +213,12 @@ else:
     total_pnl = df_res['PnL_%'].sum()
     avg_win = df_res[df_res['Result'] == 'WIN']['PnL_%'].mean() if wins > 0 else 0
     avg_loss = df_res[df_res['Result'] == 'LOSS']['PnL_%'].mean() if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0
-    max_drawdown = df_res['PnL_%'].cumsum().min()
+
+    # BUG FIX 2: Sahi Drawdown calculation
+    equity_curve = df_res['PnL_%'].cumsum()
+    running_max = equity_curve.cummax()
+    drawdown = equity_curve - running_max
+    max_drawdown = round(drawdown.min(), 1)
 
 summary = pd.DataFrame([{
     'Total_Stocks': len(stocks),
@@ -254,5 +259,5 @@ update_gsheet('QFACTOR_V8_5_SUMMARY', summary)
 print(f"\n=== V8.5 COMPLETE ===", flush=True)
 print(f"Fund Pass: {len([d for d in debug_fund if d['Pass']])} | Setups: {len(all_results)}", flush=True)
 if all_results:
-    print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}%", flush=True)
+    print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}% | Max DD: {max_drawdown}%", flush=True)
 print(f"Check QFACTOR_V8_5_SUMMARY sheet", flush=True)
