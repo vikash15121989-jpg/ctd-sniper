@@ -32,22 +32,23 @@ R = {
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
     'target_r': 1.0,
-    'max_risk_pct': 35.0, # 35% cap - V8.2 aur V8.3 ke beech
+    'max_risk_pct': 35.0, # 35% cap - Sweet spot
     'vol_blast_ratio': 1.2,
-    'rs_days': 45, # V8.2 wala 45d
+    'rs_days': 45, # 45d RS
 }
 
 debug_fund = []
 debug_tech = []
 
-# Nifty data - FIXED VERSION
+# Nifty data - FINAL FIX
 nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 
 nifty['52W_High'] = nifty['High'].rolling(252).max()
-# FIX: idxmax se date nikal, apply se nahi
-nifty['52W_High_Date'] = nifty['High'].rolling(252).apply(lambda x: x.idxmax() if len(x) == 252 else pd.NaT)
+# FIX: Timestamp error solve - pehle index position nikal, phir date map kar
+nifty['52W_High_Idx'] = nifty['High'].rolling(252).apply(lambda x: x.argmax(), raw=False)
+nifty['52W_High_Date'] = pd.Series(nifty.index, index=nifty.index).shift(252 - 1 - nifty['52W_High_Idx'].fillna(251)).where(nifty['52W_High_Idx'].notna())
 
 def get_fundamentals_v8_5(stock):
     fund_data = {'stock': stock}
