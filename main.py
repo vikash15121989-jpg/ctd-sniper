@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.6 - RS WINDOW VALIDATION ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.6 FIXED - RS WINDOW ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -155,7 +155,7 @@ for i, stock in enumerate(stocks):
     all_results.extend(trades)
     if i % 50 == 0: print(f"Done {i+1}/{len(stocks)} | Setups: {len(all_results)}", flush=True)
 
-# ===== SUMMARY CALCULATE PEHLE, GSHEET BAAD ME =====
+# ===== SUMMARY CALCULATE =====
 df_fund = pd.DataFrame(debug_fund)
 if all_results:
     df_res = pd.DataFrame(all_results).sort_values('Entry_Date')
@@ -174,13 +174,12 @@ else:
     first_bo_count = rebo_count = 0
     df_res = pd.DataFrame()
 
-# ===== PRINT SUMMARY ABHI - GSHEET FAIL BHI HO TO DIKH JAYE =====
 print(f"\n=== V8.6 RS WINDOW COMPLETE ===", flush=True)
 print(f"Total Setups: {total} | First BO: {first_bo_count} | Re-BO: {rebo_count}", flush=True)
 print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}% | Max DD: {max_drawdown}%", flush=True)
 print(f"Avg Win: {avg_win:.1f}% | Avg Loss: {avg_loss:.1f}%", flush=True)
 
-# ===== AB GSHEET UPDATE KAR - FAIL HO TO BHI UPAR PRINT HO CHUKA HAI =====
+# ===== GSHEET UPDATE - NaN/INF FIX =====
 try:
     summary = pd.DataFrame([{
         'Total_Stocks': len(stocks), 'Total_Setups': total, 'First_BO': first_bo_count, 'Re_BO': rebo_count,
@@ -188,10 +187,14 @@ try:
         'Total_PnL_%': round(total_pnl, 1), 'Max_Drawdown_%': max_drawdown, 'Strategy': 'V8.6 RS WINDOW'
     }])
 
-    # Sheets create if not exist
+    # *** FIX: Replace inf and NaN with 0 before sending to GSheet ***
+    df_res = df_res.replace([np.inf, -np.inf], np.nan).fillna(0)
+    df_fund = df_fund.replace([np.inf, -np.inf], np.nan).fillna(0)
+    summary = summary.replace([np.inf, -np.inf], np.nan).fillna(0)
+
     def get_or_create_ws(sh, title):
         try: return sh.worksheet(title)
-        except: return sh.add_worksheet(title=title, rows=1000, cols=20)
+        except: return sh.add_worksheet(title=title, rows=5000, cols=30)
 
     ws_trades = get_or_create_ws(sh, "QFACTOR_V8_6_TRADES")
     ws_trades.clear()
