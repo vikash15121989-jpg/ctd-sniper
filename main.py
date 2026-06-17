@@ -8,34 +8,34 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V9 - TIGHT FILTERS FINAL ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.3 - BALANCED WINNER ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
-ws_watchlist = sh.worksheet("Watchlist") # <-- APNE TAB KA NAAM. "Sheet1" ya "NIFTY500" ho to badal de
+ws_watchlist = sh.worksheet("Watchlist") # <-- APNE TAB KA NAAM
 
 BACKTEST_START = datetime(2023, 4, 1)
 BACKTEST_END = datetime(2026, 5, 30)
 
-# ===== 2. FUNDAMENTAL - TIGHT =====
+# ===== 2. FUNDAMENTAL - V8.2 Jaisa Loose =====
 F = {
     'min_market_cap_cr': 500,
-    'max_debt_equity': 2.0,
-    'max_pe': 200,
+    'max_debt_equity': 10.0, # Loose rakho - growth stocks me debt hota hai
+    'max_pe': 1000, # Loose rakho - PE mat dekho BO me
 }
 
-# ===== 3. TECHNICAL - V9 TIGHT =====
+# ===== 3. TECHNICAL - V8.3 BALANCED =====
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
-    'target_r': 1.5,
-    'max_risk_pct': 30.0,
-    'min_rr_pct': 3.0,
-    'vol_blast_ratio': 2.0,
-    'rs_days': 15,
+    'target_r': 1.0, # V8.2 jaisa - 1R hit hota hai
+    'max_risk_pct': 30.0, # NEW: PAGEL jaise 48% risk wale kaato
+    'min_rr_pct': 0, # Hata diya - chote SL wale trade bhi lo
+    'vol_blast_ratio': 1.2, # V8.2 jaisa - 1.2x enough
+    'rs_days': 30, # 45 se tight kiya, 15 se loose
 }
 
 debug_fund = []
@@ -57,7 +57,7 @@ for i in range(len(nifty)):
         nifty_52w_dates.append(max_date)
 nifty['52W_High_Date'] = nifty_52w_dates
 
-def get_fundamentals_v9(stock):
+def get_fundamentals_v8_3(stock):
     fund_data = {'stock': stock}
     try:
         t = yf.Ticker(f"{stock}.NS")
@@ -69,14 +69,14 @@ def get_fundamentals_v9(stock):
         if fund_data['market_cap_cr'] < F['min_market_cap_cr']:
             return False, fund_data, f"Mcap {fund_data['market_cap_cr']}Cr < 500"
         if fund_data['debt_equity'] > F['max_debt_equity']:
-            return False, fund_data, f"DE {fund_data['debt_equity']} > 2"
+            return False, fund_data, f"DE {fund_data['debt_equity']} > 10"
         if fund_data['pe'] > F['max_pe']:
-            return False, fund_data, f"PE {fund_data['pe']} > 200"
+            return False, fund_data, f"PE {fund_data['pe']} > 1000"
         return True, fund_data, "PASS"
     except:
         return False, fund_data, "Error"
 
-def check_52w_high_breakout_v9(df, idx):
+def check_52w_high_breakout_v8_3(df, idx):
     if idx < 252: return False, {}, "Data < 252"
 
     row = df.iloc[idx]
@@ -95,14 +95,14 @@ def check_52w_high_breakout_v9(df, idx):
     if row['Close'] <= high_252 * 1.01:
         return False, {}, "No 52W BO +1%"
 
-    # 4. Volume Blast 2x
+    # 4. Volume Blast 1.2x - V8.2 jaisa
     avg_vol_20 = df['Volume'].iloc[idx-20:idx].mean()
     if avg_vol_20 == 0: avg_vol_20 = 1
     vol_ratio = row['Volume'] / avg_vol_20
     if vol_ratio < R['vol_blast_ratio']:
-        return False, {}, f"Vol {vol_ratio:.1f}x < 2x"
+        return False, {}, f"Vol {vol_ratio:.1f}x < 1.2x"
 
-    # 5. RS Tight 15 days
+    # 5. RS 30 days - Balanced
     try:
         nifty_52h_date = nifty.loc[df.index[idx]]['52W_High_Date']
         if pd.isna(nifty_52h_date):
@@ -116,7 +116,7 @@ def check_52w_high_breakout_v9(df, idx):
         days_diff = 999
 
     if not rs_ok:
-        return False, {}, f"RS {days_diff} days > 15"
+        return False, {}, f"RS {days_diff} days > 30"
 
     return True, {
         'bo_date': df.index[idx].strftime('%Y-%m-%d'),
@@ -126,7 +126,7 @@ def check_52w_high_breakout_v9(df, idx):
         'rs_days_diff': days_diff,
         'rs_ok': rs_ok,
         'liquidity_cr': round(avg_value_cr, 2)
-    }, "V9 BO PASS"
+    }, "V8.3 BO PASS"
 
 def simulate_trade(df, entry_idx, sl, target):
     for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
@@ -138,10 +138,10 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
-def scan_stock_v9(stock):
+def scan_stock_v8_3(stock):
     global debug_fund, debug_tech
 
-    fund_pass, fund_data, fund_reason = get_fundamentals_v9(stock)
+    fund_pass, fund_data, fund_reason = get_fundamentals_v8_3(stock)
     debug_fund.append({'Stock': stock, 'Pass': fund_pass, 'Reason': fund_reason, **fund_data})
     if not fund_pass: return []
 
@@ -162,23 +162,19 @@ def scan_stock_v9(stock):
         results = []
 
         for i in range(252, len(df)):
-            is_bo, bo_data, bo_reason = check_52w_high_breakout_v9(df, i)
+            is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_3(df, i)
             if is_bo:
                 entry_price = df['Close'].iloc[i]
                 sl_price = df['Low'].iloc[i-20:i+1].min() * 0.97
                 risk = entry_price - sl_price
                 risk_pct = risk / entry_price * 100
 
-                # Risk 30% cap
+                # Sirf 30% max risk cap - PAGEL jaisa kaatne ke liye
                 if risk_pct > R['max_risk_pct'] or risk_pct <= 0:
                     debug_tech.append({'Stock': stock, 'Reason': f'Risk {risk_pct:.1f}% > 30%'})
                     continue
 
-                # Min RR check
-                if risk_pct < R['min_rr_pct']:
-                    debug_tech.append({'Stock': stock, 'Reason': f'Risk {risk_pct:.1f}% < 3%'})
-                    continue
-
+                # Min RR hata diya - 1% risk wale bhi lo
                 target = entry_price + risk * R['target_r']
                 result, exit_date, pnl = simulate_trade(df, i, sl_price, target)
 
@@ -192,11 +188,11 @@ def scan_stock_v9(stock):
                     **fund_data
                 }
                 results.append(entry_data)
-                debug_tech.append({'Stock': stock, 'Reason': f'V9 BO FOUND'})
+                debug_tech.append({'Stock': stock, 'Reason': f'V8.3 BO FOUND'})
                 break
 
         if not results:
-            debug_tech.append({'Stock': stock, 'Reason': 'No V9 BO'})
+            debug_tech.append({'Stock': stock, 'Reason': 'No V8.3 BO'})
 
         return results
     except Exception as e:
@@ -206,11 +202,11 @@ def scan_stock_v9(stock):
 # ===== MAIN =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
-print(f"Scanning {len(stocks)} stocks - V9 TIGHT MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks - V8.3 BALANCED MODE...", flush=True)
 
 all_results = []
 for i, stock in enumerate(stocks):
-    trades = scan_stock_v9(stock)
+    trades = scan_stock_v8_3(stock)
     all_results.extend(trades)
     if i % 50 == 0 or i == len(stocks) - 1:
         fund_count = len([d for d in debug_fund if d['Pass']])
@@ -220,7 +216,7 @@ df_fund = pd.DataFrame(debug_fund)
 df_tech = pd.DataFrame(debug_tech)
 
 if not all_results:
-    print("0 SETUP MILA - FILTER BAHUT TIGHT HAI")
+    print("0 SETUP MILA")
     wins = total = total_pnl = avg_win = avg_loss = max_drawdown = 0
     winrate = 0
     df_res = pd.DataFrame()
@@ -243,20 +239,18 @@ summary = pd.DataFrame([{
     'Avg_Loss_%': round(avg_loss, 1) if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
     'Max_Drawdown_%': round(max_drawdown, 1) if all_results else 0,
-    'Strategy': 'V9 TIGHT'
+    'Strategy': 'V8.3 BALANCED'
 }])
 
 # ===== GSHEET UPDATE - AUTO DELETE + CREATE =====
 def update_gsheet(sheet_name, df):
     try:
-        # Purani sheet hai to delete kar do
         ws = sh.worksheet(sheet_name)
         sh.del_worksheet(ws)
         print(f"Deleted old {sheet_name}", flush=True)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    # Nayi sheet banao - data ke hisaab se size
     rows = len(df) + 20 if not df.empty else 100
     cols = len(df.columns) + 5 if not df.empty else 26
     ws = sh.add_worksheet(title=sheet_name, rows=rows, cols=cols)
@@ -266,14 +260,14 @@ def update_gsheet(sheet_name, df):
         ws.update('A1', payload, value_input_option='USER_ENTERED')
         print(f"Created {sheet_name} with {len(df)} rows", flush=True)
 
-update_gsheet('DEBUG_FUNDAMENTAL_V9', df_fund)
-update_gsheet('DEBUG_TECHNICAL_V9', df_tech)
+update_gsheet('DEBUG_FUNDAMENTAL_V8_3', df_fund)
+update_gsheet('DEBUG_TECHNICAL_V8_3', df_tech)
 if all_results:
-    update_gsheet('QFACTOR_V9_TRADES', df_res)
-update_gsheet('QFACTOR_V9_SUMMARY', summary)
+    update_gsheet('QFACTOR_V8_3_TRADES', df_res)
+update_gsheet('QFACTOR_V8_3_SUMMARY', summary)
 
-print(f"\n=== V9 COMPLETE ===", flush=True)
+print(f"\n=== V8.3 COMPLETE ===", flush=True)
 print(f"Fund Pass: {len([d for d in debug_fund if d['Pass']])} | Setups: {len(all_results)}", flush=True)
 if all_results:
     print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}%", flush=True)
-print(f"Check QFACTOR_V9_SUMMARY sheet", flush=True)
+print(f"Check QFACTOR_V8_3_SUMMARY sheet", flush=True)
