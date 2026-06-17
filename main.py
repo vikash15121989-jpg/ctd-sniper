@@ -14,6 +14,7 @@ print("=== VA-PA Q-FACTOR V9 - TIGHT FILTERS FINAL ===", flush=True)
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
+ws_watchlist = sh.worksheet("Watchlist") # <-- APNE TAB KA NAAM. "Sheet1" ya "NIFTY500" ho to badal de
 
 BACKTEST_START = datetime(2023, 4, 1)
 BACKTEST_END = datetime(2026, 5, 30)
@@ -220,6 +221,9 @@ df_tech = pd.DataFrame(debug_tech)
 
 if not all_results:
     print("0 SETUP MILA - FILTER BAHUT TIGHT HAI")
+    wins = total = total_pnl = avg_win = avg_loss = max_drawdown = 0
+    winrate = 0
+    df_res = pd.DataFrame()
 else:
     df_res = pd.DataFrame(all_results).sort_values('Entry_Date')
     total = len(df_res)
