@@ -32,20 +32,22 @@ R = {
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
     'target_r': 1.0,
-    'max_risk_pct': 35.0, # V8.2=No Cap, V8.3=30%, V8.5=35% - Sweet spot
+    'max_risk_pct': 35.0, # 35% cap - V8.2 aur V8.3 ke beech
     'vol_blast_ratio': 1.2,
-    'rs_days': 45, # V8.2 wala 45d wapas - zyada setup
+    'rs_days': 45, # V8.2 wala 45d
 }
 
 debug_fund = []
 debug_tech = []
 
-# Nifty data
+# Nifty data - FIXED VERSION
 nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
+
 nifty['52W_High'] = nifty['High'].rolling(252).max()
-nifty['52W_High_Date'] = nifty['High'].rolling(252).apply(lambda x: nifty.index[x.argmax()], raw=False)
+# FIX: idxmax se date nikal, apply se nahi
+nifty['52W_High_Date'] = nifty['High'].rolling(252).apply(lambda x: x.idxmax() if len(x) == 252 else pd.NaT)
 
 def get_fundamentals_v8_5(stock):
     fund_data = {'stock': stock}
@@ -72,35 +74,32 @@ def check_52w_high_breakout_v8_5(df, idx):
     row = df.iloc[idx]
     entry_date = df.index[idx]
 
-    # 1. Price filter
     if row['Close'] < R['min_price']:
         return False, {}, f"Price {row['Close']} < 50"
 
-    # 2. Liquidity filter
     avg_value_cr = (df['Close'].iloc[idx-20:idx] * df['Volume'].iloc[idx-20:idx]).mean() / 1e7
     if avg_value_cr < R['min_daily_value_cr']:
         return False, {}, f"Liquidity {avg_value_cr:.2f}Cr < 0.5"
 
-    # 3. 52W High BO +1%
     high_252 = df['High'].iloc[idx-252:idx].max()
     if row['Close'] <= high_252 * 1.01:
         return False, {}, "No 52W BO +1%"
 
-    # 4. Volume Blast 1.2x
     avg_vol_20 = df['Volume'].iloc[idx-20:idx].mean()
     if avg_vol_20 == 0: avg_vol_20 = 1
     vol_ratio = row['Volume'] / avg_vol_20
     if vol_ratio < R['vol_blast_ratio']:
         return False, {}, f"Vol {vol_ratio:.1f}x < 1.2x"
 
-    # 5. RS Filter - 45 Days V8.2 WALA
     try:
         nifty_52h_date = nifty['52W_High_Date'].loc[entry_date]
+        if pd.isna(nifty_52h_date):
+            return False, {}, "Nifty 52W Date NaN"
         days_diff = (entry_date - nifty_52h_date).days
         if abs(days_diff) > R['rs_days']:
             return False, {}, f"RS {days_diff} days > 45"
-    except:
-        return False, {}, "RS Error"
+    except Exception as e:
+        return False, {}, f"RS Error: {str(e)[:20]}"
 
     return True, {
         'bo_date': entry_date.strftime('%Y-%m-%d'),
