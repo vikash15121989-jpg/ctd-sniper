@@ -8,34 +8,33 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V9 - TIGHT FILTERS ===", flush=True)
+print("=== VA-PA Q-FACTOR V9 - TIGHT FILTERS FINAL ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
-ws_watchlist = sh.worksheet("Watchlist")
 
 BACKTEST_START = datetime(2023, 4, 1)
 BACKTEST_END = datetime(2026, 5, 30)
 
 # ===== 2. FUNDAMENTAL - TIGHT =====
 F = {
-    'min_market_cap_cr': 500, # 300 se 500 kiya
-    'max_debt_equity': 2.0, # 3.0 se 2.0 kiya
-    'max_pe': 200, # 500 se 200 kiya
+    'min_market_cap_cr': 500,
+    'max_debt_equity': 2.0,
+    'max_pe': 200,
 }
 
 # ===== 3. TECHNICAL - V9 TIGHT =====
 R = {
-    'min_price': 50, # 5 se 50 kiya - liquidity
-    'min_daily_value_cr': 0.5, # 0.02 se 0.5 kiya
+    'min_price': 50,
+    'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
-    'target_r': 1.5, # 1.2 se 1.5 kiya - profit badhao
-    'max_risk_pct': 30.0, # 40 se 30 kiya - safety
-    'min_rr_pct': 3.0, # 2.0 se 3.0 kiya
-    'vol_blast_ratio': 2.0, # 1.2 se 2.0 kiya - strong volume
-    'rs_days': 15, # 30 se 15 kiya - tight RS
+    'target_r': 1.5,
+    'max_risk_pct': 30.0,
+    'min_rr_pct': 3.0,
+    'vol_blast_ratio': 2.0,
+    'rs_days': 15,
 }
 
 debug_fund = []
@@ -67,11 +66,11 @@ def get_fundamentals_v9(stock):
         fund_data['pe'] = info.get('trailingPE', 999)
 
         if fund_data['market_cap_cr'] < F['min_market_cap_cr']:
-            return False, fund_data, f"Mcap {fund_data['market_cap_cr']}Cr"
+            return False, fund_data, f"Mcap {fund_data['market_cap_cr']}Cr < 500"
         if fund_data['debt_equity'] > F['max_debt_equity']:
-            return False, fund_data, f"DE {fund_data['debt_equity']}"
+            return False, fund_data, f"DE {fund_data['debt_equity']} > 2"
         if fund_data['pe'] > F['max_pe']:
-            return False, fund_data, f"PE {fund_data['pe']}"
+            return False, fund_data, f"PE {fund_data['pe']} > 200"
         return True, fund_data, "PASS"
     except:
         return False, fund_data, "Error"
@@ -88,12 +87,12 @@ def check_52w_high_breakout_v9(df, idx):
     # 2. Liquidity filter
     avg_value_cr = (df['Close'].iloc[idx-20:idx] * df['Volume'].iloc[idx-20:idx]).mean() / 1e7
     if avg_value_cr < R['min_daily_value_cr']:
-        return False, {}, f"Liquidity {avg_value_cr:.2f}Cr low"
+        return False, {}, f"Liquidity {avg_value_cr:.2f}Cr < 0.5"
 
     # 3. 52W High BO
     high_252 = df['High'].iloc[idx-252:idx].max()
     if row['Close'] <= high_252 * 1.01:
-        return False, {}, "No 52W BO"
+        return False, {}, "No 52W BO +1%"
 
     # 4. Volume Blast 2x
     avg_vol_20 = df['Volume'].iloc[idx-20:idx].mean()
@@ -116,7 +115,7 @@ def check_52w_high_breakout_v9(df, idx):
         days_diff = 999
 
     if not rs_ok:
-        return False, {}, f"RS {days_diff} days"
+        return False, {}, f"RS {days_diff} days > 15"
 
     return True, {
         'bo_date': df.index[idx].strftime('%Y-%m-%d'),
@@ -127,6 +126,16 @@ def check_52w_high_breakout_v9(df, idx):
         'rs_ok': rs_ok,
         'liquidity_cr': round(avg_value_cr, 2)
     }, "V9 BO PASS"
+
+def simulate_trade(df, entry_idx, sl, target):
+    for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
+        if df['Low'].iloc[i] <= sl:
+            return 'LOSS', df.index[i].strftime('%Y-%m-%d'), round((sl / df['Close'].iloc[entry_idx] - 1) * 100, 1)
+        if df['High'].iloc[i] >= target:
+            return 'WIN', df.index[i].strftime('%Y-%m-%d'), round((target / df['Close'].iloc[entry_idx] - 1) * 100, 1)
+    exit_price = df['Close'].iloc[min(entry_idx + 59, len(df)-1)]
+    pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
+    return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
 def scan_stock_v9(stock):
     global debug_fund, debug_tech
@@ -193,16 +202,6 @@ def scan_stock_v9(stock):
         debug_tech.append({'Stock': stock, 'Reason': f'Error: {str(e)[:40]}'})
         return []
 
-def simulate_trade(df, entry_idx, sl, target):
-    for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
-        if df['Low'].iloc[i] <= sl:
-            return 'LOSS', df.index[i].strftime('%Y-%m-%d'), round((sl / df['Close'].iloc[entry_idx] - 1) * 100, 1)
-        if df['High'].iloc[i] >= target:
-            return 'WIN', df.index[i].strftime('%Y-%m-%d'), round((target / df['Close'].iloc[entry_idx] - 1) * 100, 1)
-    exit_price = df['Close'].iloc[min(entry_idx + 59, len(df)-1)]
-    pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
-    return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
-
 # ===== MAIN =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
@@ -229,28 +228,39 @@ else:
     total_pnl = df_res['PnL_%'].sum()
     avg_win = df_res[df_res['Result'] == 'WIN']['PnL_%'].mean() if wins > 0 else 0
     avg_loss = df_res[df_res['Result'] == 'LOSS']['PnL_%'].mean() if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0
+    max_drawdown = df_res['PnL_%'].cumsum().min()
 
 summary = pd.DataFrame([{
     'Total_Stocks': len(stocks),
     'Fund_Pass': len([d for d in debug_fund if d['Pass']]),
     'Total_Setups': len(all_results),
     'Winrate_%': winrate if all_results else 0,
-    'Avg_Win_%': round(avg_win, 1),
-    'Avg_Loss_%': round(avg_loss, 1),
+    'Avg_Win_%': round(avg_win, 1) if wins > 0 else 0,
+    'Avg_Loss_%': round(avg_loss, 1) if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
+    'Max_Drawdown_%': round(max_drawdown, 1) if all_results else 0,
     'Strategy': 'V9 TIGHT'
 }])
 
+# ===== GSHEET UPDATE - AUTO DELETE + CREATE =====
 def update_gsheet(sheet_name, df):
     try:
+        # Purani sheet hai to delete kar do
         ws = sh.worksheet(sheet_name)
-        ws.clear()
-    except:
-        ws = sh.add_worksheet(title=sheet_name, rows=20000, cols=70)
-        ws.clear()
+        sh.del_worksheet(ws)
+        print(f"Deleted old {sheet_name}", flush=True)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    # Nayi sheet banao - data ke hisaab se size
+    rows = len(df) + 20 if not df.empty else 100
+    cols = len(df.columns) + 5 if not df.empty else 26
+    ws = sh.add_worksheet(title=sheet_name, rows=rows, cols=cols)
+
     if not df.empty:
         payload = [df.columns.values.tolist()] + df.fillna('').values.tolist()
-        ws.update('A1', payload)
+        ws.update('A1', payload, value_input_option='USER_ENTERED')
+        print(f"Created {sheet_name} with {len(df)} rows", flush=True)
 
 update_gsheet('DEBUG_FUNDAMENTAL_V9', df_fund)
 update_gsheet('DEBUG_TECHNICAL_V9', df_tech)
@@ -259,4 +269,7 @@ if all_results:
 update_gsheet('QFACTOR_V9_SUMMARY', summary)
 
 print(f"\n=== V9 COMPLETE ===", flush=True)
-print(f"Setups: {len(all_results)} | Check QFACTOR_V9_TRADES", flush=True)
+print(f"Fund Pass: {len([d for d in debug_fund if d['Pass']])} | Setups: {len(all_results)}", flush=True)
+if all_results:
+    print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}%", flush=True)
+print(f"Check QFACTOR_V9_SUMMARY sheet", flush=True)
