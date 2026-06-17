@@ -4,6 +4,7 @@ import numpy as np
 import gspread
 import json
 import os
+import time
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -151,7 +152,6 @@ def scan_stock_v8_5(stock):
             is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_5(df, i)
             if is_bo:
                 entry_price = df['Close'].iloc[i]
-                # BUG FIX 1: SL buffer R se le
                 sl_price = df['Low'].iloc[i-20:i+1].min() * (1 - R['sl_buffer_pct']/100)
                 risk = entry_price - sl_price
                 risk_pct = risk / entry_price * 100
@@ -185,8 +185,21 @@ def scan_stock_v8_5(stock):
         return []
 
 # ===== MAIN =====
-stocks = ws_watchlist.col_values(1)[1:]
-stocks = [s.strip().upper() for s in stocks if s.strip()]
+# FIX: Retry logic for Google Sheets 502 error
+for attempt in range(3):
+    try:
+        stocks = ws_watchlist.col_values(1)[1:]
+        stocks = [s.strip().upper() for s in stocks if s.strip()]
+        print(f"Loaded {len(stocks)} stocks from Watchlist", flush=True)
+        break
+    except gspread.exceptions.APIError as e:
+        if attempt < 2:
+            print(f"Google API Error, retry {attempt+1}/3 in 10 sec...", flush=True)
+            time.sleep(10)
+        else:
+            print(f"Failed after 3 attempts: {e}", flush=True)
+            raise
+
 print(f"Scanning {len(stocks)} stocks - V8.5 HYBRID MODE...", flush=True)
 
 all_results = []
@@ -214,7 +227,7 @@ else:
     avg_win = df_res[df_res['Result'] == 'WIN']['PnL_%'].mean() if wins > 0 else 0
     avg_loss = df_res[df_res['Result'] == 'LOSS']['PnL_%'].mean() if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0
 
-    # BUG FIX 2: Sahi Drawdown calculation
+    # FIX: Sahi Drawdown calculation
     equity_curve = df_res['PnL_%'].cumsum()
     running_max = equity_curve.cummax()
     drawdown = equity_curve - running_max
