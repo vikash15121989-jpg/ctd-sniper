@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.1 - 52W HIGH + RS FIXED ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.2 - 52W HIGH FIXED ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -37,14 +37,22 @@ R = {
 debug_fund = []
 debug_tech = []
 
-# Nifty data ek baar download - FIXED VERSION
+# Nifty data - FIXED VERSION: LOOP SE NIKALO, ROLLING NAHI
 nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 
-# YAHAN FIX KIYA - idxmax() ki jagah argmax + iloc use kiya
+# YAHAN FIX KIYA - Rolling ki jagah loop
 nifty['52W_High'] = nifty['High'].rolling(252).max()
-nifty['52W_High_Date'] = nifty['High'].rolling(252).apply(lambda x: x.index[x.argmax()] if len(x) == 252 else pd.NaT, raw=False)
+nifty_52w_dates = []
+for i in range(len(nifty)):
+    if i < 251:
+        nifty_52w_dates.append(pd.NaT)
+    else:
+        window = nifty['High'].iloc[i-251:i+1]
+        max_date = window.idxmax()
+        nifty_52w_dates.append(max_date)
+nifty['52W_High_Date'] = nifty_52w_dates
 
 def get_fundamentals_v8(stock):
     fund_data = {'stock': stock}
@@ -67,10 +75,11 @@ def check_52w_high_breakout(df, idx):
         return False, {}, "No 52W BO"
 
     avg_vol_20 = df['Volume'].iloc[idx-20:idx].mean()
+    if avg_vol_20 == 0: avg_vol_20 = 1
     if row['Volume'] < avg_vol_20 * R['vol_blast_ratio']:
         return False, {}, "No Vol Blast"
 
-    # Nifty RS check - safe version
+    # Nifty RS check - safe
     try:
         nifty_52h_date = nifty.loc[df.index[idx]]['52W_High_Date']
         if pd.isna(nifty_52h_date):
@@ -194,7 +203,7 @@ summary = pd.DataFrame([{
     'Total_Setups': len(all_results),
     'Winrate_%': winrate if all_results else 0,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
-    'Strategy': 'V8.1 52W HIGH FIXED'
+    'Strategy': 'V8.2 52W HIGH FIXED'
 }])
 
 def update_gsheet(sheet_name, df):
