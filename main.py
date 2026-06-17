@@ -8,34 +8,34 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.3 - BALANCED WINNER ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.4 - ROLLING RS FINAL ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
-ws_watchlist = sh.worksheet("Watchlist") # <-- APNE TAB KA NAAM
+ws_watchlist = sh.worksheet("Watchlist")
 
 BACKTEST_START = datetime(2023, 4, 1)
 BACKTEST_END = datetime(2026, 5, 30)
 
-# ===== 2. FUNDAMENTAL - V8.2 Jaisa Loose =====
+# ===== 2. FUNDAMENTAL - LOOSE RAKHO =====
 F = {
     'min_market_cap_cr': 500,
-    'max_debt_equity': 10.0, # Loose rakho - growth stocks me debt hota hai
-    'max_pe': 1000, # Loose rakho - PE mat dekho BO me
+    'max_debt_equity': 10.0,
+    'max_pe': 1000,
 }
 
-# ===== 3. TECHNICAL - V8.3 BALANCED =====
+# ===== 3. TECHNICAL - V8.4 FINAL =====
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
-    'target_r': 1.0, # V8.2 jaisa - 1R hit hota hai
-    'max_risk_pct': 30.0, # NEW: PAGEL jaise 48% risk wale kaato
-    'min_rr_pct': 0, # Hata diya - chote SL wale trade bhi lo
-    'vol_blast_ratio': 1.2, # V8.2 jaisa - 1.2x enough
-    'rs_days': 30, # 45 se tight kiya, 15 se loose
+    'target_r': 1.0,
+    'max_risk_pct': 30.0, # 30% se zyada risk wale kaato
+    'vol_blast_ratio': 1.2,
+    'nifty_trend_max_loss': -3.0, # Nifty 20d me -3% se zyada na gira ho
+    'rs_ratio_min': 1.2, # Stock Nifty se 20% strong ho 15d me
 }
 
 debug_fund = []
@@ -46,18 +46,7 @@ nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BAC
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
 
-nifty['52W_High'] = nifty['High'].rolling(252).max()
-nifty_52w_dates = []
-for i in range(len(nifty)):
-    if i < 251:
-        nifty_52w_dates.append(pd.NaT)
-    else:
-        window = nifty['High'].iloc[i-251:i+1]
-        max_date = window.idxmax()
-        nifty_52w_dates.append(max_date)
-nifty['52W_High_Date'] = nifty_52w_dates
-
-def get_fundamentals_v8_3(stock):
+def get_fundamentals_v8_4(stock):
     fund_data = {'stock': stock}
     try:
         t = yf.Ticker(f"{stock}.NS")
@@ -76,10 +65,11 @@ def get_fundamentals_v8_3(stock):
     except:
         return False, fund_data, "Error"
 
-def check_52w_high_breakout_v8_3(df, idx):
+def check_52w_high_breakout_v8_4(df, idx):
     if idx < 252: return False, {}, "Data < 252"
 
     row = df.iloc[idx]
+    entry_date = df.index[idx]
 
     # 1. Price filter
     if row['Close'] < R['min_price']:
@@ -90,43 +80,52 @@ def check_52w_high_breakout_v8_3(df, idx):
     if avg_value_cr < R['min_daily_value_cr']:
         return False, {}, f"Liquidity {avg_value_cr:.2f}Cr < 0.5"
 
-    # 3. 52W High BO
+    # 3. 52W High BO +1%
     high_252 = df['High'].iloc[idx-252:idx].max()
     if row['Close'] <= high_252 * 1.01:
         return False, {}, "No 52W BO +1%"
 
-    # 4. Volume Blast 1.2x - V8.2 jaisa
+    # 4. Volume Blast 1.2x
     avg_vol_20 = df['Volume'].iloc[idx-20:idx].mean()
     if avg_vol_20 == 0: avg_vol_20 = 1
     vol_ratio = row['Volume'] / avg_vol_20
     if vol_ratio < R['vol_blast_ratio']:
         return False, {}, f"Vol {vol_ratio:.1f}x < 1.2x"
 
-    # 5. RS 30 days - Balanced
+    # 5. NAYA RS LOGIC - ROLLING STRENGTH
     try:
-        nifty_52h_date = nifty.loc[df.index[idx]]['52W_High_Date']
-        if pd.isna(nifty_52h_date):
-            rs_ok = False
-            days_diff = 999
-        else:
-            days_diff = (df.index[idx] - nifty_52h_date).days
-            rs_ok = abs(days_diff) <= R['rs_days']
-    except:
-        rs_ok = False
-        days_diff = 999
+        # Check 1: Nifty ka trend - Bear market me BO mat lo
+        nifty_today = nifty['Close'].loc[entry_date]
+        nifty_20d_ago = nifty['Close'].iloc[nifty.index.get_loc(entry_date) - 20]
+        nifty_trend_20d = (nifty_today / nifty_20d_ago - 1) * 100
 
-    if not rs_ok:
-        return False, {}, f"RS {days_diff} days > 30"
+        if nifty_trend_20d < R['nifty_trend_max_loss']:
+            return False, {}, f"Nifty weak {nifty_trend_20d:.1f}% < -3%"
+
+        # Check 2: Stock vs Nifty RS - Last 15 din me
+        stock_ret_15d = (df['Close'].iloc[idx] / df['Close'].iloc[idx-15] - 1) * 100
+        nifty_ret_15d = (nifty['Close'].loc[entry_date] / nifty['Close'].iloc[nifty.index.get_loc(entry_date) - 15] - 1) * 100
+
+        if nifty_ret_15d <= 0:
+            rs_ratio = 999 if stock_ret_15d > 0 else 0
+        else:
+            rs_ratio = stock_ret_15d / nifty_ret_15d
+
+        if rs_ratio < R['rs_ratio_min']:
+            return False, {}, f"RS weak {rs_ratio:.1f}x < 1.2x"
+
+    except Exception as e:
+        return False, {}, f"RS Error: {str(e)[:20]}"
 
     return True, {
-        'bo_date': df.index[idx].strftime('%Y-%m-%d'),
+        'bo_date': entry_date.strftime('%Y-%m-%d'),
         'bo_level': round(high_252, 2),
         '52w_high': round(high_252, 2),
         'vol_blast_x': round(vol_ratio, 1),
-        'rs_days_diff': days_diff,
-        'rs_ok': rs_ok,
+        'rs_ratio_15d': round(rs_ratio, 1),
+        'nifty_trend_20d': round(nifty_trend_20d, 1),
         'liquidity_cr': round(avg_value_cr, 2)
-    }, "V8.3 BO PASS"
+    }, "V8.4 BO PASS"
 
 def simulate_trade(df, entry_idx, sl, target):
     for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
@@ -138,10 +137,10 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
-def scan_stock_v8_3(stock):
+def scan_stock_v8_4(stock):
     global debug_fund, debug_tech
 
-    fund_pass, fund_data, fund_reason = get_fundamentals_v8_3(stock)
+    fund_pass, fund_data, fund_reason = get_fundamentals_v8_4(stock)
     debug_fund.append({'Stock': stock, 'Pass': fund_pass, 'Reason': fund_reason, **fund_data})
     if not fund_pass: return []
 
@@ -162,19 +161,17 @@ def scan_stock_v8_3(stock):
         results = []
 
         for i in range(252, len(df)):
-            is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_3(df, i)
+            is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_4(df, i)
             if is_bo:
                 entry_price = df['Close'].iloc[i]
                 sl_price = df['Low'].iloc[i-20:i+1].min() * 0.97
                 risk = entry_price - sl_price
                 risk_pct = risk / entry_price * 100
 
-                # Sirf 30% max risk cap - PAGEL jaisa kaatne ke liye
                 if risk_pct > R['max_risk_pct'] or risk_pct <= 0:
                     debug_tech.append({'Stock': stock, 'Reason': f'Risk {risk_pct:.1f}% > 30%'})
                     continue
 
-                # Min RR hata diya - 1% risk wale bhi lo
                 target = entry_price + risk * R['target_r']
                 result, exit_date, pnl = simulate_trade(df, i, sl_price, target)
 
@@ -184,15 +181,15 @@ def scan_stock_v8_3(stock):
                     'Target': round(target, 2), 'Risk_%': round(risk_pct, 1),
                     'Result': result, 'Exit_Date': exit_date, 'PnL_%': pnl,
                     '52W_High': bo_data['52w_high'], 'Vol_Blast_X': bo_data['vol_blast_x'],
-                    'RS_Days_Diff': bo_data['rs_days_diff'], 'Liquidity_Cr': bo_data['liquidity_cr'],
-                    **fund_data
+                    'RS_Ratio_15d': bo_data['rs_ratio_15d'], 'Nifty_Trend_20d': bo_data['nifty_trend_20d'],
+                    'Liquidity_Cr': bo_data['liquidity_cr'], **fund_data
                 }
                 results.append(entry_data)
-                debug_tech.append({'Stock': stock, 'Reason': f'V8.3 BO FOUND'})
+                debug_tech.append({'Stock': stock, 'Reason': f'V8.4 BO FOUND'})
                 break
 
         if not results:
-            debug_tech.append({'Stock': stock, 'Reason': 'No V8.3 BO'})
+            debug_tech.append({'Stock': stock, 'Reason': 'No V8.4 BO'})
 
         return results
     except Exception as e:
@@ -202,11 +199,11 @@ def scan_stock_v8_3(stock):
 # ===== MAIN =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
-print(f"Scanning {len(stocks)} stocks - V8.3 BALANCED MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks - V8.4 ROLLING RS MODE...", flush=True)
 
 all_results = []
 for i, stock in enumerate(stocks):
-    trades = scan_stock_v8_3(stock)
+    trades = scan_stock_v8_4(stock)
     all_results.extend(trades)
     if i % 50 == 0 or i == len(stocks) - 1:
         fund_count = len([d for d in debug_fund if d['Pass']])
@@ -239,10 +236,10 @@ summary = pd.DataFrame([{
     'Avg_Loss_%': round(avg_loss, 1) if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
     'Max_Drawdown_%': round(max_drawdown, 1) if all_results else 0,
-    'Strategy': 'V8.3 BALANCED'
+    'Strategy': 'V8.4 ROLLING RS'
 }])
 
-# ===== GSHEET UPDATE - AUTO DELETE + CREATE =====
+# ===== GSHEET UPDATE =====
 def update_gsheet(sheet_name, df):
     try:
         ws = sh.worksheet(sheet_name)
@@ -260,14 +257,14 @@ def update_gsheet(sheet_name, df):
         ws.update('A1', payload, value_input_option='USER_ENTERED')
         print(f"Created {sheet_name} with {len(df)} rows", flush=True)
 
-update_gsheet('DEBUG_FUNDAMENTAL_V8_3', df_fund)
-update_gsheet('DEBUG_TECHNICAL_V8_3', df_tech)
+update_gsheet('DEBUG_FUNDAMENTAL_V8_4', df_fund)
+update_gsheet('DEBUG_TECHNICAL_V8_4', df_tech)
 if all_results:
-    update_gsheet('QFACTOR_V8_3_TRADES', df_res)
-update_gsheet('QFACTOR_V8_3_SUMMARY', summary)
+    update_gsheet('QFACTOR_V8_4_TRADES', df_res)
+update_gsheet('QFACTOR_V8_4_SUMMARY', summary)
 
-print(f"\n=== V8.3 COMPLETE ===", flush=True)
+print(f"\n=== V8.4 COMPLETE ===", flush=True)
 print(f"Fund Pass: {len([d for d in debug_fund if d['Pass']])} | Setups: {len(all_results)}", flush=True)
 if all_results:
     print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}%", flush=True)
-print(f"Check QFACTOR_V8_3_SUMMARY sheet", flush=True)
+print(f"Check QFACTOR_V8_4_SUMMARY sheet", flush=True)
