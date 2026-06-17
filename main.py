@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V5 - RELAXED + DEBUG ===", flush=True)
+print("=== VA-PA Q-FACTOR V6 - VOLUME COMPRESSION BREAKOUT ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -21,30 +21,35 @@ BACKTEST_END = datetime(2026, 5, 30)
 
 # ===== 2. RELAXED FUNDAMENTAL RULES =====
 F = {
-    'min_market_cap_cr': 1000, # 2000 se 1000 kiya
-    'max_debt_equity': 1.0, # 0.5 se 1.0 kiya - BEAR me thoda debt chalta
-    'max_beta': 1.2, # 0.9 se 1.2 kiya
-    'min_roe': 12.0, # 18 se 12 kiya
-    'min_roce': 12.0, # 18 se 12 kiya
-    'min_eps_cagr_5y': 5.0, # 12 se 5 kiya - BEAR me growth kam
-    'max_pe': 80, # 60 se 80 kiya
+    'min_market_cap_cr': 500, # Aur relax kiya
+    'max_debt_equity': 1.5,
+    'max_beta': 1.5,
+    'min_roe': 8.0,
+    'min_roce': 8.0,
+    'min_eps_cagr_5y': 3.0,
+    'max_pe': 100,
 }
 
-# ===== 3. TECHNICAL RULES - RELAXED =====
+# ===== 3. TECHNICAL RULES - COMPRESSION =====
 R = {
-    'base_min_days': 20, 'base_max_days': 90, 'base_range_max_pct': 25.0, # Range badhayi
-    'base_vol_dry_pct': 0.60, 'bo_vol_spike': 1.8, 'bo_buffer_pct': 1.0, # BO easy kiya
-    'retest_vol_max_pct': 0.50, 'retest_zone_pct': 5.0, # Retest zone badhaya
-    'sl_buffer_pct': 1.0, 'target_r': 1.5, # Target 2 se 1.5 kiya
-    'min_price': 30, 'min_daily_value_cr': 0.2, # Liquidity kam kiya
-    'max_risk_pct': 20.0, 'min_rr_pct': 5.0,
+    'base_min_days': 15, 'base_max_days': 120, 'base_range_max_pct': 35.0,
+    'base_vol_dry_pct': 0.80, # Base me volume 80% tak dry chalta hai
+    'bo_vol_spike': 1.5, # 1.5x bhi chalta hai ab
+    'bo_buffer_pct': 0.5,
+    'retest_vol_max_pct': 0.70, 'retest_zone_pct': 7.0,
+    'sl_buffer_pct': 1.5, 'target_r': 1.5,
+    'min_price': 20, 'min_daily_value_cr': 0.1,
+    'max_risk_pct': 25.0, 'min_rr_pct': 4.0,
+    # NAYA: COMPRESSION RULES
+    'compression_days': 10, # 10 din ka high check
+    'vol_dry_ratio': 0.5, # Volume aadha ho jana chahiye
+    'vol_blast_ratio': 1.5, # Phir 1.5x blast
 }
 
 debug_fund = []
 debug_tech = []
 
 def get_fundamentals_debug(stock):
-    """Fundamental + Debug reason"""
     fund_data = {'stock': stock}
     reason = ""
     try:
@@ -58,21 +63,13 @@ def get_fundamentals_debug(stock):
         if fund_data['market_cap_cr'] < F['min_market_cap_cr']:
             reason = f"Mcap {fund_data['market_cap_cr']}Cr < {F['min_market_cap_cr']}"
             return False, fund_data, reason
-        if fund_data['beta'] > F['max_beta']:
-            reason = f"Beta {fund_data['beta']} > {F['max_beta']}"
-            return False, fund_data, reason
 
-        # Balance Sheet
         bs = t.balance_sheet
         if not bs.empty:
             debt = bs.loc['Total Debt'].iloc[0] if 'Total Debt' in bs.index else 0
             equity = bs.loc['Total Stockholder Equity'].iloc[0] if 'Total Stockholder Equity' in bs.index else 1
             fund_data['debt_equity'] = round(debt / equity, 2) if equity else 99
-            if fund_data['debt_equity'] > F['max_debt_equity']:
-                reason = f"D/E {fund_data['debt_equity']} > {F['max_debt_equity']}"
-                return False, fund_data, reason
 
-        # Financials
         fin = t.financials
         if not fin.empty and len(fin.columns) >= 2:
             net_income = fin.loc['Net Income'] if 'Net Income' in fin.index else pd.Series()
@@ -81,18 +78,12 @@ def get_fundamentals_debug(stock):
             if not net_income.empty and not bs.empty:
                 avg_equity = bs.loc['Total Stockholder Equity'].iloc[:2].mean() if 'Total Stockholder Equity' in bs.index else 1
                 fund_data['roe'] = round(net_income.iloc[0] / avg_equity * 100, 1) if avg_equity else 0
-                if fund_data['roe'] < F['min_roe']:
-                    reason = f"ROE {fund_data['roe']}% < {F['min_roe']}%"
-                    return False, fund_data, reason
 
             if not ebit.empty and not bs.empty:
                 total_assets = bs.loc['Total Assets'].iloc[0] if 'Total Assets' in bs.index else 0
                 curr_liab = bs.loc['Current Liabilities'].iloc[0] if 'Current Liabilities' in bs.index else 0
                 capital_employed = total_assets - curr_liab
                 fund_data['roce'] = round(ebit.iloc[0] / capital_employed * 100, 1) if capital_employed else 0
-                if fund_data['roce'] < F['min_roce']:
-                    reason = f"ROCE {fund_data['roce']}% < {F['min_roce']}%"
-                    return False, fund_data, reason
 
             if len(net_income) >= 3:
                 oldest = net_income.iloc[-1]
@@ -100,9 +91,6 @@ def get_fundamentals_debug(stock):
                 years = len(net_income) - 1
                 if oldest > 0 and years > 0:
                     fund_data['eps_cagr_5y'] = round(((latest / oldest) ** (1/years) - 1) * 100, 1)
-                    if fund_data['eps_cagr_5y'] < F['min_eps_cagr_5y']:
-                        reason = f"EPS CAGR {fund_data['eps_cagr_5y']}% < {F['min_eps_cagr_5y']}%"
-                        return False, fund_data, reason
 
         fund_data['fund_pass'] = True
         return True, fund_data, "PASS"
@@ -115,6 +103,7 @@ def add_indicators(df):
     df['Daily_Value_20MA'] = (df['Close'] * df['Volume']).rolling(20).mean()
     df['50DMA'] = df['Close'].rolling(50).mean()
     df['200DMA'] = df['Close'].rolling(200).mean()
+    df['High_10D'] = df['High'].rolling(10).max() # 10 din ka high
     return df
 
 def check_liquidity(df, idx):
@@ -124,17 +113,59 @@ def check_liquidity(df, idx):
         return True
     except: return False
 
-def find_base_and_breakout(df, idx, stock):
+def check_volume_compression(df, idx):
+    """
+    NAYA RULE: 10 din ka high nahi toota + Volume dry hoke blast
+    """
+    if idx < R['compression_days'] + 5: return False, {}
+
+    # 1. 10 din ka high nikalo
+    high_10d_idx = df['High'].iloc[idx-R['compression_days']:idx].idxmax()
+    high_10d_date = high_10d_idx
+    high_10d_price = df['High'].loc[high_10d_date]
+    high_10d_vol = df['Volume'].loc[high_10d_date]
+
+    # 2. Kya us high ke baad koi naya high bana? Nahi banana chahiye
+    if df['High'].iloc[df.index.get_loc(high_10d_date)+1:idx+1].max() >= high_10d_price:
+        return False, {} # High tut gaya
+
+    # 3. Volume dry hua kya? High wale din se aaj tak
+    days_since_high = idx - df.index.get_loc(high_10d_date)
+    if days_since_high < 3: return False, {} # Kam se kam 3 din compression
+
+    avg_vol_since_high = df['Volume'].iloc[df.index.get_loc(high_10d_date):idx].mean()
+    if avg_vol_since_high > high_10d_vol * R['vol_dry_ratio']:
+        return False, {} # Volume aadha nahi hua
+
+    # 4. Aaj volume blast hua kya?
+    today_vol = df['Volume'].iloc[idx]
+    if today_vol < avg_vol_since_high * R['vol_blast_ratio']:
+        return False, {} # Volume blast nahi
+
+    return True, {
+        'high_10d_date': high_10d_date.strftime('%Y-%m-%d'),
+        'high_10d_price': round(high_10d_price, 2),
+        'high_10d_vol': int(high_10d_vol),
+        'avg_vol_dry': int(avg_vol_since_high),
+        'today_vol': int(today_vol),
+        'compression_days': days_since_high
+    }
+
+def find_base_and_breakout_v6(df, idx, stock):
     row = df.iloc[idx]
     tech_reason = ""
 
     if row['50DMA'] < row['200DMA']:
-        tech_reason = "50DMA < 200DMA - Downtrend"
-        return False, {}, tech_reason
+        return False, {}, "50DMA < 200DMA"
     if row['Close'] < row['50DMA']:
-        tech_reason = "Close < 50DMA"
-        return False, {}, tech_reason
+        return False, {}, "Close < 50DMA"
 
+    # NAYA: VOLUME COMPRESSION CHECK
+    is_comp, comp_data = check_volume_compression(df, idx)
+    if not is_comp:
+        return False, {}, "No Volume Compression"
+
+    # Compression ke saath base bhi chahiye
     for base_days in range(R['base_min_days'], R['base_max_days'] + 1):
         if idx - base_days < 0: continue
         base_df = df.iloc[idx-base_days:idx]
@@ -142,34 +173,29 @@ def find_base_and_breakout(df, idx, stock):
         base_low = base_df['Low'].min()
         base_range = (base_high - base_low) / base_low * 100
         if base_range > R['base_range_max_pct']: continue
-        avg_base_vol = base_df['Volume'].mean()
-        if avg_base_vol > row['Vol_50MA'] * R['base_vol_dry_pct']: continue
+
         bo_level = base_high * (1 + R['bo_buffer_pct']/100)
         if row['Close'] <= bo_level: continue
         if row['Close'] <= row['Open']: continue
-        if row['Volume'] < row['Vol_50MA'] * R['bo_vol_spike']: continue
 
         return True, {
             'bo_date': df.index[idx].strftime('%Y-%m-%d'),
             'bo_level': round(base_high, 2),
             'bo_vol': row['Volume'],
-            'bo_idx': idx
-        }, "BO PASS"
+            'bo_idx': idx,
+            **comp_data # Compression data bhi add
+        }, "BO + COMPRESSION PASS"
 
-    tech_reason = "No BO - Range/Vol/Trend fail"
-    return False, {}, tech_reason
+    return False, {}, "Base Fail"
 
 def check_retest_entry(df, idx, bo_data):
     if idx <= bo_data['bo_idx'] + 1: return False, {}, "No data after BO"
     row = df.iloc[idx]
     bo_level = bo_data['bo_level']
-    bo_vol = bo_data['bo_vol']
 
     zone_low = bo_level * (1 - R['retest_zone_pct']/100)
     zone_high = bo_level * (1 + R['retest_zone_pct']/100)
     if not (zone_low <= row['Low'] <= zone_high): return False, {}, "Not in Retest Zone"
-    if row['Volume'] > bo_vol * R['retest_vol_max_pct']: return False, {}, "Retest Vol High"
-    if row['Close'] < row['Open'] * 0.995: return False, {}, "Big Red Candle"
 
     swing_low = df['Low'].iloc[idx-5:idx+1].min()
     sl_price = swing_low * (1 - R['sl_buffer_pct']/100)
@@ -199,15 +225,13 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
-def scan_stock_debug(stock):
+def scan_stock_v6(stock):
     global debug_fund, debug_tech
 
-    # STEP 1: FUNDAMENTAL
     fund_pass, fund_data, fund_reason = get_fundamentals_debug(stock)
     debug_fund.append({'Stock': stock, 'Pass': fund_pass, 'Reason': fund_reason, **fund_data})
     if not fund_pass: return []
 
-    # STEP 2: TECHNICAL
     try:
         df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=300),
                         end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True, timeout=15)
@@ -224,32 +248,36 @@ def scan_stock_debug(stock):
         df = add_indicators(df)
         results = []
         last_bo_idx = -100
-        bo_found = False
 
         for i in range(100, len(df)):
             if not check_liquidity(df, i): continue
-            is_bo, bo_data, bo_reason = find_base_and_breakout(df, i, stock)
+            is_bo, bo_data, bo_reason = find_base_and_breakout_v6(df, i, stock)
             if is_bo and i > last_bo_idx + 20:
                 last_bo_idx = i
-                bo_found = True
-                for j in range(i+1, min(i+21, len(df))):
-                    is_entry, entry_data, entry_reason = check_retest_entry(df, j, bo_data)
-                    if is_entry:
-                        result, exit_date, pnl = simulate_trade(df, j, entry_data['SL'], entry_data['Target'])
-                        entry_data.update({
-                            'Stock': stock, 'Result': result,
-                            'Exit_Date': exit_date, 'PnL_%': pnl,
-                            **fund_data
-                        })
-                        results.append(entry_data)
-                        debug_tech.append({'Stock': stock, 'Reason': 'SETUP FOUND'})
-                        break
-                    else:
-                        debug_tech.append({'Stock': stock, 'Reason': f'Retest Fail: {entry_reason}'})
+                # Compression BO me direct entry bhi le sakte, retest optional
+                entry_data = {
+                    'Entry_Date': df.index[i].strftime('%Y-%m-%d'),
+                    'Entry': round(df['Close'].iloc[i], 2),
+                    'SL': round(bo_data['bo_level'] * 0.98, 2), # 2% below BO
+                    'Target': round(df['Close'].iloc[i] * 1.15, 2), # 15% target
+                    'BO_Level': bo_data['bo_level'],
+                    'BO_Date': bo_data['bo_date'],
+                    'Compression_Days': bo_data['compression_days'],
+                    'High_10D_Date': bo_data['high_10d_date'],
+                    'Vol_Blast_X': round(df['Volume'].iloc[i] / bo_data['avg_vol_dry'], 1)
+                }
+                result, exit_date, pnl = simulate_trade(df, i, entry_data['SL'], entry_data['Target'])
+                entry_data.update({
+                    'Stock': stock, 'Result': result,
+                    'Exit_Date': exit_date, 'PnL_%': pnl,
+                    **fund_data, **bo_data
+                })
+                results.append(entry_data)
+                debug_tech.append({'Stock': stock, 'Reason': 'COMPRESSION BO SETUP'})
                 break
 
-        if not bo_found:
-            debug_tech.append({'Stock': stock, 'Reason': 'No BO Found'})
+        if not results:
+            debug_tech.append({'Stock': stock, 'Reason': 'No Compression BO'})
 
         return results
     except Exception as e:
@@ -259,12 +287,11 @@ def scan_stock_debug(stock):
 # ===== MAIN =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
-print(f"Scanning {len(stocks)} stocks - RELAXED MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks - COMPRESSION MODE...", flush=True)
 
 all_results = []
-fund_passed = []
 for i, stock in enumerate(stocks):
-    trades = scan_stock_debug(stock)
+    trades = scan_stock_v6(stock)
     all_results.extend(trades)
     if i % 10 == 0:
         fund_count = len([d for d in debug_fund if d['Pass']])
@@ -288,6 +315,7 @@ summary = pd.DataFrame([{
     'Total_Setups': len(all_results),
     'Winrate_%': winrate,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
+    'Strategy': 'V6 COMPRESSION BREAKOUT'
 }])
 
 def update_gsheet(sheet_name, df):
@@ -295,7 +323,7 @@ def update_gsheet(sheet_name, df):
         ws = sh.worksheet(sheet_name)
         ws.clear()
     except:
-        ws = sh.add_worksheet(title=sheet_name, rows=20000, cols=60)
+        ws = sh.add_worksheet(title=sheet_name, rows=20000, cols=70)
         ws.clear()
     if not df.empty:
         payload = [df.columns.values.tolist()] + df.fillna('').values.tolist()
@@ -304,8 +332,8 @@ def update_gsheet(sheet_name, df):
 update_gsheet('DEBUG_FUNDAMENTAL', df_fund)
 update_gsheet('DEBUG_TECHNICAL', df_tech)
 if all_results:
-    update_gsheet('QFACTOR_V5_TRADES', df_res)
-update_gsheet('QFACTOR_V5_SUMMARY', summary)
+    update_gsheet('QFACTOR_V6_TRADES', df_res)
+update_gsheet('QFACTOR_V6_SUMMARY', summary)
 
 print(f"\n=== COMPLETE ===", flush=True)
-print(f"Check DEBUG_FUNDAMENTAL & DEBUG_TECHNICAL sheets for reasons", flush=True)
+print(f"Check QFACTOR_V6_TRADES sheet - Compression_BO setup milega", flush=True)
