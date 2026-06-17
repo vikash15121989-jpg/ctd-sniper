@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.4 - ROLLING RS FINAL ===", flush=True)
+print("=== VA-PA Q-FACTOR V8.5 - HYBRID BALANCED ===", flush=True)
 
 # ===== 1. SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -19,23 +19,22 @@ ws_watchlist = sh.worksheet("Watchlist")
 BACKTEST_START = datetime(2023, 4, 1)
 BACKTEST_END = datetime(2026, 5, 30)
 
-# ===== 2. FUNDAMENTAL - LOOSE RAKHO =====
+# ===== 2. FUNDAMENTAL - LOOSE =====
 F = {
     'min_market_cap_cr': 500,
     'max_debt_equity': 10.0,
     'max_pe': 1000,
 }
 
-# ===== 3. TECHNICAL - V8.4 FINAL =====
+# ===== 3. TECHNICAL - V8.5 HYBRID =====
 R = {
     'min_price': 50,
     'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 3.0,
     'target_r': 1.0,
-    'max_risk_pct': 30.0, # 30% se zyada risk wale kaato
+    'max_risk_pct': 35.0, # V8.2=No Cap, V8.3=30%, V8.5=35% - Sweet spot
     'vol_blast_ratio': 1.2,
-    'nifty_trend_max_loss': -3.0, # Nifty 20d me -3% se zyada na gira ho
-    'rs_ratio_min': 1.2, # Stock Nifty se 20% strong ho 15d me
+    'rs_days': 45, # V8.2 wala 45d wapas - zyada setup
 }
 
 debug_fund = []
@@ -45,8 +44,10 @@ debug_tech = []
 nifty = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False)
 if isinstance(nifty.columns, pd.MultiIndex):
     nifty.columns = nifty.columns.droplevel(1)
+nifty['52W_High'] = nifty['High'].rolling(252).max()
+nifty['52W_High_Date'] = nifty['High'].rolling(252).apply(lambda x: nifty.index[x.argmax()], raw=False)
 
-def get_fundamentals_v8_4(stock):
+def get_fundamentals_v8_5(stock):
     fund_data = {'stock': stock}
     try:
         t = yf.Ticker(f"{stock}.NS")
@@ -65,7 +66,7 @@ def get_fundamentals_v8_4(stock):
     except:
         return False, fund_data, "Error"
 
-def check_52w_high_breakout_v8_4(df, idx):
+def check_52w_high_breakout_v8_5(df, idx):
     if idx < 252: return False, {}, "Data < 252"
 
     row = df.iloc[idx]
@@ -92,40 +93,24 @@ def check_52w_high_breakout_v8_4(df, idx):
     if vol_ratio < R['vol_blast_ratio']:
         return False, {}, f"Vol {vol_ratio:.1f}x < 1.2x"
 
-    # 5. NAYA RS LOGIC - ROLLING STRENGTH
+    # 5. RS Filter - 45 Days V8.2 WALA
     try:
-        # Check 1: Nifty ka trend - Bear market me BO mat lo
-        nifty_today = nifty['Close'].loc[entry_date]
-        nifty_20d_ago = nifty['Close'].iloc[nifty.index.get_loc(entry_date) - 20]
-        nifty_trend_20d = (nifty_today / nifty_20d_ago - 1) * 100
-
-        if nifty_trend_20d < R['nifty_trend_max_loss']:
-            return False, {}, f"Nifty weak {nifty_trend_20d:.1f}% < -3%"
-
-        # Check 2: Stock vs Nifty RS - Last 15 din me
-        stock_ret_15d = (df['Close'].iloc[idx] / df['Close'].iloc[idx-15] - 1) * 100
-        nifty_ret_15d = (nifty['Close'].loc[entry_date] / nifty['Close'].iloc[nifty.index.get_loc(entry_date) - 15] - 1) * 100
-
-        if nifty_ret_15d <= 0:
-            rs_ratio = 999 if stock_ret_15d > 0 else 0
-        else:
-            rs_ratio = stock_ret_15d / nifty_ret_15d
-
-        if rs_ratio < R['rs_ratio_min']:
-            return False, {}, f"RS weak {rs_ratio:.1f}x < 1.2x"
-
-    except Exception as e:
-        return False, {}, f"RS Error: {str(e)[:20]}"
+        nifty_52h_date = nifty['52W_High_Date'].loc[entry_date]
+        days_diff = (entry_date - nifty_52h_date).days
+        if abs(days_diff) > R['rs_days']:
+            return False, {}, f"RS {days_diff} days > 45"
+    except:
+        return False, {}, "RS Error"
 
     return True, {
         'bo_date': entry_date.strftime('%Y-%m-%d'),
         'bo_level': round(high_252, 2),
         '52w_high': round(high_252, 2),
         'vol_blast_x': round(vol_ratio, 1),
-        'rs_ratio_15d': round(rs_ratio, 1),
-        'nifty_trend_20d': round(nifty_trend_20d, 1),
+        'rs_days_diff': days_diff,
+        'nifty_52w_date': nifty_52h_date.strftime('%Y-%m-%d'),
         'liquidity_cr': round(avg_value_cr, 2)
-    }, "V8.4 BO PASS"
+    }, "V8.5 BO PASS"
 
 def simulate_trade(df, entry_idx, sl, target):
     for i in range(entry_idx + 1, min(entry_idx + 60, len(df))):
@@ -137,10 +122,10 @@ def simulate_trade(df, entry_idx, sl, target):
     pnl = round((exit_price / df['Close'].iloc[entry_idx] - 1) * 100, 1)
     return 'TIME', df.index[min(entry_idx + 59, len(df)-1)].strftime('%Y-%m-%d'), pnl
 
-def scan_stock_v8_4(stock):
+def scan_stock_v8_5(stock):
     global debug_fund, debug_tech
 
-    fund_pass, fund_data, fund_reason = get_fundamentals_v8_4(stock)
+    fund_pass, fund_data, fund_reason = get_fundamentals_v8_5(stock)
     debug_fund.append({'Stock': stock, 'Pass': fund_pass, 'Reason': fund_reason, **fund_data})
     if not fund_pass: return []
 
@@ -161,7 +146,7 @@ def scan_stock_v8_4(stock):
         results = []
 
         for i in range(252, len(df)):
-            is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_4(df, i)
+            is_bo, bo_data, bo_reason = check_52w_high_breakout_v8_5(df, i)
             if is_bo:
                 entry_price = df['Close'].iloc[i]
                 sl_price = df['Low'].iloc[i-20:i+1].min() * 0.97
@@ -169,7 +154,7 @@ def scan_stock_v8_4(stock):
                 risk_pct = risk / entry_price * 100
 
                 if risk_pct > R['max_risk_pct'] or risk_pct <= 0:
-                    debug_tech.append({'Stock': stock, 'Reason': f'Risk {risk_pct:.1f}% > 30%'})
+                    debug_tech.append({'Stock': stock, 'Reason': f'Risk {risk_pct:.1f}% > 35%'})
                     continue
 
                 target = entry_price + risk * R['target_r']
@@ -181,15 +166,15 @@ def scan_stock_v8_4(stock):
                     'Target': round(target, 2), 'Risk_%': round(risk_pct, 1),
                     'Result': result, 'Exit_Date': exit_date, 'PnL_%': pnl,
                     '52W_High': bo_data['52w_high'], 'Vol_Blast_X': bo_data['vol_blast_x'],
-                    'RS_Ratio_15d': bo_data['rs_ratio_15d'], 'Nifty_Trend_20d': bo_data['nifty_trend_20d'],
+                    'RS_Days_Diff': bo_data['rs_days_diff'], 'Nifty_52W_Date': bo_data['nifty_52w_date'],
                     'Liquidity_Cr': bo_data['liquidity_cr'], **fund_data
                 }
                 results.append(entry_data)
-                debug_tech.append({'Stock': stock, 'Reason': f'V8.4 BO FOUND'})
+                debug_tech.append({'Stock': stock, 'Reason': f'V8.5 BO FOUND'})
                 break
 
         if not results:
-            debug_tech.append({'Stock': stock, 'Reason': 'No V8.4 BO'})
+            debug_tech.append({'Stock': stock, 'Reason': 'No V8.5 BO'})
 
         return results
     except Exception as e:
@@ -199,11 +184,11 @@ def scan_stock_v8_4(stock):
 # ===== MAIN =====
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = [s.strip().upper() for s in stocks if s.strip()]
-print(f"Scanning {len(stocks)} stocks - V8.4 ROLLING RS MODE...", flush=True)
+print(f"Scanning {len(stocks)} stocks - V8.5 HYBRID MODE...", flush=True)
 
 all_results = []
 for i, stock in enumerate(stocks):
-    trades = scan_stock_v8_4(stock)
+    trades = scan_stock_v8_5(stock)
     all_results.extend(trades)
     if i % 50 == 0 or i == len(stocks) - 1:
         fund_count = len([d for d in debug_fund if d['Pass']])
@@ -236,7 +221,7 @@ summary = pd.DataFrame([{
     'Avg_Loss_%': round(avg_loss, 1) if len(df_res[df_res['Result'] == 'LOSS']) > 0 else 0,
     'Total_PnL_%': round(total_pnl, 1) if all_results else 0,
     'Max_Drawdown_%': round(max_drawdown, 1) if all_results else 0,
-    'Strategy': 'V8.4 ROLLING RS'
+    'Strategy': 'V8.5 HYBRID'
 }])
 
 # ===== GSHEET UPDATE =====
@@ -257,14 +242,14 @@ def update_gsheet(sheet_name, df):
         ws.update('A1', payload, value_input_option='USER_ENTERED')
         print(f"Created {sheet_name} with {len(df)} rows", flush=True)
 
-update_gsheet('DEBUG_FUNDAMENTAL_V8_4', df_fund)
-update_gsheet('DEBUG_TECHNICAL_V8_4', df_tech)
+update_gsheet('DEBUG_FUNDAMENTAL_V8_5', df_fund)
+update_gsheet('DEBUG_TECHNICAL_V8_5', df_tech)
 if all_results:
-    update_gsheet('QFACTOR_V8_4_TRADES', df_res)
-update_gsheet('QFACTOR_V8_4_SUMMARY', summary)
+    update_gsheet('QFACTOR_V8_5_TRADES', df_res)
+update_gsheet('QFACTOR_V8_5_SUMMARY', summary)
 
-print(f"\n=== V8.4 COMPLETE ===", flush=True)
+print(f"\n=== V8.5 COMPLETE ===", flush=True)
 print(f"Fund Pass: {len([d for d in debug_fund if d['Pass']])} | Setups: {len(all_results)}", flush=True)
 if all_results:
     print(f"Winrate: {winrate}% | Total PnL: {total_pnl:.1f}%", flush=True)
-print(f"Check QFACTOR_V8_4_SUMMARY sheet", flush=True)
+print(f"Check QFACTOR_V8_5_SUMMARY sheet", flush=True)
