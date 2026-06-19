@@ -42,6 +42,7 @@ def get_or_create_ws(sh, title):
 def calculate_indicators(df):
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
     
     # 10 Days Max Volume and Max Price (Excluding current day for reference setup)
     df['MaxVol_10D'] = df['Volume'].shift(1).rolling(window=10).max()
@@ -54,14 +55,35 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
+print("\n Downloading Nifty 50 reference data...", flush=True)
+nifty_df = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=100), end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
+if isinstance(nifty_df.columns, pd.MultiIndex): nifty_df.columns = nifty_df.columns.get_level_values(0)
+nifty_df.index = pd.to_datetime(nifty_df.index).strftime('%Y-%m-%d')
+nifty_df = nifty_df[~nifty_df.index.duplicated(keep='last')]
+
+# FIXED: Re-added the missing calculate_rs_1m function
+def calculate_rs_1m(df, i, current_date, nifty_df):
+    try:
+        if current_date not in nifty_df.index or i < 21: return None
+        nifty_idx = nifty_df.index.get_loc(current_date)
+        if nifty_idx < 21: return None
+
+        stock_start = df['Close'].iloc[i-21]
+        stock_now = df['Close'].iloc[i]
+        stock_ret = ((stock_now - stock_start) / stock_start) * 100
+
+        nifty_start = nifty_df['Close'].iloc[nifty_idx-21]
+        nifty_now = nifty_df['Close'].iloc[nifty_idx]
+        nifty_ret = ((nifty_now - nifty_start) / nifty_start) * 100
+
+        return round(stock_ret - nifty_ret, 2)
+    except:
+        return None
+
 def check_compression_and_breakout(df, current_idx, debug_counter):
-    """
-    Naya Logic: Pichle 10 dinon me Setup Day dhundo (Heavy Vol but No Price Breakout)
-    Aur check karo ki kya AJ us Setup Day ke High ka breakout ho raha hai.
-    """
     row_today = df.iloc[current_idx]
     
-    # 1. TREND CHECK (Aaj price EMA20 ke upar hona chahiye)
+    # 1. TREND CHECK
     if not (row_today['Close'] > row_today['EMA20'] > row_today['EMA50']):
         debug_counter['trend'] += 1
         return False, 0
@@ -72,7 +94,6 @@ def check_compression_and_breakout(df, current_idx, debug_counter):
         return False, 0
 
     # 2. PICHLE 10 DIN ME SETUP DAY DHUNDO
-    # Hame i-1 se lekar i-10 tak piche jana hai
     setup_found = False
     trigger_level = 0
     
@@ -82,30 +103,25 @@ def check_compression_and_breakout(df, current_idx, debug_counter):
         
         row_setup = df.iloc[setup_idx]
         
-        # Setup Condition: 
-        # उस दिन का वॉल्यूम उसके पिछले 10 दिन के मैक्स वॉल्यूम से ज़्यादा था
         vol_condition = row_setup['Volume'] > row_setup['MaxVol_10D']
-        # उस दिन का हाई उसके पिछले 10 दिन के मैक्स हाई से कम था
         price_condition = row_setup['High'] < row_setup['MaxHigh_10D']
         
         if vol_condition and price_condition:
             setup_found = True
-            # Entry tabhi hogi jab aaj ka price us setup day ke pichle 10-day max high ko cross karega
             trigger_level = row_setup['MaxHigh_10D']
             break
             
     if not setup_found:
-        debug_counter['no_base'] += 1 # Reusing counter for 'No Setup Found'
+        debug_counter['no_base'] += 1 
         return False, 0
 
-    # 3. ENTRY TRIGGER: Kya aaj ka Close us Trigger Level ke upar nikal gaya?
+    # 3. ENTRY TRIGGER
     if row_today['Close'] > trigger_level and df['Close'].iloc[current_idx-1] <= trigger_level:
-        # Check rejection wick on breakout day
         candle_range = row_today['High'] - row_today['Low']
         if candle_range > 0:
             upper_wick = row_today['High'] - max(row_today['Open'], row_today['Close'])
             if (upper_wick / candle_range) > 0.35:
-                debug_counter['no_breakout'] += 1 # Fake breakout filter
+                debug_counter['no_breakout'] += 1 
                 return False, 0
         return True, trigger_level
 
@@ -221,7 +237,6 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            # NEW LOGIC CALL
             is_entry, trigger_level = check_compression_and_breakout(df, i, debug_counter)
             if not is_entry:
                 continue
@@ -233,7 +248,6 @@ for batch_num in range(total_batches):
 
             entry_price = row['Close']
             
-            # 5% Target & 3% SL
             target_price = entry_price * (1 + (R['fixed_target_pct'] / 100))
             sl_price = entry_price * (1 - (R['fixed_sl_pct'] / 100))
             
@@ -310,3 +324,4 @@ except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
 print("\n=== COMPLETE ===", flush=True)
+    
