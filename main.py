@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V21 - VOLUMETRIC COMPRESSION SNIPER ===", flush=True)
+print("=== RS BEATER V22 - VOLUMETRIC COMPRESSION SNIPER EX ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,7 +22,7 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# V21 OPTIMIZED RULES FOR COMPRESSION & BREAKOUT
+# V22 OPTIMIZED RULES FOR COMPRESSION & STRICT BREAKOUT
 R = {
     'min_daily_value_cr': 30.0,    
     'trend_days': 20,              
@@ -61,7 +61,6 @@ if isinstance(nifty_df.columns, pd.MultiIndex): nifty_df.columns = nifty_df.colu
 nifty_df.index = pd.to_datetime(nifty_df.index).strftime('%Y-%m-%d')
 nifty_df = nifty_df[~nifty_df.index.duplicated(keep='last')]
 
-# FIXED: Re-added the missing calculate_rs_1m function
 def calculate_rs_1m(df, i, current_date, nifty_df):
     try:
         if current_date not in nifty_df.index or i < 21: return None
@@ -115,14 +114,22 @@ def check_compression_and_breakout(df, current_idx, debug_counter):
         debug_counter['no_base'] += 1 
         return False, 0
 
-    # 3. ENTRY TRIGGER
+    # 3. ENTRY TRIGGER WITH BREAKOUT DAY VOLUME & STRICT CANDLE CONFIRMATION
     if row_today['Close'] > trigger_level and df['Close'].iloc[current_idx-1] <= trigger_level:
+        
+        # ADDITION 1: Breakout wale din volume pichle 20 din ke Vol_MA se 1.2x bada hona chahiye
+        if row_today['Volume'] < (row_today['Vol_MA20'] * 1.2):
+            debug_counter['volume'] += 1
+            return False, 0
+            
+        # ADDITION 2: Candle rejection filter ko tight (0.25) kiya taaki top pin bars reject hon
         candle_range = row_today['High'] - row_today['Low']
         if candle_range > 0:
             upper_wick = row_today['High'] - max(row_today['Open'], row_today['Close'])
-            if (upper_wick / candle_range) > 0.35:
+            if (upper_wick / candle_range) > 0.25:
                 debug_counter['no_breakout'] += 1 
                 return False, 0
+                
         return True, trigger_level
 
     debug_counter['no_breakout'] += 1
@@ -279,14 +286,14 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V21", flush=True)
+print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V22", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V21", flush=True)
+print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V22", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
@@ -324,4 +331,4 @@ except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
 print("\n=== COMPLETE ===", flush=True)
-    
+        
