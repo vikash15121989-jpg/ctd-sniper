@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V9.5 - FINAL SNIPER ===", flush=True)
+print("=== RS BEATER V9.6.1 - BUG FIX CONTINUOUS FLOW ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,24 +22,20 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# SNIPER FILTERS - ROJ 1 TRADE, WR 45%+
 R = {
-    'min_daily_value_cr': 3.0, # QUALITY: 2Cr se 3Cr - Sirf Top 10% stocks
-    'fixed_target_pct': 6.0, # 6% TARGET LOCK
-    'fixed_sl_pct': 2.5, # 2.5% SL = RR 1:2.4
-    'rsi_min': 62, # QUALITY: 60 se 62 - Aur strong
-    'rsi_max': 72, # Overbought avoid
-    'min_rs_1m': 10.0, # QUALITY: Nifty se 10%+ aage 1M me
-    'min_rs_10d': 6.0, # QUALITY: Nifty se 6%+ aage 10D me
-    'breakout_buffer_pct': 0.5, # 10D high ke 0.5% upar
+    'min_daily_value_cr': 2.0,
+    'fixed_target_pct': 4.5, # 4.5% target
+    'fixed_sl_pct': 2.0, # 2% SL = RR 1:2.25
+    'vol_blast_ratio': 1.8, # 1.8x volume
+    'rsi_min': 55,
+    'rsi_max': 72,
+    'min_rs_1m': 5.0, # Nifty se 5%+ aage
+    'min_rs_10d': 3.0, # Nifty se 3%+ aage
+    'breakout_buffer_pct': 0.3,
     'lookback_days': 10,
-    'min_volume_contraction_pct': 40.0, # QUALITY: 30% se 40% - Aur tight
-    'volume_expansion_ratio': 1.5, # QUALITY: 1.2x se 1.5x - Real breakout
-    'min_body_pct': 60.0, # QUALITY: 50% se 60% - Strong candle
-    'max_upper_wick_pct': 25.0, # QUALITY: 30% se 25% - No rejection
-    'time_stop_days': 8, # QUALITY: 10 se 8 - Jaldi nikal
+    'time_stop_days': 7, # 7 din me exit
     'risk_per_trade': 1000,
-    'cooldown_days': 20 # QUALITY: 15 se 20 - Ek stock me 20 din wait
+    'cooldown_days': 7 # 7 din cooldown - jaldi wapas entry
 }
 
 def get_or_create_ws(sh, title):
@@ -90,96 +86,51 @@ def calculate_rs_1m_10d(df, i, current_date, nifty_df):
     except:
         return None, None
 
-def check_volume_pattern(df, i, debug_counter):
-    if i < R['lookback_days']: return False, 0, 0
-
-    lookback_df = df.iloc[i-R['lookback_days']:i]
-    if lookback_df.empty: return False, 0, 0
-
-    max_high_idx = lookback_df['High'].idxmax()
-    max_high = lookback_df.loc[max_high_idx, 'High']
-    max_high_vol = lookback_df.loc[max_high_idx, 'Volume']
-    max_high_pos = lookback_df.index.get_loc(max_high_idx)
-
-    after_high_df = lookback_df.iloc[max_high_pos+1:]
-    if after_high_df.empty:
-        debug_counter['high_on_last_day'] += 1
-        return False, 0, 0
-
-    avg_vol_after = after_high_df['Volume'].mean()
-    if max_high_vol == 0: return False, 0, 0
-
-    contraction_pct = ((max_high_vol - avg_vol_after) / max_high_vol) * 100
-    if contraction_pct < R['min_volume_contraction_pct']:
-        debug_counter['no_volume_contraction'] += 1
-        return False, 0, 0
-
-    current_row = df.iloc[i]
-    breakout_level = max_high * (1 + R['breakout_buffer_pct']/100)
-
-    if current_row['Close'] <= breakout_level:
-        debug_counter['no_breakout'] += 1
-        return False, 0, 0
-
-    if current_row['Volume'] < max_high_vol * R['volume_expansion_ratio']:
-        debug_counter['no_volume_expansion'] += 1
-        return False, 0, 0
-
-    return True, max_high, max_high_vol
-
 def check_entry(df, i, current_date, debug_counter):
     row = df.iloc[i]
     if pd.isna(row['EMA200']) or pd.isna(row['RSI']) or pd.isna(row['Vol_MA20']):
         debug_counter['nan'] += 1
-        return False, 0, 0, 0
+        return False, 0, 0, 0 # FIXED: 4 values
 
     # 1. Trend Filter
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
-        return False, 0, 0, 0
+        return False, 0, 0, 0 # FIXED: 4 values
 
-    # 2. RSI 62-72
+    # 2. RSI 55-72
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
-        return False, 0, 0, 0
+        return False, 0, 0, 0 # FIXED: 4 values
 
-    # 3. Price Action - Strong Body + Low Wick
-    candle_range = row['High'] - row['Low']
-    if candle_range == 0: return False
-    if row['Close'] <= row['Open']:
-        debug_counter['red_candle'] += 1
-        return False
-    body_pct = (abs(row['Close'] - row['Open']) / candle_range) * 100
-    if body_pct < R['min_body_pct']:
-        debug_counter['small_body'] += 1
-        return False
-    upper_wick_pct = ((row['High'] - row['Close']) / candle_range) * 100
-    if upper_wick_pct > R['max_upper_wick_pct']:
-        debug_counter['long_wick'] += 1
-        return False
-
-    # 4. RS Check - QUALITY: 1M > 10, 10D > 6
+    # 3. RS Check - Nifty se 1M me 5%+, 10D me 3%+ aage
     rs_1m, rs_10d = calculate_rs_1m_10d(df, i, current_date, nifty_df)
     if rs_1m is None or rs_10d is None:
         debug_counter['rs_error'] += 1
-        return False, 0, 0, 0
+        return False, 0, 0, 0 # FIXED: 4 values
 
     if rs_1m < R['min_rs_1m'] or rs_10d < R['min_rs_10d']:
         debug_counter['rs_weak'] += 1
-        return False, 0, 0, 0
+        return False, 0, 0, 0 # FIXED: 4 values
 
-    if rs_10d <= rs_1m: # Accelerating chahiye
-        debug_counter['rs_not_accelerating'] += 1
-        return False, 0, 0, 0
+    # 4. 10D High Breakout
+    if i < R['lookback_days']:
+        return False, 0, 0, 0 # FIXED: 4 values
+    lookback_df = df.iloc[i-R['lookback_days']:i]
+    max_high = lookback_df['High'].max()
 
-    # 5. Volume Pattern - 40% contraction + 1.5x expansion
-    vol_pattern_ok, high_10d, vol_at_high = check_volume_pattern(df, i, debug_counter)
-    if not vol_pattern_ok:
-        return False, 0, 0, 0
+    breakout_level = max_high * (1 + R['breakout_buffer_pct']/100)
+    if row['Close'] <= breakout_level:
+        debug_counter['no_breakout'] += 1
+        return False, 0, 0, 0 # FIXED: 4 values
 
-    return True, rs_1m, rs_10d, high_10d
+    # 5. Volume Expansion Only
+    if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_blast_ratio']):
+        debug_counter['volume'] += 1
+        return False, 0, 0, 0 # FIXED: 4 values
+
+    return True, rs_1m, rs_10d, max_high
 
 def download_single_stock(stock):
     try:
@@ -204,7 +155,7 @@ total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
 
-debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'red_candle':0, 'small_body':0, 'long_wick':0, 'rs_weak':0, 'rs_not_accelerating':0, 'high_on_last_day':0, 'no_volume_contraction':0, 'no_breakout':0, 'no_volume_expansion':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
+debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'rs_weak':0, 'no_breakout':0, 'volume':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
 total_candles_checked = 0
 last_exit_dates = {}
 
@@ -321,18 +272,18 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - FINAL SNIPER", flush=True)
+print("DEBUG SUMMARY - CONTINUOUS FLOW", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - SNIPER", flush=True)
+print("FINAL RESULTS - CONTINUOUS FLOW", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nNo quality trades found with sniper rules.", flush=True)
+    print("\nNo trades found.", flush=True)
 else:
     total = len(df_bt)
     wins = len(df_bt[df_bt['Status'] == 'WIN'])
@@ -341,16 +292,20 @@ else:
     win_amt = df_bt[df_bt['Status']=='WIN']['PnL_Rs'].sum()
     loss_amt = abs(df_bt[df_bt['Status']=='LOSS']['PnL_Rs'].sum())
     pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
+    avg_days = round(df_bt['Days_Held'].mean(), 1)
 
     print(f"\nTotal Trades: {total} | WR: {winrate}% | PF: {pf} | PnL: Rs.{total_pnl:,.0f}", flush=True)
-    print(f"Avg RS: 1M={df_bt['RS_1M'].mean():.1f} | 10D={df_bt['RS_10D'].mean():.1f}", flush=True)
+    print(f"Avg Days Held: {avg_days} | Avg RS: 1M={df_bt['RS_1M'].mean():.1f} | 10D={df_bt['RS_10D'].mean():.1f}", flush=True)
+
+    trades_per_month = round(total / 12, 1)
+    print(f"Trades/Month: {trades_per_month} | Gap between trades: ~{round(250/total, 1)} days", flush=True)
 
 try:
-    ws_bt = get_or_create_ws(sh, "RS_SNIPER_BT")
+    ws_bt = get_or_create_ws(sh, "RS_FLOW_BT")
     ws_bt.clear()
     if not df_bt.empty:
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Saved to 'RS_SNIPER_BT' Sheet!", flush=True)
+        print(f"\n[SUCCESS] Saved to 'RS_FLOW_BT' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
