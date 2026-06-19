@@ -27,13 +27,13 @@ ws_watchlist = sh.worksheet("Watchlist")
 R = {
     'min_daily_value_cr': 0.3, 
     'sl_buffer_pct': 1.5,        
-    'target_r': 2.0,             # 1:2 Risk Reward Ratio
+    'target_r': 2.0,             # Improved RR for better Profit Factor
     'max_risk_pct': 4.5, 
     'vol_blast_ratio': 1.0,      
-    'adx_min': 20,               # Win rate badhane ke liye ADX 15 se badha kar 20 kiya (Strong Trend Only)
-    'rsi_min': 45,               # RSI floor thoda tighten kiya momentum ke liye
-    'rsi_max': 75,               # Overbought se bachne ke liye limit 75 ki
-    '52h_proximity': 0.85,       # Stock must be within top 15% of 52W High
+    'adx_min': 20,               # Filter out choppy/sideways markets
+    'rsi_min': 45,               # Ensure strong entry momentum
+    'rsi_max': 75,               # Avoid buying at absolute overbought peaks
+    '52h_proximity': 0.85,       # Must be within top 15% of 52W High (Strong Stocks Only)
     'time_stop_days': 10
 }
 S = {'spring_breach_pct': 0.01, 'spring_recover_pct': 0.005, 'max_spring_depth': 0.04}
@@ -76,25 +76,22 @@ def check_power_swing(df, i, debug_counter):
         debug_counter['nan'] += 1
         return False
 
-    # 1. Major Trend Check
+    # Sequential filtering flow to track rejections correctly
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
         return False
 
-    # 2. Pullback Check
     pullback = row['Low'] <= row['EMA20'] * 1.05
     if not pullback:
         debug_counter['pullback'] += 1
         return False
 
-    # 3. Green Candle Confirmation
     green = row['Close'] > row['Open']
     if not green:
         debug_counter['green'] += 1
         return False
 
-    # 4. Volume Check
     vol_avg = df['Volume'].iloc[max(0,i-20):i].mean()
     if pd.isna(vol_avg) or vol_avg < 1000:
         debug_counter['vol_avg'] += 1
@@ -105,13 +102,11 @@ def check_power_swing(df, i, debug_counter):
         debug_counter['volume'] += 1
         return False
 
-    # 5. RSI Filter (No Overbought entries)
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
         return False
 
-    # 6. ADX Filter (Strong Trend strength)
     adx_ok = row['ADX'] > R['adx_min']
     if not adx_ok:
         debug_counter['adx'] += 1
@@ -234,14 +229,13 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            # BUG FIX FIXED: `row['Close'] < (high_252 * 0.85)` filter kamzor stocks chun raha tha.
-            # Ab hum check kar rahe hain agar price 52W high se 15% se ZYADA niche hai toh reject karein.
+            # BUG FIX: Weak stocks filter hata kar strict 15% zone from 52W high kiya hai
             high_252 = df['High'].iloc[max(0,i-252):i].max()
             if not pd.isna(high_252) and row['Close'] < (high_252 * R['52h_proximity']):
                 debug_counter['52h'] += 1
                 continue
 
-            # Scan setups sequentially
+            # Check setups sequentially
             is_power_swing = check_power_swing(df, i, debug_counter)
             is_spring = check_spring_setup(df, i)
 
@@ -337,4 +331,3 @@ except Exception as e:
     print(f"GSheet upload error: {e}", flush=True)
 
 print("\n=== BACKTEST COMPLETE ===", flush=True)
-        
