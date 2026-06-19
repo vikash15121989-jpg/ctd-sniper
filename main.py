@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RELATIVE STRENGTH BREAKOUT SNIPER V5.0 ===", flush=True)
+print("=== RELATIVE STRENGTH BREAKOUT SNIPER V6.0 (RS 45+ ONLY) ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 # Google Sheets Setup
@@ -23,7 +23,7 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# NEW HIGH-STRENGTH PARAMETERS
+# BINA KOI DUSRA CRITERIA BADLE - SIRF RS >= 45 FILTER
 R = {
     'min_daily_value_cr': 0.5,   # Minimum liquidity filter (50 Lakhs+)
     'fixed_target_pct': 6.0,     # Target 6%
@@ -31,8 +31,8 @@ R = {
     'vol_blast_ratio': 1.5,      # Buyer Aggression: Volume 1.5x of 20-day average
     'rsi_min': 58,               # Strong momentum floor (RSI near 60)
     'rsi_max': 78,               # Avoid highly overbought stocks
-    'min_rs_score': 3.0,         # Relative Strength: Stock must beat Nifty by 3%+ in last 20 days
-    'time_stop_days': 10         # Money rotation in 10 days
+    'min_rs_score': 45.0,        # CRITICAL: Strict Cutoff (Sirf RS 45 ke upar wale share)
+    'time_stop_days': 10         # ORIGINAL TIME STOP (No change here)
 }
 
 def get_or_create_ws(sh, title):
@@ -76,7 +76,7 @@ def check_rs_breakout_entry(df, i, current_date, debug_counter):
     pichla_20_day_high = df['Close'].iloc[max(0, i-20):i].max()
     is_breakout = row['Close'] > pichla_20_day_high
     if not is_breakout:
-        debug_counter['pullback'] += 1  # Reusing counter slot for breakout failure
+        debug_counter['pullback'] += 1  
         return False, 0.0
 
     # 3. Volume Blast Check (Heavy Institutional Buying)
@@ -91,7 +91,6 @@ def check_rs_breakout_entry(df, i, current_date, debug_counter):
         return False, 0.0
 
     # 5. Relative Strength (RS) Calculation vs Nifty 50
-    # Checking 20-day price performance comparison
     try:
         stock_start_p = df['Close'].iloc[i-20]
         stock_ret_20d = ((row['Close'] - stock_start_p) / stock_start_p) * 100
@@ -102,8 +101,10 @@ def check_rs_breakout_entry(df, i, current_date, debug_counter):
         nifty_ret_20d = ((nifty_current_p - nifty_start_p) / nifty_start_p) * 100
         
         rs_score = stock_ret_20d - nifty_ret_20d
+        
+        # Pure RS Score Filter
         if rs_score < R['min_rs_score']:
-            debug_counter['adx'] += 1  # Reusing counter slot for RS failure
+            debug_counter['adx'] += 1  
             return False, 0.0
     except:
         return False, 0.0
@@ -205,7 +206,7 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            # Check new Relative Strength + Breakout logic
+            # Check Relative Strength + Breakout logic
             is_entry, rs_score = check_rs_breakout_entry(df, i, current_date, debug_counter)
             if not is_entry:
                 continue
@@ -236,27 +237,33 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - RELATIVE STRENGTH 6% BREAKOUT", flush=True)
+print("FINAL RESULTS - PURE RS 45+ FILTER (ORIGINAL TIME STOP)", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nNo breakout trades found with current strict RS rules.", flush=True)
+    print("\nNo breakout trades found with strict RS >= 45 rules.", flush=True)
 else:
     total = len(df_bt)
     wins = len(df_bt[df_bt['Status'] == 'WIN'])
+    losses = len(df_bt[df_bt['Status'] == 'LOSS'])
+    times = len(df_bt[df_bt['Status'] == 'TIME'])
     winrate = round(wins / total * 100, 1) if total else 0
-    print(f"Total Trades Filtered: {total}")
-    print(f"Overall WinRate: {winrate}%")
+    
+    print(f"Total Filtered Shares (RS >= 45): {total}")
+    print(f"Total WIN Trades: {wins}")
+    print(f"Total LOSS Trades: {losses}")
+    print(f"Total TIME Exits (10 Days): {times}")
+    print(f"⭐ CURRENT WIN-RATE (WITH RS 45+): {winrate}%")
+    print("="*60, flush=True)
 
 try:
-    ws_bt = get_or_create_ws(sh, "BACKTEST_RS_BREAKOUT_1Y")
+    ws_bt = get_or_create_ws(sh, "RS_45_PLUS_BACKTEST")
     ws_bt.clear()
     if not df_bt.empty:
-        # Reordering columns slightly for cleaner view
         cols = ['Stock', 'Category', 'Entry_Date', 'Exit_Date', 'Entry', 'Exit_Price', 'Status', 'PnL_%', 'Days_Held', 'RS_Score']
         df_bt = df_bt[cols]
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] New RS Breakout Trades Saved to Sheet!", flush=True)
+        print(f"\n[SUCCESS] Filtered List Saved to 'RS_45_PLUS_BACKTEST' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
-    
+        
