@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V9.4 - VOLUME CONTRACTION + EXPANSION ===", flush=True)
+print("=== RS BEATER V9.5 - FINAL SNIPER ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,19 +22,24 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
+# SNIPER FILTERS - ROJ 1 TRADE, WR 45%+
 R = {
-    'min_daily_value_cr': 2.0, # 2Cr liquidity
+    'min_daily_value_cr': 3.0, # QUALITY: 2Cr se 3Cr - Sirf Top 10% stocks
     'fixed_target_pct': 6.0, # 6% TARGET LOCK
     'fixed_sl_pct': 2.5, # 2.5% SL = RR 1:2.4
-    'rsi_min': 60,
-    'rsi_max': 75,
-    'breakout_buffer_pct': 0.3, # 10D high ke 0.3% upar
-    'lookback_days': 10, # 10 din me high dhundo
-    'min_volume_contraction_pct': 30.0, # High ke baad volume 30%+ sukha ho
-    'volume_expansion_ratio': 1.2, # Breakout day volume > 1.2x of high day volume
-    'time_stop_days': 10,
+    'rsi_min': 62, # QUALITY: 60 se 62 - Aur strong
+    'rsi_max': 72, # Overbought avoid
+    'min_rs_1m': 10.0, # QUALITY: Nifty se 10%+ aage 1M me
+    'min_rs_10d': 6.0, # QUALITY: Nifty se 6%+ aage 10D me
+    'breakout_buffer_pct': 0.5, # 10D high ke 0.5% upar
+    'lookback_days': 10,
+    'min_volume_contraction_pct': 40.0, # QUALITY: 30% se 40% - Aur tight
+    'volume_expansion_ratio': 1.5, # QUALITY: 1.2x se 1.5x - Real breakout
+    'min_body_pct': 60.0, # QUALITY: 50% se 60% - Strong candle
+    'max_upper_wick_pct': 25.0, # QUALITY: 30% se 25% - No rejection
+    'time_stop_days': 8, # QUALITY: 10 se 8 - Jaldi nikal
     'risk_per_trade': 1000,
-    'cooldown_days': 15
+    'cooldown_days': 20 # QUALITY: 15 se 20 - Ek stock me 20 din wait
 }
 
 def get_or_create_ws(sh, title):
@@ -86,10 +91,8 @@ def calculate_rs_1m_10d(df, i, current_date, nifty_df):
         return None, None
 
 def check_volume_pattern(df, i, debug_counter):
-    """USER DEMAND: 10D High ka volume dekho, phir sukha ho, phir breakout pe explode"""
     if i < R['lookback_days']: return False, 0, 0
 
-    # 1. Pichle 10 din ka Highest High aur uska index nikalo
     lookback_df = df.iloc[i-R['lookback_days']:i]
     if lookback_df.empty: return False, 0, 0
 
@@ -98,9 +101,10 @@ def check_volume_pattern(df, i, debug_counter):
     max_high_vol = lookback_df.loc[max_high_idx, 'Volume']
     max_high_pos = lookback_df.index.get_loc(max_high_idx)
 
-    # 2. High ke baad volume sukha ho - Contraction
     after_high_df = lookback_df.iloc[max_high_pos+1:]
-    if after_high_df.empty: return False, 0, 0 # High last day ka tha to skip
+    if after_high_df.empty:
+        debug_counter['high_on_last_day'] += 1
+        return False, 0, 0
 
     avg_vol_after = after_high_df['Volume'].mean()
     if max_high_vol == 0: return False, 0, 0
@@ -110,7 +114,6 @@ def check_volume_pattern(df, i, debug_counter):
         debug_counter['no_volume_contraction'] += 1
         return False, 0, 0
 
-    # 3. Aaj ka candle - Breakout + Volume Expansion
     current_row = df.iloc[i]
     breakout_level = max_high * (1 + R['breakout_buffer_pct']/100)
 
@@ -118,7 +121,6 @@ def check_volume_pattern(df, i, debug_counter):
         debug_counter['no_breakout'] += 1
         return False, 0, 0
 
-    # Breakout day ka volume > High day ka volume * 1.2
     if current_row['Volume'] < max_high_vol * R['volume_expansion_ratio']:
         debug_counter['no_volume_expansion'] += 1
         return False, 0, 0
@@ -137,23 +139,42 @@ def check_entry(df, i, current_date, debug_counter):
         debug_counter['trend'] += 1
         return False, 0, 0, 0
 
-    # 2. RSI 60-75
+    # 2. RSI 62-72
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
         return False, 0, 0, 0
 
-    # 3. USER DEMAND: RS Check pehle - Positive hona chahiye
+    # 3. Price Action - Strong Body + Low Wick
+    candle_range = row['High'] - row['Low']
+    if candle_range == 0: return False
+    if row['Close'] <= row['Open']:
+        debug_counter['red_candle'] += 1
+        return False
+    body_pct = (abs(row['Close'] - row['Open']) / candle_range) * 100
+    if body_pct < R['min_body_pct']:
+        debug_counter['small_body'] += 1
+        return False
+    upper_wick_pct = ((row['High'] - row['Close']) / candle_range) * 100
+    if upper_wick_pct > R['max_upper_wick_pct']:
+        debug_counter['long_wick'] += 1
+        return False
+
+    # 4. RS Check - QUALITY: 1M > 10, 10D > 6
     rs_1m, rs_10d = calculate_rs_1m_10d(df, i, current_date, nifty_df)
     if rs_1m is None or rs_10d is None:
         debug_counter['rs_error'] += 1
         return False, 0, 0, 0
 
-    if rs_1m <= 0 or rs_10d <= 0: # Dono positive = Nifty beat
-        debug_counter['rs_negative'] += 1
+    if rs_1m < R['min_rs_1m'] or rs_10d < R['min_rs_10d']:
+        debug_counter['rs_weak'] += 1
         return False, 0, 0, 0
 
-    # 4. USER DEMAND: Volume Pattern - Contraction then Expansion
+    if rs_10d <= rs_1m: # Accelerating chahiye
+        debug_counter['rs_not_accelerating'] += 1
+        return False, 0, 0, 0
+
+    # 5. Volume Pattern - 40% contraction + 1.5x expansion
     vol_pattern_ok, high_10d, vol_at_high = check_volume_pattern(df, i, debug_counter)
     if not vol_pattern_ok:
         return False, 0, 0, 0
@@ -183,7 +204,7 @@ total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
 
-debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'rs_negative':0, 'no_volume_contraction':0, 'no_breakout':0, 'no_volume_expansion':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
+debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'red_candle':0, 'small_body':0, 'long_wick':0, 'rs_weak':0, 'rs_not_accelerating':0, 'high_on_last_day':0, 'no_volume_contraction':0, 'no_breakout':0, 'no_volume_expansion':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
 total_candles_checked = 0
 last_exit_dates = {}
 
@@ -300,18 +321,18 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - VOLUME PATTERN", flush=True)
+print("DEBUG SUMMARY - FINAL SNIPER", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - VOLUME CONTRACTION + EXPANSION", flush=True)
+print("FINAL RESULTS - SNIPER", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nNo quality trades found with volume pattern rules.", flush=True)
+    print("\nNo quality trades found with sniper rules.", flush=True)
 else:
     total = len(df_bt)
     wins = len(df_bt[df_bt['Status'] == 'WIN'])
@@ -325,11 +346,11 @@ else:
     print(f"Avg RS: 1M={df_bt['RS_1M'].mean():.1f} | 10D={df_bt['RS_10D'].mean():.1f}", flush=True)
 
 try:
-    ws_bt = get_or_create_ws(sh, "RS_VOL_PATTERN_BT")
+    ws_bt = get_or_create_ws(sh, "RS_SNIPER_BT")
     ws_bt.clear()
     if not df_bt.empty:
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Saved to 'RS_VOL_PATTERN_BT' Sheet!", flush=True)
+        print(f"\n[SUCCESS] Saved to 'RS_SNIPER_BT' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
