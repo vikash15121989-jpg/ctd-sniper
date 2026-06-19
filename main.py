@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== POWER SPRING HYBRID V2.1 - ALL BUGS FIXED ===", flush=True)
+print("=== POWER SPRING HYBRID V2.2 - WIN RATE OPTIMIZED ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 # Google Sheets Setup
@@ -26,14 +26,14 @@ ws_watchlist = sh.worksheet("Watchlist")
 # FIXED PARAMETERS
 R = {
     'min_daily_value_cr': 0.3, 
-    'sl_buffer_pct': 1.5,        # 2% se thoda kam kiya for better RR
-    'target_r': 2.0,             # Target badha kar 1:2 kiya high accuracy ke liye
+    'sl_buffer_pct': 1.5,        
+    'target_r': 2.0,             # 1:2 Risk Reward Ratio
     'max_risk_pct': 4.5, 
-    'vol_blast_ratio': 1.0,      # BUG FIX: Pullback par blast ki zarurat nahi, average volume kaafi hai
-    'adx_min': 15,
-    'rsi_min': 40, 
-    'rsi_max': 80, 
-    '52h_proximity': 0.85,       # BUG FIX: Ab stock 52W High ke 15% range ke andar hona chahiye (Strong Stocks)
+    'vol_blast_ratio': 1.0,      
+    'adx_min': 20,               # Win rate badhane ke liye ADX 15 se badha kar 20 kiya (Strong Trend Only)
+    'rsi_min': 45,               # RSI floor thoda tighten kiya momentum ke liye
+    'rsi_max': 75,               # Overbought se bachne ke liye limit 75 ki
+    '52h_proximity': 0.85,       # Stock must be within top 15% of 52W High
     'time_stop_days': 10
 }
 S = {'spring_breach_pct': 0.01, 'spring_recover_pct': 0.005, 'max_spring_depth': 0.04}
@@ -76,21 +76,25 @@ def check_power_swing(df, i, debug_counter):
         debug_counter['nan'] += 1
         return False
 
+    # 1. Major Trend Check
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
         return False
 
+    # 2. Pullback Check
     pullback = row['Low'] <= row['EMA20'] * 1.05
     if not pullback:
         debug_counter['pullback'] += 1
         return False
 
+    # 3. Green Candle Confirmation
     green = row['Close'] > row['Open']
     if not green:
         debug_counter['green'] += 1
         return False
 
+    # 4. Volume Check
     vol_avg = df['Volume'].iloc[max(0,i-20):i].mean()
     if pd.isna(vol_avg) or vol_avg < 1000:
         debug_counter['vol_avg'] += 1
@@ -101,11 +105,13 @@ def check_power_swing(df, i, debug_counter):
         debug_counter['volume'] += 1
         return False
 
+    # 5. RSI Filter (No Overbought entries)
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
         return False
 
+    # 6. ADX Filter (Strong Trend strength)
     adx_ok = row['ADX'] > R['adx_min']
     if not adx_ok:
         debug_counter['adx'] += 1
@@ -145,7 +151,7 @@ def download_single_stock(stock):
         return None, stock
 
 all_trades = []
-stocks = ws_watchlist.col_values(1)[1:] # Header skip
+stocks = ws_watchlist.col_values(1)[1:] 
 stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip()])))
 total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
@@ -228,13 +234,14 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            # BUG FIX: 52W High Proximity Fix (Ab check karega ki stock 52W High se max 15% niche ho, yaani strong ho)
+            # BUG FIX FIXED: `row['Close'] < (high_252 * 0.85)` filter kamzor stocks chun raha tha.
+            # Ab hum check kar rahe hain agar price 52W high se 15% se ZYADA niche hai toh reject karein.
             high_252 = df['High'].iloc[max(0,i-252):i].max()
             if not pd.isna(high_252) and row['Close'] < (high_252 * R['52h_proximity']):
                 debug_counter['52h'] += 1
                 continue
 
-            # BUG FIX: Dono setups ko alag alag scan karenge bina collision ke
+            # Scan setups sequentially
             is_power_swing = check_power_swing(df, i, debug_counter)
             is_spring = check_spring_setup(df, i)
 
@@ -243,13 +250,13 @@ for batch_num in range(total_batches):
 
             # Category Decision Logic
             if is_power_swing and is_spring:
-                category = 'A'  # Hybrid Best Setup
+                category = 'A'  
                 sl_base = df['Low'].iloc[i-1]
             elif is_power_swing:
-                category = 'B'  # Only Power Swing
+                category = 'B'  
                 sl_base = row['EMA20'] * 0.98
             else:
-                category = 'C'  # Only Spring Setup
+                category = 'C'  
                 sl_base = df['Low'].iloc[i-1]
 
             entry_price = row['Close']
@@ -261,7 +268,7 @@ for batch_num in range(total_batches):
                 continue
                 
             target = entry_price + risk * R['target_r']
-            qty = int(1000 / risk) if risk > 0 else 0  # Per trade risk approx Rs. 1000
+            qty = int(1000 / risk) if risk > 0 else 0  
             if qty == 0: continue
 
             open_positions.append({
@@ -270,7 +277,7 @@ for batch_num in range(total_batches):
                 'Target': round(target, 2), 'Qty': qty
             })
 
-    # Close Remaining Open Positions at final market price
+    # Close Remaining Open Positions
     for pos in open_positions:
         df = stock_data[pos['Stock']]
         exit_price = df['Close'].iloc[-1]
@@ -330,3 +337,4 @@ except Exception as e:
     print(f"GSheet upload error: {e}", flush=True)
 
 print("\n=== BACKTEST COMPLETE ===", flush=True)
+        
