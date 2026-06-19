@@ -11,10 +11,10 @@ warnings.filterwarnings('ignore')
 
 BACKTEST_MODE = True
 BACKTEST_END = datetime.now().date()
-BACKTEST_START = BACKTEST_END - timedelta(days=365) # 1 SAAL
+BACKTEST_START = BACKTEST_END - timedelta(days=365) # 1 SAAL BACKTEST
 BATCH_SIZE = 50
 
-print("=== RS BEATER V14 - 6% SNIPER SYSTEM ===", flush=True)
+print("=== RS BEATER V14.1 - 6% SNIPER FINAL ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,22 +22,23 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# 6% KA RULE - FIXED
+# 6% SNIPER RULES - FIXED TARGET
 R = {
-    'min_daily_value_cr': 15.0, # 15Cr liquidity - Entry/exit easy
+    'min_daily_value_cr': 50.0, # 50Cr liquidity - Sirf Nifty100 level
     'fixed_target_pct': 6.0, # EXACT 6% TARGET
     'fixed_sl_pct': 3.0, # EXACT 3% SL = RR 1:2
     'momentum_5d_min': 8.0, # 5 din me 8%+ chalna chahiye
-    'momentum_5d_max': 15.0, # 15% se zyada chala = Overextended
-    'pullback_pct': 2.5, # 5D high se 2.5% pullback pe entry
-    'rsi_min': 60,
-    'rsi_max': 75,
-    'rs_1m_min': 6.0, # Nifty se 1 mahine me 6%+ aage
-    'vol_ratio_min': 1.5, # 1.5x volume minimum
-    'time_stop_days': 8, # 8 din me exit - Max hold
-    'risk_per_trade': 2000, # 2k risk per trade
-    'cooldown_days': 10, # 10 din cooldown
-    'max_open_trades': 3 # Max 3 position
+    'momentum_5d_max': 12.0, # 12% se zyada = Overextended
+    'pullback_pct': 2.0, # 5D high se 2% pullback pe entry
+    'rsi_min': 62,
+    'rsi_max': 72,
+    'rs_1m_min': 8.0, # Nifty se 1 mahine me 8%+ aage
+    'vol_ratio_min': 2.0, # 2x volume minimum
+    'time_stop_days': 6, # 6 din me exit max
+    'risk_per_trade': 3000, # 3k risk per trade
+    'cooldown_days': 15, # 15 din cooldown
+    'max_open_trades': 2, # Max 2 position
+    'min_base_days': 10, # 10 din ka tight base chahiye
 }
 
 def get_or_create_ws(sh, title):
@@ -55,7 +56,6 @@ def calculate_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 5D Momentum
     df['Ret_5D'] = df['Close'].pct_change(5) * 100
     df['High_5D'] = df['High'].rolling(5).max()
     return df
@@ -96,32 +96,41 @@ def check_entry(df, i, current_date, debug_counter):
         debug_counter['trend'] += 1
         return False, 0, 0
 
-    # 2. RSI 60-75: Momentum zone
+    # 2. BASE CHECK: Pichle 10 din me 12% se zyada range nahi
+    if i < 10: return False, 0, 0
+    high_10d = df['High'].iloc[i-10:i].max()
+    low_10d = df['Low'].iloc[i-10:i].min()
+    base_range = (high_10d - low_10d) / low_10d
+    if base_range > 0.12:
+        debug_counter['no_base'] += 1
+        return False, 0, 0
+
+    # 3. RSI 62-72: Strong momentum zone
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
         return False, 0, 0
 
-    # 3. MOMENTUM BURST: 5 din me 8-15% chala ho
+    # 4. MOMENTUM BURST: 5 din me 8-12%
     mom_5d = row['Ret_5D']
     if not (R['momentum_5d_min'] <= mom_5d <= R['momentum_5d_max']):
         debug_counter['momentum'] += 1
         return False, 0, 0
 
-    # 4. PULLBACK ENTRY: 5D high se 2-3% neeche ho
+    # 5. PULLBACK ENTRY: 5D high se 2% pullback
     high_5d = row['High_5D']
     pullback_from_high = ((high_5d - row['Close']) / high_5d) * 100
-    if pullback_from_high < R['pullback_pct'] or pullback_from_high > 5.0:
+    if pullback_from_high < R['pullback_pct'] or pullback_from_high > 4.0:
         debug_counter['no_pullback'] += 1
         return False, 0, 0
 
-    # 5. RS 1M > 6%: Nifty se strong
+    # 6. RS 1M > 8%: Market leader
     rs_1m = calculate_rs_1m(df, i, current_date, nifty_df)
     if rs_1m is None or rs_1m < R['rs_1m_min']:
         debug_counter['rs_weak'] += 1
         return False, 0, 0
 
-    # 6. VOLUME: 1.5x minimum
+    # 7. VOLUME: 2x minimum
     if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_ratio_min']):
         debug_counter['volume'] += 1
         return False, 0, 0
@@ -151,7 +160,7 @@ total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
 
-debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'momentum':0, 'no_pullback':0,
+debug_counter = {'nan':0, 'trend':0, 'no_base':0, 'rsi':0, 'momentum':0, 'no_pullback':0,
                 'rs_weak':0, 'volume':0, 'liquidity':0, 'cooldown':0, 'max_positions':0}
 total_candles_checked = 0
 last_exit_dates = {}
@@ -188,7 +197,6 @@ for batch_num in range(total_batches):
             exit_status = None
             days_held = (current_dt - pd.to_datetime(pos['Entry_Date']).date()).days
 
-            # SL pehle check - Risk management
             if sl_hit:
                 exit_price = pos['SL']; exit_status = 'LOSS'
             elif target_hit:
@@ -272,14 +280,14 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - 6% SNIPER", flush=True)
+print("DEBUG SUMMARY - 6% SNIPER V14.1", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 6% SNIPER", flush=True)
+print("FINAL RESULTS - 6% SNIPER V14.1", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
