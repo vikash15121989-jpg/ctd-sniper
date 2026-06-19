@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V9.1 - RESISTANCE BREAKOUT ===", flush=True)
+print("=== RS BEATER V9.4 - VOLUME CONTRACTION + EXPANSION ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -23,18 +23,18 @@ sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
 R = {
-    'min_daily_value_cr': 1.0, # 1Cr liquidity
+    'min_daily_value_cr': 2.0, # 2Cr liquidity
     'fixed_target_pct': 6.0, # 6% TARGET LOCK
-    'fixed_sl_pct': 3.0, # 3% SL = 1:2 RR
-    'vol_blast_ratio': 1.5, # 1.5x volume
-    'rsi_min': 55,
-    'rsi_max': 78,
-    'breakout_buffer_pct': 0.2, # Resistance ke 0.2% upar close
-    'resistance_lookback': 20, # 20 din me resistance dhundo
-    'resistance_touches': 2, # Kam se kam 2 baar touch hona chahiye
+    'fixed_sl_pct': 2.5, # 2.5% SL = RR 1:2.4
+    'rsi_min': 60,
+    'rsi_max': 75,
+    'breakout_buffer_pct': 0.3, # 10D high ke 0.3% upar
+    'lookback_days': 10, # 10 din me high dhundo
+    'min_volume_contraction_pct': 30.0, # High ke baad volume 30%+ sukha ho
+    'volume_expansion_ratio': 1.2, # Breakout day volume > 1.2x of high day volume
     'time_stop_days': 10,
     'risk_per_trade': 1000,
-    'cooldown_days': 10
+    'cooldown_days': 15
 }
 
 def get_or_create_ws(sh, title):
@@ -53,25 +53,6 @@ def calculate_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
-
-def find_resistance(df, i):
-    """USER DEMAND: 20D me 2+ baar touch hua level = Resistance"""
-    if i < R['resistance_lookback']: return None
-
-    lookback = df['High'].iloc[i-R['resistance_lookback']:i]
-    if lookback.empty: return None
-
-    # Sabse zyada baar touch hua high dhundo
-    highs = lookback.round(2) # 2 decimal tak round taaki same level count ho
-    value_counts = highs.value_counts()
-
-    # Kam se kam 2 baar touch hona chahiye
-    valid_resistance = value_counts[value_counts >= R['resistance_touches']]
-    if valid_resistance.empty: return None
-
-    # Sabse bada resistance level jo 2+ baar touch hua
-    resistance = valid_resistance.index.max()
-    return resistance
 
 print("\n Downloading Nifty 50 reference data...", flush=True)
 nifty_df = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=400), end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
@@ -104,52 +85,80 @@ def calculate_rs_1m_10d(df, i, current_date, nifty_df):
     except:
         return None, None
 
+def check_volume_pattern(df, i, debug_counter):
+    """USER DEMAND: 10D High ka volume dekho, phir sukha ho, phir breakout pe explode"""
+    if i < R['lookback_days']: return False, 0, 0
+
+    # 1. Pichle 10 din ka Highest High aur uska index nikalo
+    lookback_df = df.iloc[i-R['lookback_days']:i]
+    if lookback_df.empty: return False, 0, 0
+
+    max_high_idx = lookback_df['High'].idxmax()
+    max_high = lookback_df.loc[max_high_idx, 'High']
+    max_high_vol = lookback_df.loc[max_high_idx, 'Volume']
+    max_high_pos = lookback_df.index.get_loc(max_high_idx)
+
+    # 2. High ke baad volume sukha ho - Contraction
+    after_high_df = lookback_df.iloc[max_high_pos+1:]
+    if after_high_df.empty: return False, 0, 0 # High last day ka tha to skip
+
+    avg_vol_after = after_high_df['Volume'].mean()
+    if max_high_vol == 0: return False, 0, 0
+
+    contraction_pct = ((max_high_vol - avg_vol_after) / max_high_vol) * 100
+    if contraction_pct < R['min_volume_contraction_pct']:
+        debug_counter['no_volume_contraction'] += 1
+        return False, 0, 0
+
+    # 3. Aaj ka candle - Breakout + Volume Expansion
+    current_row = df.iloc[i]
+    breakout_level = max_high * (1 + R['breakout_buffer_pct']/100)
+
+    if current_row['Close'] <= breakout_level:
+        debug_counter['no_breakout'] += 1
+        return False, 0, 0
+
+    # Breakout day ka volume > High day ka volume * 1.2
+    if current_row['Volume'] < max_high_vol * R['volume_expansion_ratio']:
+        debug_counter['no_volume_expansion'] += 1
+        return False, 0, 0
+
+    return True, max_high, max_high_vol
+
 def check_entry(df, i, current_date, debug_counter):
     row = df.iloc[i]
     if pd.isna(row['EMA200']) or pd.isna(row['RSI']) or pd.isna(row['Vol_MA20']):
         debug_counter['nan'] += 1
-        return False, 0, 0
+        return False, 0, 0, 0
 
     # 1. Trend Filter
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
-        return False, 0, 0
+        return False, 0, 0, 0
 
-    # 2. USER DEMAND: Resistance Breakout
-    resistance = find_resistance(df, i)
-    if resistance is None:
-        debug_counter['no_resistance'] += 1
-        return False, 0, 0
-
-    breakout_level = resistance * (1 + R['breakout_buffer_pct']/100)
-    is_breakout = row['Close'] > breakout_level
-    if not is_breakout:
-        debug_counter['breakout'] += 1
-        return False, 0, 0
-
-    # 3. Volume 1.5x
-    if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_blast_ratio']):
-        debug_counter['volume'] += 1
-        return False, 0, 0
-
-    # 4. RSI 55-78
+    # 2. RSI 60-75
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
-        return False, 0, 0
+        return False, 0, 0, 0
 
-    # 5. USER DEMAND: 1M RS aur 10D RS dono Nifty ko beat kare
+    # 3. USER DEMAND: RS Check pehle - Positive hona chahiye
     rs_1m, rs_10d = calculate_rs_1m_10d(df, i, current_date, nifty_df)
     if rs_1m is None or rs_10d is None:
         debug_counter['rs_error'] += 1
-        return False, 0, 0
+        return False, 0, 0, 0
 
-    if rs_1m <= 0 or rs_10d <= 0:
-        debug_counter['rs_not_beating'] += 1
-        return False, 0, 0
+    if rs_1m <= 0 or rs_10d <= 0: # Dono positive = Nifty beat
+        debug_counter['rs_negative'] += 1
+        return False, 0, 0, 0
 
-    return True, rs_1m, rs_10d
+    # 4. USER DEMAND: Volume Pattern - Contraction then Expansion
+    vol_pattern_ok, high_10d, vol_at_high = check_volume_pattern(df, i, debug_counter)
+    if not vol_pattern_ok:
+        return False, 0, 0, 0
+
+    return True, rs_1m, rs_10d, high_10d
 
 def download_single_stock(stock):
     try:
@@ -174,7 +183,7 @@ total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
 
-debug_counter = {'nan':0, 'trend':0, 'no_resistance':0, 'breakout':0, 'volume':0, 'rsi':0, 'rs_not_beating':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
+debug_counter = {'nan':0, 'trend':0, 'rsi':0, 'rs_negative':0, 'no_volume_contraction':0, 'no_breakout':0, 'no_volume_expansion':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
 total_candles_checked = 0
 last_exit_dates = {}
 
@@ -228,7 +237,7 @@ for batch_num in range(total_batches):
                     'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
                     'Status': exit_status, 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
                     'Days_Held': days_held, 'RS_1M': pos['RS_1M'], 'RS_10D': pos['RS_10D'],
-                    'Resistance': pos['Resistance'], 'Qty': pos['Qty']
+                    '10D_High': pos['10D_High'], 'Qty': pos['Qty']
                 })
                 last_exit_dates[pos['Stock']] = current_dt
                 open_positions.remove(pos)
@@ -255,12 +264,11 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            is_entry, rs_1m, rs_10d = check_entry(df, i, current_date, debug_counter)
+            is_entry, rs_1m, rs_10d, high_10d = check_entry(df, i, current_date, debug_counter)
             if not is_entry:
                 continue
 
             entry_price = row['Close']
-            resistance = find_resistance(df, i) # Sheet ke liye save kar le
             target_price = entry_price * (1 + R['fixed_target_pct']/100)
             sl_price = entry_price * (1 - R['fixed_sl_pct']/100)
 
@@ -272,7 +280,7 @@ for batch_num in range(total_batches):
                 'Stock': stock, 'Entry_Date': current_date,
                 'Entry': round(entry_price, 2), 'SL': round(sl_price, 2),
                 'Target': round(target_price, 2), 'RS_1M': rs_1m, 'RS_10D': rs_10d,
-                'Resistance': round(resistance, 2), 'Qty': qty
+                '10D_High': round(high_10d, 2), 'Qty': qty
             })
 
     for pos in open_positions:
@@ -286,24 +294,24 @@ for batch_num in range(total_batches):
             'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
             'Status': 'TIME', 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
             'Days_Held': (BACKTEST_END - pd.to_datetime(pos['Entry_Date']).date()).days,
-            'RS_1M': pos['RS_1M'], 'RS_10D': pos['RS_10D'], 'Resistance': pos['Resistance'], 'Qty': pos['Qty']
+            'RS_1M': pos['RS_1M'], 'RS_10D': pos['RS_10D'], '10D_High': pos['10D_High'], 'Qty': pos['Qty']
         })
 
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - RESISTANCE BREAKOUT", flush=True)
+print("DEBUG SUMMARY - VOLUME PATTERN", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - RESISTANCE BREAKOUT", flush=True)
+print("FINAL RESULTS - VOLUME CONTRACTION + EXPANSION", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nNo trades found.", flush=True)
+    print("\nNo quality trades found with volume pattern rules.", flush=True)
 else:
     total = len(df_bt)
     wins = len(df_bt[df_bt['Status'] == 'WIN'])
@@ -317,11 +325,11 @@ else:
     print(f"Avg RS: 1M={df_bt['RS_1M'].mean():.1f} | 10D={df_bt['RS_10D'].mean():.1f}", flush=True)
 
 try:
-    ws_bt = get_or_create_ws(sh, "RS_RESISTANCE_BT")
+    ws_bt = get_or_create_ws(sh, "RS_VOL_PATTERN_BT")
     ws_bt.clear()
     if not df_bt.empty:
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Saved to 'RS_RESISTANCE_BT' Sheet!", flush=True)
+        print(f"\n[SUCCESS] Saved to 'RS_VOL_PATTERN_BT' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
