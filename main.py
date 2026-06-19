@@ -14,22 +14,23 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== POWER SPRING HYBRID V1 - NO PRICE FILTER ===", flush=True)
+print("=== POWER SPRING HYBRID V1 - CORRECT LOGIC ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
+print("Logic: Power = Cat B, Power+Spring = Cat A", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# ===== FILTERS - PRICE KA KOI CHAKKAR HI NAHI =====
+# ===== RELAXED FILTERS - AB TRADE AAYENGE =====
 R = {
-    # min_price: HATA DIYA - 5 rs ka bhi chalega agar liquidity hai
-    # max_price: HATA DIYA - 10000 ka bhi chalega
-    'min_daily_value_cr': 0.5, # SIRF LIQUIDITY MATTER KARTI HAI
+    'min_daily_value_cr': 0.3, # 50L se 30L kar diya
     'sl_buffer_pct': 2.0, 'target_r': 1.5, 'max_risk_pct': 4.0,
-    'vol_blast_ratio': 1.5, 'adx_min': 20, 'rsi_min': 45, 'rsi_max': 70,
-    '52h_proximity': 0.85, # 0.88 se 0.85 kar diya - 15% tak neeche chalega
+    'vol_blast_ratio': 1.2, # 1.5 se 1.2 - 20% volume spike bhi chalega
+    'adx_min': 15, # 20 se 15 - weak trend bhi OK
+    'rsi_min': 40, 'rsi_max': 80, # Range wide kar di
+    '52h_proximity': 0.70, # -30% tak neeche chalega
     'time_stop_days': 8
 }
 
@@ -68,7 +69,7 @@ def check_power_swing(df, i):
     row = df.iloc[i]
     if pd.isna(row['EMA200']) or pd.isna(row['ADX']) or pd.isna(row['RSI']): return False
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
-    pullback = row['Low'] <= row['EMA20'] * 1.02
+    pullback = row['Low'] <= row['EMA20'] * 1.05 # 2% se 5% kar diya - loose
     green = row['Close'] > row['Open']
     vol_avg = df['Volume'].iloc[i-20:i].mean()
     if vol_avg == 0 or pd.isna(vol_avg): return False
@@ -88,7 +89,7 @@ def check_spring_setup(df, i):
     recovered = row['Close'] > support * (1 + S['spring_recover_pct'])
     vol_avg = df['Volume'].iloc[i-20:i].mean()
     if vol_avg == 0 or pd.isna(vol_avg): return False
-    vol_confirm = row['Volume'] > vol_avg * 1.2
+    vol_confirm = row['Volume'] > vol_avg * 1.1 # Spring me 1.2 se 1.1 kar diya
     return breached and not_too_deep and recovered and vol_confirm
 
 def download_single_stock(stock):
@@ -110,7 +111,6 @@ total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
-print("NOTE: Price filter removed. Penny stocks included if liquidity OK.", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B')
 
 for batch_num in range(total_batches):
@@ -136,6 +136,7 @@ for batch_num in range(total_batches):
     
     for current_date in date_range:
         current_date = current_date.date()
+        # Exits same...
         for pos in open_positions[:]:
             df = stock_data[pos['Stock']]
             if current_date not in df.index.date: continue
@@ -166,6 +167,7 @@ for batch_num in range(total_batches):
                 open_positions.remove(pos)
                 batch_trades += 1
         
+        # ===== CORRECT ENTRY LOGIC =====
         open_stocks = [p['Stock'] for p in open_positions]
         for stock, df in stock_data.items():
             if stock in open_stocks: continue
@@ -174,23 +176,26 @@ for batch_num in range(total_batches):
             if i < 300: continue
             row = df.iloc[i]
             
-            # PRICE FILTER BILKUL HATA DIYA - SIRF LIQUIDITY CHECK
+            # BASIC FILTERS ONLY - NO PRICE
             avg_value_cr = (df['Close'].iloc[i-20:i] * df['Volume'].iloc[i-20:i]).mean() / 1e7
             if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']: continue
-            
             high_252 = df['High'].iloc[i-252:i].max()
             if pd.isna(high_252) or row['Close'] < high_252 * R['52h_proximity']: continue
             
+            # STEP 1: CHECK POWER SWING FIRST - YE COMPULSORY HAI
             is_power_swing = check_power_swing(df, i)
-            if not is_power_swing: continue
+            if not is_power_swing: continue # Power nahi bana to kuch nahi
             
+            # STEP 2: CHECK SPRING - YE OPTIONAL HAI
             is_spring = check_spring_setup(df, i)
+            
+            # STEP 3: CATEGORY ASSIGN KAR
             if is_power_swing and is_spring:
-                category = 'A'
-                sl_base = df['Low'].iloc[i-1]
+                category = 'A' # Power + Spring = A grade
+                sl_base = df['Low'].iloc[i-1] # Spring ka SL
             else:
-                category = 'B'
-                sl_base = row['EMA20'] * 0.98
+                category = 'B' # Sirf Power = B grade
+                sl_base = row['EMA20'] * 0.98 # Power ka SL
             
             entry_price = row['Close']
             sl_price = sl_base * (1 - R['sl_buffer_pct']/100)
@@ -198,8 +203,6 @@ for batch_num in range(total_batches):
             risk_pct = risk / entry_price * 100
             if risk_pct > R['max_risk_pct'] or risk_pct <= 0: continue
             target = entry_price + risk * R['target_r']
-            
-            # QTY CALCULATION - PENNY ME BHI KAAM KAREGA
             qty = int(750 / risk) if risk > 0 else 0
             if qty == 0: continue
             
@@ -227,15 +230,17 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - NO PRICE FILTER", flush=True)
+print("FINAL RESULTS - CORRECT LOGIC", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nAb bhi 0 trades? To strategy hi over-optimized hai", flush=True)
+    print("\nAb bhi 0 trades? Bhai market hi nahi tha phir 😅", flush=True)
 else:
     for cat in ['A', 'B']:
         cat_df = df_bt[df_bt['Category'] == cat]
-        if cat_df.empty: continue
+        if cat_df.empty: 
+            print(f"\nCategory {cat}: No trades", flush=True)
+            continue
         total = len(cat_df)
         wins = len(cat_df[cat_df['Status'] == 'WIN'])
         winrate = round(wins / total * 100, 1) if total else 0
@@ -247,7 +252,6 @@ else:
         print(f"Total: {total} | WR: {winrate}% | PF: {pf} | PnL: Rs.{cat_df['PnL_Rs'].sum():,.0f}", flush=True)
 
     print(f"\nCOMBINED: {len(df_bt)} Trades | WR: {round(len(df_bt[df_bt['Status']=='WIN'])/len(df_bt)*100,1)}%", flush=True)
-    print(f"Avg Price of Trades: Rs.{df_bt['Entry'].mean():.0f}", flush=True)
 
 try:
     ws_bt = get_or_create_ws(sh, "BACKTEST_HYBRID_1Y")
