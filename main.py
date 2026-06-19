@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V19 - ULTRA HIGH WIN-RATE SNIPER ===", flush=True)
+print("=== RS BEATER V21 - VOLUMETRIC COMPRESSION SNIPER ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,23 +22,17 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# MODIFIED HIGH PROBABILITY RULES (Optimized to fix 26% Win-Rate)
+# V21 OPTIMIZED RULES FOR COMPRESSION & BREAKOUT
 R = {
-    'min_daily_value_cr': 40.0,    # Minimum 40Cr liquidity
-    'trend_days': 20,              # Strong uptrend filter (Price > EMA20 > EMA50)
-    'base_days_min': 5,            
-    'base_days_max': 15,           
-    'base_range_max': 5.0,         # CRITICAL CHANGE: 8.0 se ghata kar 5.0 kiya (Super Tight Base)
-    'vol_ratio_min': 2.0,          # CRITICAL CHANGE: 1.8 se badha kar 2.0 kiya (Strong Buyer Confirmation)
-    'rsi_min': 55,                 
-    'rsi_max': 72,                 # CRITICAL CHANGE: 75 se 72 kiya (Overbought rejection)
-    'fixed_target_pct': 4.5,       # 4.5% Fixed Target (High Win Rate Range)
-    'fixed_sl_pct': 3.0,           # 3.0% Tight Stop Loss
-    'time_stop_days': 7,           # 10 din se ghata kar 7 kiya (Dead trades se jaldi exit)
+    'min_daily_value_cr': 30.0,    
+    'trend_days': 20,              
+    'fixed_target_pct': 5.0,       # 5% Fixed Target
+    'fixed_sl_pct': 3.0,           # 3% Fixed Stop Loss
+    'time_stop_days': 8,           
     'risk_per_trade': 10000,       
-    'cooldown_days': 7,            
-    'max_open_trades': 4,          
-    'rs_1m_min': 5.0,              
+    'cooldown_days': 5,            
+    'max_open_trades': 6,          
+    'rs_1m_min': 2.0,              
 }
 
 def get_or_create_ws(sh, title):
@@ -48,7 +42,10 @@ def get_or_create_ws(sh, title):
 def calculate_indicators(df):
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+    
+    # 10 Days Max Volume and Max Price (Excluding current day for reference setup)
+    df['MaxVol_10D'] = df['Volume'].shift(1).rolling(window=10).max()
+    df['MaxHigh_10D'] = df['High'].shift(1).rolling(window=10).max()
 
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -57,89 +54,63 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-print("\n Downloading Nifty 50 reference data...", flush=True)
-nifty_df = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=100), end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
-if isinstance(nifty_df.columns, pd.MultiIndex): nifty_df.columns = nifty_df.columns.get_level_values(0)
-nifty_df.index = pd.to_datetime(nifty_df.index).strftime('%Y-%m-%d')
-nifty_df = nifty_df[~nifty_df.index.duplicated(keep='last')]
-
-def calculate_rs_1m(df, i, current_date, nifty_df):
-    try:
-        if current_date not in nifty_df.index or i < 21: return None
-        nifty_idx = nifty_df.index.get_loc(current_date)
-        if nifty_idx < 21: return None
-
-        stock_start = df['Close'].iloc[i-21]
-        stock_now = df['Close'].iloc[i]
-        stock_ret = ((stock_now - stock_start) / stock_start) * 100
-
-        nifty_start = nifty_df['Close'].iloc[nifty_idx-21]
-        nifty_now = nifty_df['Close'].iloc[nifty_idx]
-        nifty_ret = ((nifty_now - nifty_start) / nifty_start) * 100
-
-        return round(stock_ret - nifty_ret, 2)
-    except:
-        return None
-
-def find_base_and_breakout(df, i, debug_counter):
-    row = df.iloc[i]
-
-    # 1. TREND CHECK
-    trend_ok = True
-    for j in range(max(0, i-19), i+1):
-        if not (df['Close'].iloc[j] > df['EMA20'].iloc[j] > df['EMA50'].iloc[j]):
-            trend_ok = False
-            break
-    if not trend_ok:
+def check_compression_and_breakout(df, current_idx, debug_counter):
+    """
+    Naya Logic: Pichle 10 dinon me Setup Day dhundo (Heavy Vol but No Price Breakout)
+    Aur check karo ki kya AJ us Setup Day ke High ka breakout ho raha hai.
+    """
+    row_today = df.iloc[current_idx]
+    
+    # 1. TREND CHECK (Aaj price EMA20 ke upar hona chahiye)
+    if not (row_today['Close'] > row_today['EMA20'] > row_today['EMA50']):
         debug_counter['trend'] += 1
-        return False, 0, 0, 0
-
-    # 2. BASE FINDING
-    base_found = False
-    base_high = 0
-    base_low = 999999
-
-    for base_len in range(R['base_days_min'], R['base_days_max'] + 1):
-        if i < base_len: continue
-
-        temp_high = df['High'].iloc[i-base_len:i].max()
-        temp_low = df['Low'].iloc[i-base_len:i].min()
-        base_range = (temp_high - temp_low) / temp_low * 100
-
-        if base_range <= R['base_range_max']:
-            base_found = True
-            base_high = temp_high
-            base_low = temp_low
-            break
-
-    if not base_found:
-        debug_counter['no_base'] += 1
-        return False, 0, 0, 0
-
-    # 3. BREAKOUT CHECK & CANDLE BODY FILTER (To Avoid Rejection Wicks/Fake Breakouts)
-    if row['Close'] <= base_high:
-        debug_counter['no_breakout'] += 1
-        return False, 0, 0, 0
+        return False, 0
         
-    candle_range = row['High'] - row['Low']
-    if candle_range > 0:
-        upper_wick = row['High'] - max(row['Open'], row['Close'])
-        # NEW CRITERIA: Upper wick agar candle body se badi hai toh entry reject (Fake Breakout Filter)
-        if (upper_wick / candle_range) > 0.35:
-            debug_counter['no_breakout'] += 1 
-            return False, 0, 0, 0
-
-    # 4. VOLUME CHECK
-    if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_ratio_min']):
-        debug_counter['volume'] += 1
-        return False, 0, 0, 0
-
-    # 5. RSI CHECK
-    if not (R['rsi_min'] <= row['RSI'] <= R['rsi_max']):
+    # RSI Check
+    if not (53 <= row_today['RSI'] <= 75):
         debug_counter['rsi'] += 1
-        return False, 0, 0, 0
+        return False, 0
 
-    return True, base_high, base_low, row['EMA20']
+    # 2. PICHLE 10 DIN ME SETUP DAY DHUNDO
+    # Hame i-1 se lekar i-10 tak piche jana hai
+    setup_found = False
+    trigger_level = 0
+    
+    for lookback in range(1, 11):
+        setup_idx = current_idx - lookback
+        if setup_idx < 20: break
+        
+        row_setup = df.iloc[setup_idx]
+        
+        # Setup Condition: 
+        # उस दिन का वॉल्यूम उसके पिछले 10 दिन के मैक्स वॉल्यूम से ज़्यादा था
+        vol_condition = row_setup['Volume'] > row_setup['MaxVol_10D']
+        # उस दिन का हाई उसके पिछले 10 दिन के मैक्स हाई से कम था
+        price_condition = row_setup['High'] < row_setup['MaxHigh_10D']
+        
+        if vol_condition and price_condition:
+            setup_found = True
+            # Entry tabhi hogi jab aaj ka price us setup day ke pichle 10-day max high ko cross karega
+            trigger_level = row_setup['MaxHigh_10D']
+            break
+            
+    if not setup_found:
+        debug_counter['no_base'] += 1 # Reusing counter for 'No Setup Found'
+        return False, 0
+
+    # 3. ENTRY TRIGGER: Kya aaj ka Close us Trigger Level ke upar nikal gaya?
+    if row_today['Close'] > trigger_level and df['Close'].iloc[current_idx-1] <= trigger_level:
+        # Check rejection wick on breakout day
+        candle_range = row_today['High'] - row_today['Low']
+        if candle_range > 0:
+            upper_wick = row_today['High'] - max(row_today['Open'], row_today['Close'])
+            if (upper_wick / candle_range) > 0.35:
+                debug_counter['no_breakout'] += 1 # Fake breakout filter
+                return False, 0
+        return True, trigger_level
+
+    debug_counter['no_breakout'] += 1
+    return False, 0
 
 def download_single_stock(stock):
     try:
@@ -250,7 +221,8 @@ for batch_num in range(total_batches):
                 debug_counter['liquidity'] += 1
                 continue
 
-            is_entry, base_high, base_low, ema20 = find_base_and_breakout(df, i, debug_counter)
+            # NEW LOGIC CALL
+            is_entry, trigger_level = check_compression_and_breakout(df, i, debug_counter)
             if not is_entry:
                 continue
 
@@ -261,7 +233,7 @@ for batch_num in range(total_batches):
 
             entry_price = row['Close']
             
-            # FIXED POSITION SIZING AND HIGH WR MATHEMATICS
+            # 5% Target & 3% SL
             target_price = entry_price * (1 + (R['fixed_target_pct'] / 100))
             sl_price = entry_price * (1 - (R['fixed_sl_pct'] / 100))
             
@@ -273,7 +245,7 @@ for batch_num in range(total_batches):
                 'Stock': stock, 'Entry_Date': current_date,
                 'Entry': round(entry_price, 2), 'SL': round(sl_price, 2),
                 'Target': round(target_price, 2), 'RS_1M': rs_1m,
-                'Base_High': round(base_high, 2), 'Qty': qty
+                'Base_High': round(trigger_level, 2), 'Qty': qty
             })
 
     for pos in open_positions:
@@ -293,14 +265,14 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V19", flush=True)
+print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V21", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V19", flush=True)
+print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V21", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
@@ -338,4 +310,3 @@ except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
 print("\n=== COMPLETE ===", flush=True)
-    
