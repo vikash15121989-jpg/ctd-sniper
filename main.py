@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== SWING TARGETED 6PCT WINRATE BOOSTER V3.0 ===", flush=True)
+print("=== BULLETPROOF 6PCT SWING STRATEGY V4.0 ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 # Google Sheets Setup
@@ -23,16 +23,16 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# FIXED 6% TARGET SETTINGS FOR HIGH WINRATE
+# BULLETPROOF PARAMETERS
 R = {
-    'min_daily_value_cr': 0.3, 
-    'fixed_target_pct': 6.0,     # MERA KAHNA YE HAI: 6% Profit Fixed!
-    'fixed_sl_pct': 3.0,         # Safe 3% Stop Loss for 1:2 Risk-Reward
-    'vol_blast_ratio': 1.0,      
-    'adx_min': 20,               
-    'rsi_min': 45,               
+    'min_daily_value_cr': 0.5,   # Sirf high liquidity stocks jisme upper/lower circuit ka lafda na ho
+    'fixed_target_pct': 6.0,     # Fixed 6% Profit
+    'fixed_sl_pct': 3.0,         # Minimum Loss Fixed 3% Stop Loss
+    'vol_blast_ratio': 1.0,      # Volume average se zyada hona chahiye
+    'adx_min': 22,               # Market me mazboot trend hona chahiye
+    'rsi_min': 50,               # Entry ke waqt momentum floor strong ho
     'rsi_max': 75,               
-    'time_stop_days': 10         # 10 din me target nahi aaya toh exit
+    'time_stop_days': 10         # 10 din me target nahi aaya toh paisa free karo
 }
 
 def get_or_create_ws(sh, title):
@@ -67,29 +67,31 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(14).mean()
     return df
 
-def check_swing_entry(df, i, debug_counter):
+def check_bulletproof_entry(df, i, debug_counter):
     row = df.iloc[i]
     if pd.isna(row['EMA200']) or pd.isna(row['ADX']) or pd.isna(row['RSI']):
         debug_counter['nan'] += 1
         return False
 
-    # Strong Trend Check: Stock strong hona chahiye taaki entry lete hi 6% bhaage
+    # 1. Trend Lock: Price > EMA20 > EMA50 > EMA200
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
         return False
 
-    # Pullback zone near EMA20
-    pullback = row['Low'] <= row['EMA20'] * 1.05
+    # 2. Pullback Check: Low EMA20 ke paas hona chahiye (within 4%)
+    pullback = row['Low'] <= row['EMA20'] * 1.04
     if not pullback:
         debug_counter['pullback'] += 1
         return False
 
+    # 3. Price Confirmation: Green Candle
     green = row['Close'] > row['Open']
     if not green:
         debug_counter['green'] += 1
         return False
 
+    # 4. Volume Blast Check
     vol_avg = df['Volume'].iloc[max(0,i-20):i].mean()
     if pd.isna(vol_avg) or vol_avg < 1000:
         debug_counter['vol_avg'] += 1
@@ -100,6 +102,7 @@ def check_swing_entry(df, i, debug_counter):
         debug_counter['volume'] += 1
         return False
 
+    # 5. Momentum Lock
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
@@ -121,7 +124,6 @@ def download_single_stock(stock):
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = calculate_indicators(df)
         df.index = df.index.strftime('%Y-%m-%d')
-        df = df[~df.index.duplicated(keep='last')]
         return df, stock
     except:
         return None, stock
@@ -158,7 +160,7 @@ for batch_num in range(total_batches):
     batch_trades = 0
 
     for current_date in date_range:
-        # 1. Manage Open Positions (Fixed 6% Target vs 3% SL)
+        # Manage Open Positions
         for pos in open_positions[:]:
             df = stock_data[pos['Stock']]
             if current_date not in df.index: continue
@@ -181,18 +183,16 @@ for batch_num in range(total_batches):
                 
             if exit_price:
                 pnl_pct = round((exit_price / pos['Entry'] - 1) * 100, 1)
-                pnl_rs = round((exit_price - pos['Entry']) * pos['Qty'], 0)
                 all_trades.append({
-                    'Stock': pos['Stock'], 'Category': '6% Swing Scalp',
+                    'Stock': pos['Stock'], 'Category': '6% Fixed Bulletproof',
                     'Entry_Date': pos['Entry_Date'], 'Exit_Date': current_date,
                     'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
-                    'Status': exit_status, 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
-                    'Days_Held': days_held
+                    'Status': exit_status, 'PnL_%': pnl_pct, 'Days_Held': days_held
                 })
                 open_positions.remove(pos)
                 batch_trades += 1
 
-        # 2. Scan New Entries
+        # Scan New Entries
         open_stocks = [p['Stock'] for p in open_positions]
         for stock, df in stock_data.items():
             if stock in open_stocks: continue
@@ -203,68 +203,58 @@ for batch_num in range(total_batches):
             row = df.iloc[i]
             total_candles_checked += 1
 
-            # Liquidity Filter
+            # Liquidity Lock (Avoid Penny Stocks)
             avg_value_cr = (df['Close'].iloc[max(0,i-20):i] * df['Volume'].iloc[max(0,i-20):i]).mean() / 1e7
             if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']:
                 debug_counter['liquidity'] += 1
                 continue
 
-            if not check_swing_entry(df, i, debug_counter):
+            if not check_bulletproof_entry(df, i, debug_counter):
                 continue
 
             entry_price = row['Close']
             target_price = entry_price * (1 + R['fixed_target_pct']/100)
             sl_price = entry_price * (1 - R['fixed_sl_pct']/100)
-            
-            qty = int(10000 / entry_price) # Hypothetical qty base
-            if qty == 0: continue
 
             open_positions.append({
-                'Stock': stock, 'Category': '6% Swing Scalp', 'Entry_Date': current_date,
+                'Stock': stock, 'Category': '6% Fixed Bulletproof', 'Entry_Date': current_date,
                 'Entry': round(entry_price, 2), 'SL': round(sl_price, 2),
-                'Target': round(target_price, 2), 'Qty': qty
+                'Target': round(target_price, 2)
             })
 
-    # Close Remaining Open Positions at current market price
+    # Close left-overs
     for pos in open_positions:
         df = stock_data[pos['Stock']]
         exit_price = df['Close'].iloc[-1]
         pnl_pct = round((exit_price / pos['Entry'] - 1) * 100, 1)
-        pnl_rs = round((exit_price - pos['Entry']) * pos['Qty'], 0)
         all_trades.append({
-            'Stock': pos['Stock'], 'Category': '6% Swing Scalp',
+            'Stock': pos['Stock'], 'Category': '6% Fixed Bulletproof',
             'Entry_Date': pos['Entry_Date'], 'Exit_Date': BACKTEST_END.strftime('%Y-%m-%d'),
             'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
-            'Status': 'TIME', 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
-            'Days_Held': (BACKTEST_END - pd.to_datetime(pos['Entry_Date']).date()).days
+            'Status': 'TIME', 'PnL_%': pnl_pct, 'Days_Held': (BACKTEST_END - pd.to_datetime(pos['Entry_Date']).date()).days
         })
-
-    print(f"Batch {batch_num + 1} complete | Total Trades till now: {len(all_trades)}", flush=True)
 
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 6% FIXED TARGET STRATEGY", flush=True)
+print("FINAL RESULTS - BULLETPROOF 6% SWING", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
-    print("\nNo trades found. Kripya check karein ki aapki Watchlist sheet khali toh nahi hai!", flush=True)
+    print("\nNo trades found.", flush=True)
 else:
     total = len(df_bt)
     wins = len(df_bt[df_bt['Status'] == 'WIN'])
     winrate = round(wins / total * 100, 1) if total else 0
-    print(f"Total Trades Generated: {total}")
-    print(f"Overall WinRate: {winrate}%")
-    print(f"Net Profit/Loss: Rs. {df_bt['PnL_Rs'].sum():,.0f}", flush=True)
+    print(f"Total Trades: {total}")
+    print(f"Overall WinRate: {winrate}%  <-- Yeh check karein!")
 
 try:
     ws_bt = get_or_create_ws(sh, "BACKTEST_HYBRID_1Y")
     ws_bt.clear()
     if not df_bt.empty:
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Results saved to Google Sheet!", flush=True)
+        print(f"\n[SUCCESS] Saved to Google Sheet!", flush=True)
 except Exception as e:
-    print(f"GSheet upload error: {e}", flush=True)
-
-print("\n=== BACKTEST COMPLETE ===", flush=True)
-        
+    print(f"GSheet error: {e}", flush=True)
+                
