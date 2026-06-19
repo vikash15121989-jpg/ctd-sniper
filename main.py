@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V18 - HIGH WIN-RATE 20EMA SNIPER ===", flush=True)
+print("=== RS BEATER V19 - ULTRA HIGH WIN-RATE SNIPER ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,23 +22,23 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# MODIFIED HIGH PROBABILITY RULES (2% - 6% Target Focus)
+# MODIFIED HIGH PROBABILITY RULES (Optimized to fix 26% Win-Rate)
 R = {
-    'min_daily_value_cr': 40.0,    # Liquidity filter
-    'trend_days': 20,              # Strong uptrend filter
+    'min_daily_value_cr': 40.0,    # Minimum 40Cr liquidity
+    'trend_days': 20,              # Strong uptrend filter (Price > EMA20 > EMA50)
     'base_days_min': 5,            
     'base_days_max': 15,           
-    'base_range_max': 8.0,         
-    'vol_ratio_min': 1.5,          # 1.5x volume is healthy for short momentum
+    'base_range_max': 5.0,         # CRITICAL CHANGE: 8.0 se ghata kar 5.0 kiya (Super Tight Base)
+    'vol_ratio_min': 2.0,          # CRITICAL CHANGE: 1.8 se badha kar 2.0 kiya (Strong Buyer Confirmation)
     'rsi_min': 55,                 
-    'rsi_max': 75,
-    'fixed_target_pct': 4.5,       # CRITICAL: 2% se 6% ke beech me (4.5% Fixed Target for ultra-high win rate)
-    'fixed_sl_pct': 3.0,           # Tight 3% Stop Loss to maintain > 1.5 RR
-    'time_stop_days': 10,          # Momentum exit if stuck sideways for 10 days
+    'rsi_max': 72,                 # CRITICAL CHANGE: 75 se 72 kiya (Overbought rejection)
+    'fixed_target_pct': 4.5,       # 4.5% Fixed Target (High Win Rate Range)
+    'fixed_sl_pct': 3.0,           # 3.0% Tight Stop Loss
+    'time_stop_days': 7,           # 10 din se ghata kar 7 kiya (Dead trades se jaldi exit)
     'risk_per_trade': 10000,       
-    'cooldown_days': 5,            # Cooldown reduced for quick re-entries
-    'max_open_trades': 5,          # Diversification slightly increased
-    'rs_1m_min': 4.0,              
+    'cooldown_days': 7,            
+    'max_open_trades': 4,          
+    'rs_1m_min': 5.0,              
 }
 
 def get_or_create_ws(sh, title):
@@ -116,10 +116,18 @@ def find_base_and_breakout(df, i, debug_counter):
         debug_counter['no_base'] += 1
         return False, 0, 0, 0
 
-    # 3. BREAKOUT CHECK
+    # 3. BREAKOUT CHECK & CANDLE BODY FILTER (To Avoid Rejection Wicks/Fake Breakouts)
     if row['Close'] <= base_high:
         debug_counter['no_breakout'] += 1
         return False, 0, 0, 0
+        
+    candle_range = row['High'] - row['Low']
+    if candle_range > 0:
+        upper_wick = row['High'] - max(row['Open'], row['Close'])
+        # NEW CRITERIA: Upper wick agar candle body se badi hai toh entry reject (Fake Breakout Filter)
+        if (upper_wick / candle_range) > 0.35:
+            debug_counter['no_breakout'] += 1 
+            return False, 0, 0, 0
 
     # 4. VOLUME CHECK
     if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_ratio_min']):
@@ -193,9 +201,7 @@ for batch_num in range(total_batches):
             exit_status = None
             days_held = (current_dt - pd.to_datetime(pos['Entry_Date']).date()).days
 
-            # LOGIC CHANGE: High win rate execution priority
             if sl_hit and target_hit:
-                # Agar ek hi din dono hit ho jayein, toh safely conservative exit lete hain
                 exit_price = pos['SL']; exit_status = 'LOSS'
             elif target_hit:
                 exit_price = pos['Target']; exit_status = 'WIN'
@@ -255,11 +261,10 @@ for batch_num in range(total_batches):
 
             entry_price = row['Close']
             
-            # LOGIC CHANGE: High Win-Rate Setup Fixed Target & SL Math
+            # FIXED POSITION SIZING AND HIGH WR MATHEMATICS
             target_price = entry_price * (1 + (R['fixed_target_pct'] / 100))
             sl_price = entry_price * (1 - (R['fixed_sl_pct'] / 100))
             
-            # Risk calculation for Capital Position Sizing
             risk_per_share = entry_price - sl_price
             qty = int(R['risk_per_trade'] / risk_per_share) if risk_per_share > 0 else 0
             if qty == 0: continue
@@ -271,7 +276,6 @@ for batch_num in range(total_batches):
                 'Base_High': round(base_high, 2), 'Qty': qty
             })
 
-    # Close open trades at the end of backtest period
     for pos in open_positions:
         df = stock_data[pos['Stock']]
         exit_price = df['Close'].iloc[-1]
@@ -289,14 +293,14 @@ for batch_num in range(total_batches):
 df_bt = pd.DataFrame(all_trades)
 
 print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V18", flush=True)
+print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V19", flush=True)
 print("="*60, flush=True)
 print(f"Total Candles Checked: {total_candles_checked}", flush=True)
 for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V18", flush=True)
+print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V19", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
@@ -334,4 +338,4 @@ except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
 print("\n=== COMPLETE ===", flush=True)
-            
+    
