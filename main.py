@@ -5,22 +5,25 @@ import gspread
 import json
 import os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
 BACKTEST_MODE = True
 BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
+BATCH_SIZE = 50 # <-- 50 STOCK PER BATCH
 
-print("=== POWER SPRING HYBRID V1 - TIGHT + BUGFIX ===", flush=True)
+print("=== POWER SPRING HYBRID V1 - BATCH MODE ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
+print(f"Batch Size: {BATCH_SIZE} stocks", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# ===== TIGHT FILTERS - TERA ORIGINAL V1 =====
+# ===== TIGHT FILTERS =====
 R = {
     'min_price': 100, 'max_price': 400, 'min_daily_value_cr': 0.5,
     'sl_buffer_pct': 2.0, 'target_r': 1.5, 'max_risk_pct': 4.0,
@@ -28,13 +31,7 @@ R = {
     '52h_proximity': 0.88, 'time_stop_days': 8
 }
 
-# FUNDAMENTAL TIGHT BUT SAFE - FAIL HONE PE SKIP NAHI KARENGE
-F = {'min_market_cap_cr': 500, 'max_debt_equity': 2.0, 'max_pe': 100}
-
-S = {
-    'spring_breach_pct': 0.01, 'spring_recover_pct': 0.005,
-    'max_spring_depth': 0.03
-}
+S = {'spring_breach_pct': 0.01, 'spring_recover_pct': 0.005, 'max_spring_depth': 0.03}
 
 def get_or_create_ws(sh, title):
     try: return sh.worksheet(title)
@@ -44,20 +41,17 @@ def calculate_indicators(df):
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = np.max(ranges, axis=1)
     atr = true_range.rolling(14).mean()
-
     up_move = df['High'].diff()
     down_move = df['Low'].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
@@ -70,7 +64,6 @@ def calculate_indicators(df):
 
 def check_power_swing(df, i):
     row = df.iloc[i]
-    # TIGHT: 3 EMA trend
     if pd.isna(row['EMA200']): return False
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     pullback = row['Low'] <= row['EMA20'] * 1.02
@@ -88,56 +81,62 @@ def check_spring_setup(df, i):
     prev = df.iloc[i-1]
     if pd.isna(prev['EMA20']): return False
     support = prev['EMA20']
-
     breached = prev['Low'] < support * (1 - S['spring_breach_pct'])
     not_too_deep = prev['Low'] > support * (1 - S['max_spring_depth'])
     recovered = row['Close'] > support * (1 + S['spring_recover_pct'])
     vol_avg = df['Volume'].iloc[i-20:i].mean()
     if vol_avg == 0 or pd.isna(vol_avg): return False
     vol_confirm = row['Volume'] > vol_avg * 1.2
-
     return breached and not_too_deep and recovered and vol_confirm
 
-# ===== BACKTEST =====
+def download_single_stock(stock):
+    try:
+        df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=400),
+                       end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        if len(df) < 300: return None, stock
+        df = calculate_indicators(df)
+        return df, stock
+    except:
+        return None, stock
+
+# ===== MAIN BATCH LOGIC =====
 all_trades = []
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = sorted(list(set([s.strip().upper() for s in stocks if s.strip()])))
-print(f"\nWatchlist: {len(stocks)} stocks", flush=True)
+total_stocks = len(stocks)
+total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
-if BACKTEST_MODE:
-    date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B')
-    print(f"Backtesting {len(date_range)} trading days...", flush=True)
+print(f"\nTotal Watchlist: {total_stocks} stocks", flush=True)
+print(f"Total Batches: {total_batches}", flush=True)
 
-    print("Downloading data...", flush=True)
+date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B')
+
+# BATCH LOOP START
+for batch_num in range(total_batches):
+    start_idx = batch_num * BATCH_SIZE
+    end_idx = min(start_idx + BATCH_SIZE, total_stocks)
+    batch_stocks = stocks[start_idx:end_idx]
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"BATCH {batch_num + 1}/{total_batches} | Stocks {start_idx+1}-{end_idx}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    # Download batch
+    print(f"Downloading {len(batch_stocks)} stocks...", flush=True)
     stock_data = {}
-    fundamental_data = {} # BUG FIX: Fundamental alag se cache karo
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
+        for future in as_completed(future_to_stock):
+            df, stock = future.result()
+            if df is not None:
+                stock_data[stock] = df
 
-    for stock in stocks:
-        try:
-            df = yf.download(f"{stock}.NS", start=BACKTEST_START - timedelta(days=400),
-                           end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if len(df) < 300: continue
-            df = calculate_indicators(df)
-            stock_data[stock] = df
+    print(f"Data ready for {len(stock_data)} stocks in this batch", flush=True)
 
-            # BUG FIX: Fundamental data ek baar hi load karo, fail pe default values
-            try:
-                t = yf.Ticker(f"{stock}.NS")
-                info = t.info
-                fundamental_data[stock] = {
-                    'mcap_cr': info.get('marketCap', 0) / 1e7,
-                    'de': info.get('debtToEquity', 0),
-                    'pe': info.get('trailingPE', 0)
-                }
-            except:
-                # BUG FIX: Fail hone pe pass values de do, skip mat karo
-                fundamental_data[stock] = {'mcap_cr': 9999, 'de': 0, 'pe': 10}
-        except: continue
-
-    print(f"Data ready for {len(stock_data)} stocks", flush=True)
+    # Run backtest on this batch
     open_positions = []
-    debug_stats = {'price': 0, 'liquidity': 0, '52h': 0, 'trend': 0, 'fundamental': 0, 'signal': 0}
+    batch_trades = 0
 
     for current_date in date_range:
         current_date = current_date.date()
@@ -151,7 +150,6 @@ if BACKTEST_MODE:
             row = df.loc[df.index.date == current_date].iloc[0]
             sl_hit = row['Low'] <= pos['SL']
             target_hit = row['High'] >= pos['Target']
-
             exit_price = None
             exit_status = None
             days_held = (current_date - pos['Entry_Date']).days
@@ -180,52 +178,29 @@ if BACKTEST_MODE:
                     'Days_Held': days_held
                 })
                 positions_to_remove.append(pos)
+                batch_trades += 1
 
         for pos in positions_to_remove:
             open_positions.remove(pos)
 
         # Entries
         open_stocks = [p['Stock'] for p in open_positions]
-
         for stock, df in stock_data.items():
             if stock in open_stocks: continue
             if current_date not in df.index.date: continue
 
             i = df.index.get_loc(df.index[df.index.date == current_date][0])
             if i < 300: continue
-
             row = df.iloc[i]
 
-            # DEBUG: Kahan fail ho raha
-            if row['Close'] < R['min_price'] or row['Close'] > R['max_price']:
-                debug_stats['price'] += 1
-                continue
+            if row['Close'] < R['min_price'] or row['Close'] > R['max_price']: continue
             avg_value_cr = (df['Close'].iloc[i-20:i] * df['Volume'].iloc[i-20:i]).mean() / 1e7
-            if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']:
-                debug_stats['liquidity'] += 1
-                continue
-
+            if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']: continue
             high_252 = df['High'].iloc[i-252:i].max()
-            if pd.isna(high_252) or row['Close'] < high_252 * R['52h_proximity']:
-                debug_stats['52h'] += 1
-                continue
-
-            # BUG FIX: Fundamental fail pe skip nahi, default use karo
-            fund = fundamental_data.get(stock, {'mcap_cr': 9999, 'de': 0, 'pe': 10})
-            if fund['mcap_cr'] < F['min_market_cap_cr']:
-                debug_stats['fundamental'] += 1
-                continue
-            if fund['de'] > 0 and fund['de'] > F['max_debt_equity']:
-                debug_stats['fundamental'] += 1
-                continue
-            if fund['pe'] > 0 and fund['pe'] > F['max_pe']:
-                debug_stats['fundamental'] += 1
-                continue
+            if pd.isna(high_252) or row['Close'] < high_252 * R['52h_proximity']: continue
 
             is_power_swing = check_power_swing(df, i)
-            if not is_power_swing:
-                debug_stats['trend'] += 1
-                continue
+            if not is_power_swing: continue
 
             is_spring = check_spring_setup(df, i)
 
@@ -242,7 +217,6 @@ if BACKTEST_MODE:
             risk_pct = risk / entry_price * 100
             if risk_pct > R['max_risk_pct'] or risk_pct <= 0: continue
             target = entry_price + risk * R['target_r']
-
             qty = int(750 / risk) if risk > 0 else 0
             if qty == 0: continue
 
@@ -251,9 +225,8 @@ if BACKTEST_MODE:
                 'Entry': round(entry_price, 2), 'SL': round(sl_price, 2),
                 'Target': round(target, 2), 'Qty': qty
             })
-            debug_stats['signal'] += 1
 
-    # Close remaining
+    # Close remaining positions for this batch
     for pos in open_positions:
         df = stock_data[pos['Stock']]
         exit_price = df['Close'].iloc[-1]
@@ -267,76 +240,51 @@ if BACKTEST_MODE:
             'Days_Held': (BACKTEST_END - pos['Entry_Date']).days
         })
 
-    # Results - BUG FIX: Empty check pehle
-    df_bt = pd.DataFrame(all_trades)
+    print(f"Batch {batch_num + 1} complete | Trades in batch: {batch_trades}", flush=True)
+    print(f"Total trades so far: {len(all_trades)}", flush=True)
 
-    print("\n" + "="*60, flush=True)
-    print("BACKTEST RESULTS - 1 YEAR", flush=True)
-    print("="*60, flush=True)
-    print(f"\nDebug Stats - Kahan fail hua:", flush=True)
-    print(f"Price fail: {debug_stats['price']} | Liquidity fail: {debug_stats['liquidity']}", flush=True)
-    print(f"52W High fail: {debug_stats['52h']} | Fundamental fail: {debug_stats['fundamental']}", flush=True)
-    print(f"Trend/Indicator fail: {debug_stats['trend']} | Signals found: {debug_stats['signal']}", flush=True)
+# ===== FINAL RESULTS =====
+df_bt = pd.DataFrame(all_trades)
 
-    if df_bt.empty:
-        print("\n0 trades mile. Possible reasons:", flush=True)
-        print("1. Watchlist me strong uptrend stocks nahi hain", flush=True)
-        print("2. 2025 market sideways raha - ADX 25 cross nahi hua", flush=True)
-        print("3. NIFTY500 ki list daal ke test karo", flush=True)
-    else:
-        # BUG FIX: KeyError se bachne ke liye check
-        if 'Category' not in df_bt.columns:
-            print("\nError: Category column missing!", flush=True)
-        else:
-            for cat in ['A', 'B']:
-                cat_df = df_bt[df_bt['Category'] == cat]
-                if cat_df.empty:
-                    print(f"\nCategory {cat}: No trades", flush=True)
-                    continue
+print("\n" + "="*60, flush=True)
+print("FINAL BACKTEST RESULTS - ALL BATCHES", flush=True)
+print("="*60, flush=True)
 
-                total = len(cat_df)
-                wins = len(cat_df[cat_df['Status'] == 'WIN'])
-                losses = len(cat_df[cat_df['Status'] == 'LOSS'])
-                time_exit = len(cat_df[cat_df['Status'] == 'TIME'])
-                winrate = round(wins / total * 100, 1) if total else 0
+if df_bt.empty:
+    print("\n0 trades in 1 year with tight filters!", flush=True)
+else:
+    for cat in ['A', 'B']:
+        cat_df = df_bt[df_bt['Category'] == cat]
+        if cat_df.empty:
+            print(f"\nCategory {cat}: No trades", flush=True)
+            continue
+        total = len(cat_df)
+        wins = len(cat_df[cat_df['Status'] == 'WIN'])
+        losses = len(cat_df[cat_df['Status'] == 'LOSS'])
+        winrate = round(wins / total * 100, 1) if total else 0
+        win_amt = cat_df[cat_df['Status']=='WIN']['PnL_Rs'].sum()
+        loss_amt = abs(cat_df[cat_df['Status']=='LOSS']['PnL_Rs'].sum())
+        pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
+        cat_name = "Power+Spring" if cat=='A' else "Power Only"
+        print(f"\nCategory {cat} - {cat_name}", flush=True)
+        print(f"Total Trades: {total} | Wins: {wins} | Winrate: {winrate}%", flush=True)
+        print(f"Profit Factor: {pf} | Total PnL: Rs.{cat_df['PnL_Rs'].sum():,.0f}", flush=True)
 
-                avg_win = cat_df[cat_df['Status']=='WIN']['PnL_%'].mean() if wins else 0
-                avg_loss = cat_df[cat_df['Status']=='LOSS']['PnL_%'].mean() if losses else 0
-                total_pnl = cat_df['PnL_Rs'].sum()
+    total = len(df_bt)
+    wins = len(df_bt[df_bt['Status'] == 'WIN'])
+    winrate = round(wins / total * 100, 1) if total else 0
+    win_amt = df_bt[df_bt['Status']=='WIN']['PnL_Rs'].sum()
+    loss_amt = abs(df_bt[df_bt['Status']=='LOSS']['PnL_Rs'].sum())
+    pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
+    print(f"\nCOMBINED: {total} Trades | {winrate}% WR | PF: {pf} | PnL: Rs.{df_bt['PnL_Rs'].sum():,.0f}", flush=True)
 
-                win_amt = cat_df[cat_df['Status']=='WIN']['PnL_Rs'].sum()
-                loss_amt = abs(cat_df[cat_df['Status']=='LOSS']['PnL_Rs'].sum())
-                pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
-
-                cat_name = "Power+Spring" if cat=='A' else "Power Only"
-                print(f"\nCategory {cat} - {cat_name}", flush=True)
-                print(f"Total Trades: {total}", flush=True)
-                print(f"Wins: {wins} | Losses: {losses} | Time: {time_exit}", flush=True)
-                print(f"Winrate: {winrate}%", flush=True)
-                print(f"Avg Win: {avg_win:.1f}% | Avg Loss: {avg_loss:.1f}%", flush=True)
-                print(f"Profit Factor: {pf}", flush=True)
-                print(f"Total PnL: Rs.{total_pnl:,.0f}", flush=True)
-
-            total = len(df_bt)
-            wins = len(df_bt[df_bt['Status'] == 'WIN'])
-            winrate = round(wins / total * 100, 1) if total else 0
-            win_amt = df_bt[df_bt['Status']=='WIN']['PnL_Rs'].sum()
-            loss_amt = abs(df_bt[df_bt['Status']=='LOSS']['PnL_Rs'].sum())
-            pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
-
-            print(f"\nCOMBINED", flush=True)
-            print(f"Total Trades: {total}", flush=True)
-            print(f"Winrate: {winrate}%", flush=True)
-            print(f"Profit Factor: {pf}", flush=True)
-            print(f"Total PnL: Rs.{df_bt['PnL_Rs'].sum():,.0f}", flush=True)
-
-    try:
-        ws_bt = get_or_create_ws(sh, "BACKTEST_HYBRID_1Y")
-        ws_bt.clear()
-        if not df_bt.empty:
-            ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-            print(f"\nSaved to GSHEET", flush=True)
-    except Exception as e:
-        print(f"GSheet error: {e}", flush=True)
+try:
+    ws_bt = get_or_create_ws(sh, "BACKTEST_HYBRID_1Y")
+    ws_bt.clear()
+    if not df_bt.empty:
+        ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
+        print(f"\nSaved to GSHEET", flush=True)
+except Exception as e:
+    print(f"GSheet error: {e}", flush=True)
 
 print("\n=== COMPLETE ===", flush=True)
