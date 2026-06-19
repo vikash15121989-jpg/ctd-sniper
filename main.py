@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS MOMENTUM ACCELERATION V7.0 - A+ / A / B GRADING ===", flush=True)
+print("=== RS MOMENTUM V7.1 - 10 DAY LOCK PER STOCK ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -29,9 +29,10 @@ R = {
     'vol_blast_ratio': 1.5,
     'rsi_min': 58,
     'rsi_max': 78,
-    'min_rs_score': 5.0, # USER REQUEST: RS 5 ke upar
+    'min_rs_score': 5.0, # RS 5 ke upar
     'time_stop_days': 10,
-    'risk_per_trade': 1000
+    'risk_per_trade': 1000,
+    'cooldown_days': 10 # USER REQUEST: 10 din lock
 }
 
 def get_or_create_ws(sh, title):
@@ -58,12 +59,10 @@ nifty_df.index = nifty_df.index.strftime('%Y-%m-%d')
 nifty_df = nifty_df[~nifty_df.index.duplicated(keep='last')]
 
 def calculate_rs_multi_timeframe(df, i, current_date, nifty_df):
-    """3M, 1M, 10D ka RS nikal"""
     try:
         if current_date not in nifty_df.index: return None, None, None
         nifty_idx = nifty_df.index.get_loc(current_date)
 
-        # Periods: 63 days ~ 3M, 21 days ~ 1M, 10 days
         periods = {'3M': 63, '1M': 21, '10D': 10}
         rs_values = {}
 
@@ -90,13 +89,11 @@ def check_entry_and_grade(df, i, current_date, debug_counter):
         debug_counter['nan'] += 1
         return False, None, 0, 0, 0
 
-    # 1. Trend Filter
     trend = row['Close'] > row['EMA20'] > row['EMA50'] > row['EMA200']
     if not trend:
         debug_counter['trend'] += 1
         return False, None, 0, 0, 0
 
-    # 2. Breakout Check - High se
     if i < 20: return False, None, 0, 0, 0
     pichla_20_day_high = df['High'].iloc[i-20:i].max()
     is_breakout = row['High'] > pichla_20_day_high
@@ -104,32 +101,28 @@ def check_entry_and_grade(df, i, current_date, debug_counter):
         debug_counter['breakout'] += 1
         return False, None, 0, 0, 0
 
-    # 3. Volume Blast
     if row['Vol_MA20'] < 1000 or row['Volume'] < (row['Vol_MA20'] * R['vol_blast_ratio']):
         debug_counter['volume'] += 1
         return False, None, 0, 0, 0
 
-    # 4. RSI Filter
     rsi_ok = R['rsi_min'] <= row['RSI'] <= R['rsi_max']
     if not rsi_ok:
         debug_counter['rsi'] += 1
         return False, None, 0, 0, 0
 
-    # 5. Multi-Timeframe RS Check
     rs_3m, rs_1m, rs_10d = calculate_rs_multi_timeframe(df, i, current_date, nifty_df)
     if rs_3m is None or rs_1m is None or rs_10d is None:
         debug_counter['rs_error'] += 1
         return False, None, 0, 0, 0
 
-    # USER REQUEST: RS 5 ke upar + Grading Logic
     category = None
     if rs_10d > R['min_rs_score'] and rs_1m > R['min_rs_score'] and rs_3m > R['min_rs_score']:
-        if rs_3m < rs_1m < rs_10d: # Momentum accelerate ho raha
-            category = 'A+' # Sabse strong
-        elif rs_10d > rs_1m: # Pichle 10 din me sabse tez
-            category = 'A' # Abhi power aaya
+        if rs_3m < rs_1m < rs_10d:
+            category = 'A+'
+        elif rs_10d > rs_1m:
+            category = 'A'
         else:
-            category = 'B' # Bas RS positive hai
+            category = 'B'
     else:
         debug_counter['rs_score'] += 1
         return False, None, 0, 0, 0
@@ -159,8 +152,11 @@ total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
 date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
 
-debug_counter = {'nan':0, 'trend':0, 'breakout':0, 'volume':0, 'rsi':0, 'rs_score':0, 'liquidity':0, 'rs_error':0}
+debug_counter = {'nan':0, 'trend':0, 'breakout':0, 'volume':0, 'rsi':0, 'rs_score':0, 'liquidity':0, 'rs_error':0, 'cooldown':0}
 total_candles_checked = 0
+
+# BUG FIX: 10 DAY LOCK - Har stock ka last exit date track karenge
+last_exit_dates = {} # {stock: last_exit_date}
 
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
@@ -181,6 +177,8 @@ for batch_num in range(total_batches):
     open_positions = []
 
     for current_date in date_range:
+        current_dt = pd.to_datetime(current_date).date()
+
         # Manage Open Positions
         for pos in open_positions[:]:
             df = stock_data[pos['Stock']]
@@ -191,7 +189,7 @@ for batch_num in range(total_batches):
             target_hit = row['High'] >= pos['Target']
             exit_price = None
             exit_status = None
-            days_held = (pd.to_datetime(current_date) - pd.to_datetime(pos['Entry_Date'])).days
+            days_held = (current_dt - pd.to_datetime(pos['Entry_Date']).date()).days
 
             if sl_hit and target_hit:
                 exit_price = pos['SL']; exit_status = 'LOSS'
@@ -213,12 +211,22 @@ for batch_num in range(total_batches):
                     'Days_Held': days_held, 'RS_3M': pos['RS_3M'], 'RS_1M': pos['RS_1M'],
                     'RS_10D': pos['RS_10D'], 'Qty': pos['Qty']
                 })
+                # BUG FIX: Exit date save kar do cooldown ke liye
+                last_exit_dates[pos['Stock']] = current_dt
                 open_positions.remove(pos)
 
         # Scan New Entries
         open_stocks = [p['Stock'] for p in open_positions]
         for stock, df in stock_data.items():
             if stock in open_stocks: continue
+
+            # BUG FIX: 10 DAY COOLDOWN CHECK
+            if stock in last_exit_dates:
+                days_since_exit = (current_dt - last_exit_dates[stock]).days
+                if days_since_exit < R['cooldown_days']:
+                    debug_counter['cooldown'] += 1
+                    continue
+
             if current_date not in df.index: continue
 
             i = df.index.get_loc(current_date)
@@ -226,13 +234,11 @@ for batch_num in range(total_batches):
             row = df.iloc[i]
             total_candles_checked += 1
 
-            # Liquidity Lock
             avg_value_cr = (df['Close'].iloc[max(0,i-20):i] * df['Volume'].iloc[max(0,i-20):i]).mean() / 1e7
             if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']:
                 debug_counter['liquidity'] += 1
                 continue
 
-            # Check Entry + Grade
             is_entry, category, rs_3m, rs_1m, rs_10d = check_entry_and_grade(df, i, current_date, debug_counter)
             if not is_entry:
                 continue
@@ -277,7 +283,7 @@ for k, v in debug_counter.items():
     print(f"Rejected by {k}: {v}", flush=True)
 
 print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - A+ / A / B GRADING", flush=True)
+print("FINAL RESULTS - 10 DAY LOCK", flush=True)
 print("="*60, flush=True)
 
 if df_bt.empty:
@@ -301,11 +307,11 @@ else:
     print(f"\nCOMBINED: {len(df_bt)} Trades | WR: {round(len(df_bt[df_bt['Status']=='WIN'])/len(df_bt)*100,1)}%", flush=True)
 
 try:
-    ws_bt = get_or_create_ws(sh, "RS_MOMENTUM_ACCEL_BT")
+    ws_bt = get_or_create_ws(sh, "RS_LOCK_10D_BT")
     ws_bt.clear()
     if not df_bt.empty:
         ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Saved to 'RS_MOMENTUM_ACCEL_BT' Sheet!", flush=True)
+        print(f"\n[SUCCESS] Saved to 'RS_LOCK_10D_BT' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
 
