@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V12 (ULTIMATE MULTIINDEX KILLER) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V13 (FINAL STRUCTURE FIX) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -42,41 +42,53 @@ def get_or_create_ws(sh, title):
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
-def calculate_price_action_features(df):
-    # लेयर 1: अगर कॉलम्स में MultiIndex है, तो सिर्फ आखिरी लेयर (Price metrics) को बाहर निकालें
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-    
-    # लेयर 2: सारे कॉलम नामों को साफ़ और स्टैंडर्डाइज़ करें
-    df.columns = [str(c).strip().capitalize() for c in df.columns]
-    
-    # लेयर 3: याहू फाइनेंस के अजीब रिनेमिंग (जैसे 'Upl.ns') को पूरी तरह कुचलने का अचूक इलाज
-    valid_cols = ['Open', 'High', 'Low', 'Close']
-    missing = [c for c in valid_cols if c not in df.columns]
-    
-    # अगर अभी भी कॉलम गायब हैं, तो पोजीशन के आधार पर ज़बरदस्ती नाम बदलें (OHLC हमेशा पहले 4-5 कॉलम्स होते हैं)
-    if missing and len(df.columns) >= 4:
-        new_cols = list(df.columns)
-        for i, name in enumerate(['Open', 'High', 'Low', 'Close']):
-            new_cols[i] = name
-        if len(new_cols) >= 5:
-            new_cols[4] = 'Volume'
-        df.columns = new_cols
-
-    # अंतिम सुरक्षा जांच
-    final_missing = [c for c in valid_cols if c not in df.columns]
-    if final_missing:
-        raise KeyError(f"Critical Fix Failed! Missing: {final_missing}. Found: {list(df.columns)}")
+def clean_and_flatten_df(df):
+    """याहू फाइनेंस के मल्टी-इंडेक्स और टुपल स्ट्रक्चर को पूरी तरह नष्ट करके सादा DF बनाने वाला फंक्शन"""
+    if df.empty:
+        return pd.DataFrame()
         
-    df = df.dropna(subset=valid_cols)
+    new_data = {}
+    # चेक करें कि कॉलम्स में टुपल या मल्टी-इंडेक्स तो नहीं फंसा है
+    for col in df.columns:
+        col_name = col[-1] if isinstance(col, tuple) else (col[1] if isinstance(col, pd.MultiIndex) else col)
+        col_clean = str(col_name).strip().capitalize()
+        
+        # सिर्फ काम के कॉलम्स को ही सादे डिक्शनरी फॉर्मेट में निकालें
+        if col_clean in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj close']:
+            # डेटा को 1D Series में फ़ोर्स करें ताकि Calculations न टूटें
+            new_data[col_clean] = df[col].to_numpy().flatten()
+            
+    # एक नया और बिल्कुल फ्रेश सिंगल-लेयर डेटाफ़्रेम तैयार करें
+    flat_df = pd.DataFrame(new_data, index=df.index)
+    
+    # फॉलबैक: अगर 'Close' गायब है तो 'Adj close' को ही मेन क्लोज बनाएं
+    if 'Close' not in flat_df.columns and 'Adj close' in flat_df.columns:
+        flat_df['Close'] = flat_df['Adj close']
+        
+    return flat_df
+
+def calculate_price_action_features(df):
+    df = clean_and_flatten_df(df)
+    
+    required_cols = ['Open', 'High', 'Low', 'Close']
+    if any(c not in df.columns for c in required_cols):
+        return pd.DataFrame() # आवश्यक कॉलम्स न होने पर खाली छोड़ें
+        
+    df = df.dropna(subset=required_cols)
     if len(df) < 25:
         return pd.DataFrame()
         
+    # शुद्ध फ्लोट एरे में कन्वर्ट करें ताकि कोई पांडास इंडेक्सिंग इशू न रहे
+    df['Open'] = df['Open'].astype(float)
+    df['High'] = df['High'].astype(float)
+    df['Low'] = df['Low'].astype(float)
+    df['Close'] = df['Close'].astype(float)
+    
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     
-    # वॉल्यूम कैलकुलेशन सेफ्टी नेट
     if 'Volume' in df.columns:
+        df['Volume'] = df['Volume'].astype(float)
         df['Vol_20MA'] = df['Volume'].rolling(20).mean()
         df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
     else:
@@ -118,7 +130,6 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        # group_by को हटाकर सिंगल-टीकर ऑब्जेक्ट को बिना किसी झंझट के डाउनलोड करना
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=False, timeout=15, session=SESSION)
@@ -131,7 +142,6 @@ def download_single_stock(stock):
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
     except Exception as e:
-        print(f"Error downloading {stock}: {e}", flush=True)
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -269,4 +279,3 @@ except Exception as sheet_err:
     print(f"⚠️ Sheet Upload Failed! Error: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
-    
