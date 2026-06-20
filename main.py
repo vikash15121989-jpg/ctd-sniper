@@ -13,8 +13,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V27 - 4-STRATEGY COMPARATIVE ENGINE ===", flush=True)
-print(f"Testing Period: {BACKTEST_START} to {BACKTEST_END}\n", flush=True)
+print("=== RS BEATER V28 - BEST STRATEGY CONDITION DIGGER ===", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -23,10 +22,9 @@ ws_watchlist = sh.worksheet("Watchlist")
 
 R = {
     'min_daily_value_cr': 30.0,
-    'fixed_target_pct': 6.0,       # Strict 6% Target
-    'fixed_sl_pct': 3.0,           # Strict 3% SL
+    'fixed_target_pct': 6.0,
+    'fixed_sl_pct': 3.0,
     'time_stop_days': 8,
-    'cooldown_days': 4
 }
 
 def calculate_base_indicators(df):
@@ -36,48 +34,29 @@ def calculate_base_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     df['Low_Min_10D'] = df['Low'].shift(1).rolling(window=10).min()
+    df['Vol_Avg20'] = df['Volume'].rolling(window=20).mean()
     return df
 
-# --- 4 INDIVIDUAL PATTERN ENGINES ---
-def check_fvg(df, idx):
-    if idx < 2: return False
-    # Today's Low is greater than 2-days-ago High (Bullish FVG Void)
-    return df['Low'].iloc[idx] > df['High'].iloc[idx-2]
-
-def check_stophunt(df, idx):
-    if idx < 1: return False
+# Merging our best two structural strategies for analysis
+def check_best_combined_pattern(df, idx):
+    if idx < 10: return False, "NONE"
     row_today = df.iloc[idx]
-    # Low broke 10D low, but Close sustained above it
-    if (row_today['Low'] < row_today['Low_Min_10D']) and (row_today['Close'] > row_today['Low_Min_10D']):
-        candle_range = row_today['High'] - row_today['Low']
-        if candle_range > 0:
-            lower_wick = min(row_today['Open'], row_today['Close']) - row_today['Low']
-            return (lower_wick / candle_range) >= 0.35
-    return False
-
-def check_accumulation(df, idx):
-    if idx < 10: return False
+    
+    # 1. Stop Hunt Rejection
+    stop_hunt = (row_today['Low'] < row_today['Low_Min_10D']) and (row_today['Close'] > row_today['Low_Min_10D'])
+    # 2. Hidden Accumulation
     price_flat_or_down = df['Close'].iloc[idx] <= df['Close'].iloc[idx-10]
     rsi_rising = df['RSI'].iloc[idx] > df['RSI'].iloc[idx-10]
-    return price_flat_or_down and rsi_rising
-
-def check_sandwich(df, idx):
-    if idx < 2: return False
-    c_today = df.iloc[idx]      # Right Bread
-    c_prev = df.iloc[idx-1]     # Stuffing
-    c_prev2 = df.iloc[idx-2]    # Left Bread
+    hidden_accum = price_flat_or_down and rsi_rising
     
-    # 1. Left is Bullish, Middle is a minor pause/red, Right is strong Bullish Breakout
-    is_left_bull = c_prev2['Close'] > c_prev2['Open']
-    is_right_bull = c_today['Close'] > c_today['Open']
-    
-    # 2. Middle candle stays within bounds (No breakdown below left low)
-    middle_sustained = c_prev['Low'] >= c_prev2['Low']
-    
-    # 3. Right candle engulfs/breaks out above the middle candle's high
-    sandwich_breakout = c_today['Close'] > c_prev['High']
-    
-    return is_left_bull and is_right_bull and middle_sustained and sandwich_breakout
+    if stop_hunt and hidden_accum:
+        return True, "COMBINED_JACKPOT"
+    elif stop_hunt:
+        return True, "STOP_HUNT"
+    elif hidden_accum:
+        return True, "HIDDEN_ACCUM"
+        
+    return False, "NONE"
 
 def download_single_stock(stock):
     try:
@@ -88,27 +67,16 @@ def download_single_stock(stock):
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = calculate_base_indicators(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
-        df = df[~df.index.duplicated(keep='last')]
         return df, stock
     except: return None, stock
 
-# Load all watchlists
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip()])))
 total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
-strategies = {
-    'Strat_1_FVG': check_fvg,
-    'Strat_2_StopHunt': check_stophunt,
-    'Strat_3_HiddenAccum': check_accumulation,
-    'Strat_4_Sandwich': check_sandwich
-}
-
-# Master performance tracker
-perf_summary = {strat: {'Wins':0, 'Losses':0, 'Total':0, 'PnL':0.0} for strat in strategies}
-
-date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
+winning_conditions = []
+losing_conditions = []
 
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
@@ -122,80 +90,93 @@ for batch_num in range(total_batches):
             df, stock = future.result()
             if df is not None: stock_data[stock] = df
 
-    # Run backtest independently for each strategy to avoid mix-up
-    for strat_name, strat_func in strategies.items():
-        open_positions = {}
-        last_exit_idx = {}
-
-        for current_date in date_range:
-            for stock, df in stock_data.items():
-                if current_date not in df.index: continue
-                idx = df.index.get_loc(current_date)
-                row = df.iloc[idx]
+    for stock, df in stock_data.items():
+        open_trade = None
+        
+        for idx in range(20, len(df)):
+            row = df.iloc[idx]
+            
+            if open_trade:
+                # Track maximum favorable movement during the trade
+                if row['High'] > open_trade['Max_High']:
+                    open_trade['Max_High'] = row['High']
                 
-                # Liquidity check
+                # Trailing logic at 3%
+                current_max_profit = ((row['High'] / open_trade['Entry_Price']) - 1) * 100
+                current_sl = open_trade['SL_Price']
+                if current_max_profit >= 3.0:
+                    current_sl = open_trade['Entry_Price']
+
+                sl_hit = row['Low'] <= current_sl
+                target_hit = row['High'] >= open_trade['Target_Price']
+                days_held = idx - open_trade['Entry_Idx']
+                
+                exit_status = None
+                if sl_hit and target_hit: exit_status = 'LOSS'
+                elif target_hit: exit_status = 'WIN'
+                elif sl_hit: exit_status = 'LOSS'
+                elif days_held >= R['time_stop_days']: exit_status = 'TIME_OUT'
+                
+                if exit_status:
+                    max_runup = ((open_trade['Max_High'] / open_trade['Entry_Price']) - 1) * 100
+                    trade_stats = {
+                        'Stock': stock,
+                        'Pattern': open_trade['Pattern_Type'],
+                        'Wick_Ratio': open_trade['Wick_Ratio'],
+                        'Volume_Multiplier': open_trade['Vol_Mult'],
+                        'Max_Runup_%': round(max_runup, 2),
+                        'Days_Held': days_held
+                    }
+                    
+                    if exit_status == 'WIN':
+                        winning_conditions.append(trade_stats)
+                    else:
+                        losing_conditions.append(trade_stats)
+                        
+                    open_trade = None
+            else:
                 avg_val = (df['Close'].iloc[max(0,idx-20):idx] * df['Volume'].iloc[max(0,idx-20):idx]).mean() / 1e7
                 if pd.isna(avg_val) or avg_val < R['min_daily_value_cr']: continue
-
-                # Position Management
-                if stock in open_positions:
-                    pos = open_positions[stock]
+                
+                is_pattern, pattern_type = check_best_combined_pattern(df, idx)
+                if is_pattern:
+                    c_range = row['High'] - row['Low']
+                    w_ratio = (min(row['Open'], row['Close']) - row['Low']) / c_range if c_range > 0 else 0
+                    v_mult = row['Volume'] / row['Vol_Avg20'] if row['Vol_Avg20'] > 0 else 1
                     
-                    # Trailing at 3% profit
-                    current_max_profit = ((row['High'] / pos['Entry']) - 1) * 100
-                    current_sl = pos['SL']
-                    if current_max_profit >= 3.0:
-                        current_sl = pos['Entry']
+                    open_trade = {
+                        'Entry_Price': row['Close'],
+                        'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
+                        'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
+                        'Entry_Idx': idx,
+                        'Pattern_Type': pattern_type,
+                        'Wick_Ratio': round(w_ratio, 2),
+                        'Vol_Mult': round(v_mult, 2),
+                        'Max_High': row['High']
+                    }
 
-                    sl_hit = row['Low'] <= current_sl
-                    target_hit = row['High'] >= pos['Target']
-                    days_held = idx - pos['Entry_Idx']
+# --- REPORT GENERATION ---
+df_wins = pd.DataFrame(winning_conditions)
+df_loss = pd.DataFrame(losing_conditions)
 
-                    exit_price = None
-                    if sl_hit and target_hit: exit_price = current_sl
-                    elif target_hit: exit_price = pos['Target']
-                    elif sl_hit: exit_price = current_sl
-                    elif days_held >= R['time_stop_days']: exit_price = row['Close']
+print("\n" + "="*70)
+print("🟩 WINNING TRADES STRUCTURAL PROFILE (WHEN PATTERN PROFITED) 🟩")
+print("="*70)
+if not df_wins.empty:
+    print(f"Average Wick Rejection Ratio : {round(df_wins['Wick_Ratio'].mean()*100, 1)}%")
+    print(f"Average Volume Multiplier    : {round(df_wins['Volume_Multiplier'].mean(), 2)}x (vs 20-day avg)")
+    print(f"Most Profitable Pattern Type : {df_wins['Pattern'].value_counts().idxmax()}")
+else:
+    print("No winning samples recorded.")
 
-                    if exit_price:
-                        pnl_pct = (exit_price / pos['Entry'] - 1) * 100
-                        perf_summary[strat_name]['Total'] += 1
-                        if pnl_pct > 0.1:
-                            perf_summary[strat_name]['Wins'] += 1
-                        else:
-                            perf_summary[strat_name]['Losses'] += 1
-                        perf_summary[strat_name]['PnL'] += pnl_pct
-                        
-                        last_exit_idx[stock] = idx
-                        del open_positions[stock]
-                        
-                else:
-                    if stock in last_exit_idx and (idx - last_exit_idx[stock]) < R['cooldown_days']: continue
-                    if strat_func(df, idx):
-                        open_positions[stock] = {
-                            'Entry': row['Close'],
-                            'Target': row['Close'] * (1 + R['fixed_target_pct']/100),
-                            'SL': row['Close'] * (1 - R['fixed_sl_pct']/100),
-                            'Entry_Idx': idx
-                        }
-
-# Print the final execution scoreboard
-print("="*75)
-print("🏆 GRAND COMPARATIVE SCOREBOARD (ALL WATCHLIST SHARES - 1 YEAR) 🏆")
-print("="*75)
-report_data = []
-for strat, metrics in perf_summary.items():
-    tot = metrics['Total']
-    wr = round((metrics['Wins'] / tot * 100), 1) if tot > 0 else 0.0
-    report_data.append({
-        'Strategy Name': strat,
-        'Total Trades': tot,
-        'Wins (Targets)': metrics['Wins'],
-        'Losses/Time-Outs': metrics['Losses'],
-        'Net Win Rate %': f"{wr}%",
-        'Avg PnL per Trade': f"{round(metrics['PnL']/tot, 2)}%" if tot > 0 else "0%"
-    })
-
-df_report = pd.DataFrame(report_data)
-print(df_report.to_string(index=False))
-print("="*75)
+print("\n" + "="*70)
+print("🟥 LOSING TRADES STRUCTURAL PROFILE (WHEN PATTERN FAILED) 🟥")
+print("="*70)
+if not df_loss.empty:
+    print(f"Average Wick Rejection Ratio : {round(df_loss['Wick_Ratio'].mean()*100, 1)}%")
+    print(f"Average Volume Multiplier    : {round(df_loss['Volume_Multiplier'].mean(), 2)}x")
+    print(f"Average Max Upward Runup     : {round(df_loss['Max_Runup_%'].mean(), 2)}% (Before hitting SL)")
+    print(f"Average Days Before Failure  : {round(df_loss['Days_Held'].mean(), 1)} Days")
+else:
+    print("No losing samples recorded.")
+print("="*70)
