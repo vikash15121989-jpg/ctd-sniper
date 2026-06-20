@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V4 ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V5 ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,16 +22,16 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# PRICE ACTION BACKTEST PARAMETERS
+# STRICT PARAMETERS
 TARGET_PCT = 10.0        
 VALIDATION_SL = 5.0      
 MAX_HOLD_DAYS = 30
-COOLDOWN_DAYS = 10       # एक ट्रेड के बाद स्टॉक को सेट होने का पूरा समय दें ताकि ओवरलैपिंग न हो
+COOLDOWN_DAYS = 10       # ट्रेड खत्म होने के बाद 10 दिनों तक स्टॉक को दोबारा टच नहीं करना है
 
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
-        ws.clear()
+        ws.clear() # पुरानी कचरा वैल्यूज को पूरी तरह साफ करने के लिए
         return ws
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
@@ -43,17 +43,13 @@ def calculate_price_action_features(df):
     # 2. Resistance Line (CHoCH के लिए): पिछले 10 दिनों का उच्चतम स्तर
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     
-    # 3. Volume Breakdown (Institutional Activity)
+    # 3. Volume Breakdown
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
     df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
     
     return df
 
 def check_pure_price_action(df, idx):
-    """
-    बि放 किसी लैगिंग इंडिकेटर के, सिर्फ कैंडल और स्ट्रक्चर को देखकर 
-    एंट्री सिग्नल जनरेट करता है।
-    """
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1] if idx > 0 else row
     
@@ -65,16 +61,14 @@ def check_pure_price_action(df, idx):
     lower_wick = min(open_p, close_p) - low_p
     is_green = close_p > open_p
     
-    # --- PATTERN 1: SUPPORT RETEST + BUYER REJECTION ---
-    # प्राइस पुराने सपोर्ट के पास (1.2% के दायरे में) आया और नीचे से रिजेक्शन (लंबी पूँछ) दिखाई
+    # --- PATTERN 1: SUPPORT RETEST ---
     at_support = abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
     has_buyer_rejection = lower_wick >= (body_size * 1.2)
     
     if at_support and (has_buyer_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # --- PATTERN 2: CHoCH BREAKOUT (VOLUME BACKED) ---
-    # प्राइस ने पिछले 10 दिनों के हाई (रेसिस्टेंस) को ब्रेक किया और मजबूत ग्रीन कैंडल बनाई
+    # --- PATTERN 2: CHoCH BREAKOUT ---
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
     strong_volume = row['Vol_Multiple'] > 1.8
     
@@ -86,14 +80,12 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        # group_by='ticker' जोड़ने से डेलिस्टेड या गलत सिंबल्स कोड को क्रैश या गंदा नहीं करेंगे
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=True, timeout=15, group_by='ticker')
         
         if df.empty or len(df) < 40: return None, stock
         
-        # MultiIndex columns को क्लीन करने का सबसे मजबूत तरीका
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(-1)
             
@@ -101,7 +93,6 @@ def download_single_stock(stock):
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
     except Exception:
-        # बैकग्राउंड में एरर को साइलेंटली इग्नोर करेगा ताकि लॉग खराब न हो
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -111,7 +102,11 @@ total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
 pa_logs = []
-strategy_tracker = {}
+# दो टोकन फिक्स स्ट्रैटेजी ताकि कचरा नाम जमा न हों
+strategy_tracker = {
+    "PA_SUPPORT_RETEST": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0},
+    "PA_CHoCH_BREAKOUT": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
+}
 
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
@@ -128,10 +123,12 @@ for batch_num in range(total_batches):
     for stock, df in stock_data.items():
         idx = 20
         while idx < len(df) - 1:
-            # स्टेप 1: आज की तारीख पर प्योर प्राइस एक्शन चेक करो (No Look-Ahead Bias)
             has_setup, pa_logic = check_pure_price_action(df, idx)
             
-            if has_setup:
+            # स्ट्रिंग को साफ़ रखें ताकि डिक्शनरी में डुप्लीकेट कीज़ न बनें
+            pa_logic = pa_logic.strip().upper()
+            
+            if has_setup and pa_logic in strategy_tracker:
                 entry_price = df['Close'].iloc[idx]
                 target_price = entry_price * (1 + TARGET_PCT / 100)
                 sl_price = entry_price * (1 - VALIDATION_SL / 100)
@@ -140,7 +137,7 @@ for batch_num in range(total_batches):
                 exit_idx = idx + 1
                 max_gain = 0
                 
-                # स्टेप 2: एंट्री होने के बाद अगले 30 दिनों का लाइव सफर ट्रैक करो
+                # लाइव सिमुलेशन: अगले 30 दिन का सफर ट्रैक करो
                 for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
                     f_row = df.iloc[future_idx]
                     
@@ -161,7 +158,7 @@ for batch_num in range(total_batches):
                     trade_outcome = "TIMEOUT"
                     exit_idx = min(idx + MAX_HOLD_DAYS, len(df) - 1)
                 
-                # लॉग में डेटा डालें
+                # सेव करें
                 pa_logs.append({
                     'Stock': stock,
                     'Entry_Date': df.index[idx],
@@ -173,23 +170,20 @@ for batch_num in range(total_batches):
                     'Days_Held': exit_idx - idx
                 })
                 
-                # सेग्रिगेशन (Metrics Tracking)
-                if pa_logic not in strategy_tracker:
-                    strategy_tracker[pa_logic] = {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
+                # सेग्रिगेशन ट्रैकर अपडेट
                 strategy_tracker[pa_logic]['Total'] += 1
                 if trade_outcome == "PROFIT": strategy_tracker[pa_logic]['Wins'] += 1
                 elif trade_outcome == "LOSS": strategy_tracker[pa_logic]['Losses'] += 1
                 else: strategy_tracker[pa_logic]['Timeouts'] += 1
                 
-                # [FIX]: ट्रेड खत्म होने के बाद स्टॉक को सेटल होने के लिए जंप करें
                 idx = exit_idx + COOLDOWN_DAYS
             else:
                 idx += 1
 
-# --- GOOGLE SHEETS WRITE ---
-print("\nUploading Pure Price Action Performance to Google Sheets...", flush=True)
+# --- GOOGLE SHEETS CLEAN UPLOAD ---
+print("\nUploading Pure Unbiased Performance to Google Sheets...", flush=True)
 
-# Sheet 1: Detailed Logs
+# 1. Detailed Sheet साफ़ करके लिखें
 ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
 if pa_logs:
     df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
@@ -200,19 +194,22 @@ if pa_logs:
         ws_logs.append_rows(payload_rev[i:i+1000])
         time.sleep(1)
 
-# Sheet 2: Pure Performance Summary
+# 2. Summary Sheet साफ़ करके केवल 2 क्लीन रोज़ लिखें
 ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
-if strategy_tracker:
-    summary_rows = []
-    for logic, metrics in strategy_tracker.items():
-        total = metrics['Total']
-        wins = metrics['Wins']
-        losses = metrics['Losses']
-        timeouts = metrics['Timeouts']
-        win_rate = round((wins / total) * 100, 2) if total > 0 else 0.0
-        summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
+summary_rows = []
+for logic, metrics in strategy_tracker.items():
+    total = metrics['Total']
+    # अगर किसी स्ट्रैटेजी का कोई ट्रिगर ही नहीं मिला तो उसे समरी में ब्लैंक या 0 दिखाएंगे
+    if total == 0: continue 
     
+    wins = metrics['Wins']
+    losses = metrics['Losses']
+    timeouts = metrics['Timeouts']
+    win_rate = round((wins / total) * 100, 2)
+    summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
+
+if summary_rows:
     header_sum = ["Price Action Mode", "Total Signal Count", "Target Hits (10% Profit)", "StopLoss Hits (5% Loss)", "Timeouts", "Real Price Action Win Rate %"]
     ws_summary.update([header_sum] + summary_rows)
 
-print("\n=== PURE PRICE ACTION TEST DONE ===")
+print("\n=== SYSTEM EXECUTION COMPLETE ===")
