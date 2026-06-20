@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V9 (CASE-FIXED) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V10 (MULTIINDEX FIX) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -43,9 +43,19 @@ def get_or_create_ws(sh, title):
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_price_action_features(df):
-    # कॉलम नामों को बड़े अक्षरों में फ़ोर्स करें ताकि याहू फाइनेंस का चेंज कोड न तोड़े
-    df.columns = [c.capitalize() for c in df.columns]
+    # मल्टी-इंडेक्स कॉलम्स को पूरी तरह साफ़ और सिंगल लेयर करने का अचूक तरीका
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
     
+    # कॉलम नामों को क्लीन और स्टैंडर्ड 'Open', 'High', 'Low', 'Close', 'Volume' में बदलें
+    df.columns = [str(c).strip().capitalize() for c in df.columns]
+    
+    # डेटा री-इंडेक्सिंग और क्लीनिंग
+    df = df.dropna(subset=['Close', 'High', 'Low', 'Open'])
+    
+    if len(df) < 25:
+        return pd.DataFrame() # अगर डेटा बहुत कम है तो खाली रिटर्न करें
+        
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
@@ -56,6 +66,10 @@ def check_pure_price_action(df, idx):
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1] if idx > 0 else row
     
+    # सेफ्टी चेक: अगर कोई वैल्यू NaN है तो सिग्नल जेनरेट न करें
+    if pd.isna(row['Low']) or pd.isna(row['Support_20D']) or pd.isna(row['Resistance_10D']):
+        return False, "NONE"
+        
     open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
     candle_range = high_p - low_p
     if candle_range <= 0: return False, "NONE"
@@ -87,15 +101,15 @@ def download_single_stock(stock):
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=True, timeout=15, session=SESSION)
         
+        if df.empty: return None, stock
+        
+        df = calculate_price_action_features(df)
         if df.empty or len(df) < 40: return None, stock
         
-        if isinstance(df.columns, pd.MultiIndex): 
-            df.columns = df.columns.get_level_values(-1)
-            
-        df = calculate_price_action_features(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
-    except Exception:
+    except Exception as e:
+        print(f"Error downloading {stock}: {e}", flush=True)
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -110,6 +124,8 @@ strategy_tracker = {
     "PA_CHoCH_BREAKOUT": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
 }
 
+print(f"Processing {total_stocks} stocks in {total_batches} batches...", flush=True)
+
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
     end_idx = min(start_idx + BATCH_SIZE, total_stocks)
@@ -120,7 +136,8 @@ for batch_num in range(total_batches):
         future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
         for future in as_completed(future_to_stock):
             df, stock = future.result()
-            if df is not None: stock_data[stock] = df
+            if df is not None and not df.empty: 
+                stock_data[stock] = df
 
     for stock, df in stock_data.items():
         idx = 20
