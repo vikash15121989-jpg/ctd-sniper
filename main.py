@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V4 ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -26,7 +26,7 @@ ws_watchlist = sh.worksheet("Watchlist")
 TARGET_PCT = 10.0        
 VALIDATION_SL = 5.0      
 MAX_HOLD_DAYS = 30
-COOLDOWN_DAYS = 8        # एक ट्रेड के बाद स्टॉक को सेट होने का समय दें
+COOLDOWN_DAYS = 10       # एक ट्रेड के बाद स्टॉक को सेट होने का पूरा समय दें ताकि ओवरलैपिंग न हो
 
 def get_or_create_ws(sh, title):
     try: 
@@ -51,13 +51,12 @@ def calculate_price_action_features(df):
 
 def check_pure_price_action(df, idx):
     """
-    बिना किसी लैगिंग इंडिकेटर के, सिर्फ कैंडल और स्ट्रक्चर को देखकर 
+    बि放 किसी लैगिंग इंडिकेटर के, सिर्फ कैंडल और स्ट्रक्चर को देखकर 
     एंट्री सिग्नल जनरेट करता है।
     """
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1] if idx > 0 else row
     
-    # कैंडल की बनावट (Body & Wicks)
     open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
     candle_range = high_p - low_p
     if candle_range <= 0: return False, "NONE"
@@ -69,7 +68,7 @@ def check_pure_price_action(df, idx):
     # --- PATTERN 1: SUPPORT RETEST + BUYER REJECTION ---
     # प्राइस पुराने सपोर्ट के पास (1.2% के दायरे में) आया और नीचे से रिजेक्शन (लंबी पूँछ) दिखाई
     at_support = abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
-    has_buyer_rejection = lower_wick >= (body_size * 1.2) # कैंडल के नीचे लंबी पूँछ है
+    has_buyer_rejection = lower_wick >= (body_size * 1.2)
     
     if at_support and (has_buyer_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
@@ -77,7 +76,7 @@ def check_pure_price_action(df, idx):
     # --- PATTERN 2: CHoCH BREAKOUT (VOLUME BACKED) ---
     # प्राइस ने पिछले 10 दिनों के हाई (रेसिस्टेंस) को ब्रेक किया और मजबूत ग्रीन कैंडल बनाई
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row['Vol_Multiple'] > 1.8 # सामान्य से दोगुना वॉल्यूम (बड़े प्लेयर्स की एंट्री)
+    strong_volume = row['Vol_Multiple'] > 1.8
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
@@ -87,14 +86,22 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
+        # group_by='ticker' जोड़ने से डेलिस्टेड या गलत सिंबल्स कोड को क्रैश या गंदा नहीं करेंगे
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
-                       end=BACKTEST_END + timedelta(days=5), progress=False, auto_adjust=True, timeout=15)
+                       end=BACKTEST_END + timedelta(days=5), progress=False, 
+                       auto_adjust=True, timeout=15, group_by='ticker')
+        
         if df.empty or len(df) < 40: return None, stock
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
+        # MultiIndex columns को क्लीन करने का सबसे मजबूत तरीका
+        if isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.get_level_values(-1)
+            
         df = calculate_price_action_features(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
-    except:
+    except Exception:
+        # बैकग्राउंड में एरर को साइलेंटली इग्नोर करेगा ताकि लॉग खराब न हो
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -121,7 +128,7 @@ for batch_num in range(total_batches):
     for stock, df in stock_data.items():
         idx = 20
         while idx < len(df) - 1:
-            # स्टेप 1: आज की तारीख पर प्योर प्राइस एक्शन चेक करो
+            # स्टेप 1: आज की तारीख पर प्योर प्राइस एक्शन चेक करो (No Look-Ahead Bias)
             has_setup, pa_logic = check_pure_price_action(df, idx)
             
             if has_setup:
@@ -174,12 +181,12 @@ for batch_num in range(total_batches):
                 elif trade_outcome == "LOSS": strategy_tracker[pa_logic]['Losses'] += 1
                 else: strategy_tracker[pa_logic]['Timeouts'] += 1
                 
-                # ट्रेड खत्म होने के बाद स्टॉक को आराम दें (Cooldown)
+                # [FIX]: ट्रेड खत्म होने के बाद स्टॉक को सेटल होने के लिए जंप करें
                 idx = exit_idx + COOLDOWN_DAYS
             else:
                 idx += 1
 
-# --- GOOGLE SHEETS GRAPH WRITE ---
+# --- GOOGLE SHEETS WRITE ---
 print("\nUploading Pure Price Action Performance to Google Sheets...", flush=True)
 
 # Sheet 1: Detailed Logs
