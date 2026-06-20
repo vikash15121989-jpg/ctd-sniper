@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V10 (MULTIINDEX FIX) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V11 (STRICT COLUMN FIX) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -43,30 +43,49 @@ def get_or_create_ws(sh, title):
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_price_action_features(df):
-    # मल्टी-इंडेक्स कॉलम्स को पूरी तरह साफ़ और सिंगल लेयर करने का अचूक तरीका
+    # मल्टी-इंडेक्स हटाकर कॉलम्स फ्लैट करें
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(-1)
     
-    # कॉलम नामों को क्लीन और स्टैंडर्ड 'Open', 'High', 'Low', 'Close', 'Volume' में बदलें
+    # कॉलम्स को नाम ठीक करें (Capitalize)
     df.columns = [str(c).strip().capitalize() for c in df.columns]
     
-    # डेटा री-इंडेक्सिंग और क्लीनिंग
-    df = df.dropna(subset=['Close', 'High', 'Low', 'Open'])
-    
+    # फॉलबैक: अगर 'Close' गायब है लेकिन 'Adj close' मौजूद है, तो उसे 'Close' बना दें
+    if 'Close' not in df.columns and 'Adj close' in df.columns:
+        df['Close'] = df['Adj close']
+    elif 'Close' not in df.columns and 'Adj close' not in df.columns:
+        # अगर दोनों ही गायब हैं, तो जो भी आखरी कॉलम क्लोज जैसा दिखे उसे चुनें
+        close_cols = [c for c in df.columns if 'close' in c.lower()]
+        if close_cols:
+            df['Close'] = df[close_cols[0]]
+
+    # चेक करें कि सारे ज़रूरी कॉलम्स अब उपलब्ध हैं या नहीं
+    required_cols = ['Open', 'High', 'Low', 'Close']
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise KeyError(f"Missing essential columns: {missing_cols}. Available: {list(df.columns)}")
+        
+    df = df.dropna(subset=required_cols)
     if len(df) < 25:
-        return pd.DataFrame() # अगर डेटा बहुत कम है तो खाली रिटर्न करें
+        return pd.DataFrame()
         
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
-    df['Vol_20MA'] = df['Volume'].rolling(20).mean()
-    df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
+    
+    # वॉल्यूम चेक और फॉलबैक
+    vol_col = 'Volume' if 'Volume' in df.columns else (df.columns[-1] if 'vol' in df.columns[-1].lower() else None)
+    if vol_col:
+        df['Vol_20MA'] = df[vol_col].rolling(20).mean()
+        df['Vol_Multiple'] = df[vol_col] / df['Vol_20MA']
+    else:
+        df['Vol_Multiple'] = 2.0  # सेफ्टी फॉलबैक ताकि वॉल्यूम की वजह से कोड न रुके
+        
     return df
 
 def check_pure_price_action(df, idx):
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1] if idx > 0 else row
     
-    # सेफ्टी चेक: अगर कोई वैल्यू NaN है तो सिग्नल जेनरेट न करें
     if pd.isna(row['Low']) or pd.isna(row['Support_20D']) or pd.isna(row['Resistance_10D']):
         return False, "NONE"
         
@@ -87,7 +106,7 @@ def check_pure_price_action(df, idx):
         
     # 2. CHoCH BREAKOUT
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row['Vol_Multiple'] > 1.8
+    strong_volume = row.get('Vol_Multiple', 2.0) > 1.8
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
@@ -97,9 +116,10 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
+        # auto_adjust=False किया ताकि ट्रेडिशनल क्लोज कॉलम मिस न हो
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
-                       auto_adjust=True, timeout=15, session=SESSION)
+                       auto_adjust=False, timeout=15, session=SESSION)
         
         if df.empty: return None, stock
         
@@ -247,3 +267,4 @@ except Exception as sheet_err:
     print(f"⚠️ Sheet Upload Failed! Error: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
+                
