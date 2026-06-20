@@ -14,18 +14,18 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== RS BEATER V37 - 10-DAY MAX VOLUME & BREAKOUT ENGINE ===", flush=True)
+print("=== RS BEATER V38 - REVERSE BOTTOM SNIPER ENGINE ===", flush=True)
 
-# GSheet Connection Setup
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
+# TARGET & SL SETTINGS (Optimized for Bottom Buying)
 R = {
     'min_daily_value_cr': 30.0,
     'fixed_target_pct': 6.0,       
-    'fixed_sl_pct': 3.0,           
+    'fixed_sl_pct': 3.0, # Will act as max emergency SL           
     'trail_trigger_pct': 2.5,      
     'time_stop_days': 8,
     'cooldown_days': 4
@@ -43,9 +43,6 @@ def calculate_base_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     df['Low_Min_10D'] = df['Low'].shift(1).rolling(window=10).min()
     df['Support_Zone_20D'] = df['Low'].shift(1).rolling(window=20).min()
-    
-    # NEW Indicator: Calculate Max Volume of the PREVIOUS 10 days for volume surge check
-    df['Vol_Max_10D'] = df['Volume'].shift(1).rolling(window=10).max()
     return df
 
 def check_best_combined_pattern(df, idx):
@@ -71,8 +68,8 @@ def is_bullish_confirmation_candle(row):
     upper_wick = high_p - max(open_p, close_p)
     is_green = close_p > open_p
     
-    is_hammer = (lower_wick >= (body_size * 1.5)) and (upper_wick <= (candle_range * 0.25))
-    is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 1.0)
+    is_hammer = (lower_wick >= (body_size * 1.3)) and (upper_wick <= (candle_range * 0.30))
+    is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 0.5) # Gentle bounce tracking
     
     return is_hammer or is_strong_green
 
@@ -112,7 +109,7 @@ for batch_num in range(total_batches):
         open_trade = None
         last_exit_idx = -100
         
-        for idx in range(20, len(df) - 1):
+        for idx in range(20, len(df)):
             row = df.iloc[idx]
             current_date = df.index[idx]
             
@@ -151,33 +148,30 @@ for batch_num in range(total_batches):
                 avg_val = (df['Close'].iloc[max(0,idx-20):idx] * df['Volume'].iloc[max(0,idx-20):idx]).mean() / 1e7
                 if pd.isna(avg_val) or avg_val < R['min_daily_value_cr']: continue
                 
-                # Step 1: Check Silent Accumulation & Stop Hunt
+                # Check Silent Accumulation & Stop Hunt
                 is_pattern, pattern_type = check_best_combined_pattern(df, idx)
                 if is_pattern:
-                    # Step 2: Check Bullish Candle Confirmation
+                    # Check Bullish Candle Confirmation
                     if is_bullish_confirmation_candle(row):
                         support_line = row['Support_Zone_20D']
                         pct_from_support = ((row['Low'] / support_line) - 1) * 100
                         
                         if pct_from_support <= 1.5:
-                            # CRITICAL NEW CONDITION: Current Volume MUST be greater than Max Volume of last 10 days
-                            if row['Volume'] > row['Vol_Max_10D']:
-                                
-                                # Step 3: Check Next Day (Day 2) Close Breakout of High
-                                if idx + 1 < len(df):
-                                    next_row = df.iloc[idx + 1]
-                                    if next_row['Close'] > row['High']:
-                                        open_trade = {
-                                            'Setup_Date': df.index[idx + 1], 
-                                            'Entry_Price': next_row['Close'],
-                                            'Target_Price': next_row['Close'] * (1 + R['fixed_target_pct']/100),
-                                            'SL_Price': next_row['Close'] * (1 - R['fixed_sl_pct']/100),
-                                            'Entry_Idx': idx + 1,
-                                            'Pattern_Type': f"{pattern_type}_VOL_SURGE_CONFIRMED",
-                                            'Max_High': next_row['High']
-                                        }
+                            # CRITICAL REVERSE CHANGE: Direct entry on the SAME DAY close to capture cheap bottom
+                            # Dynamic SL is either the candle low or max 3% fixed SL
+                            dynamic_sl_price = max(row['Low'], row['Close'] * (1 - R['fixed_sl_pct']/100))
+                            
+                            open_trade = {
+                                'Setup_Date': current_date, 
+                                'Entry_Price': row['Close'],
+                                'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
+                                'SL_Price': dynamic_sl_price,
+                                'Entry_Idx': idx,
+                                'Pattern_Type': f"{pattern_type}_BOTTOM_BUY",
+                                'Max_High': row['High']
+                            }
 
-# --- DASHBOARD GENERATION & UPLOAD ---
+# --- STABLE SHEET WRITE BLOCK ---
 print("\nConnecting to Google Sheet...", flush=True)
 ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
 ws_datewise.clear()
@@ -197,7 +191,7 @@ if trade_logs:
     avg_pnl_per_trade = round(df_logs['PnL_%'].mean(), 2)
 
     dashboard = [
-        ["📊 STRATEGY PERFORMANCE DASHBOARD (VOLUME SURGE + BREAKOUT)", "", "", "", "", "", "", "", "", ""],
+        ["📊 REVERSE SNIPER ENGINE (BOTTOM BUYING ON SUPPORT)", "", "", "", "", "", "", "", "", ""],
         ["Total Trades", "Wins (Targets)", "Losses (SL)", "Cost Exits", "Time Outs", "WIN RATE %", "NET P&L %", "AVG P&L/TRADE", "", ""],
         [total_trades, wins, losses, cost_exits, timeouts, f"{win_rate}%", f"{net_pnl}%", f"{avg_pnl_per_trade}%", "", ""],
         ["", "", "", "", "", "", "", "", "", ""],
@@ -208,14 +202,12 @@ if trade_logs:
     payload = dashboard + [header] + all_rows
     
     chunk_size = 1000
-    print(f"Uploading {len(payload)} rows including Dashboard Summary...", flush=True)
     for i in range(0, len(payload), chunk_size):
         chunk = payload[i:i + chunk_size]
         if i == 0: ws_datewise.update(chunk)
         else: ws_datewise.append_rows(chunk)
         time.sleep(1.5)
-    print(f"\n[VERIFIED] Dashboard & Filtered Volume Surge Logs successfully saved!", flush=True)
+    print(f"\n[VERIFIED] Clean Bottom-buying Strategy saved!", flush=True)
 else:
-    print("\n[INFO] No trades matched.", flush=True)
-    ws_datewise.update([["System_Status"], ["No Trades Matched the Strict 10-Day Max Volume + Breakout filter."]])
+    ws_datewise.update([["System_Status"], ["No Trades Matched."]])
     
