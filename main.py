@@ -13,7 +13,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V29 - DATE-WISE GOOGLE SHEET LOGGER ===", flush=True)
+print("=== RS BEATER V30 - BULLISH CANDLESTICK CONFIRMATION ENGINE ===", flush=True)
 
 # GSheet Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -25,7 +25,7 @@ R = {
     'min_daily_value_cr': 30.0,
     'fixed_target_pct': 6.0,       # 6% Profit Target
     'fixed_sl_pct': 3.0,           # 3% Initial SL
-    'trail_trigger_pct': 2.5,      # Lock at cost if price hits 2.5% runup
+    'trail_trigger_pct': 2.5,      # 2.5% Profit trailing to lock cost
     'time_stop_days': 8,
     'cooldown_days': 4
 }
@@ -57,6 +57,25 @@ def check_best_combined_pattern(df, idx):
     elif stop_hunt: return True, "STOP_HUNT"
     elif hidden_accum: return True, "HIDDEN_ACCUM"
     return False, "NONE"
+
+# --- NEW EXTRACTED BULLISH CANDLE CONFIRMATION FILTER ---
+def is_bullish_confirmation_candle(row):
+    open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
+    candle_range = high_p - low_p
+    if candle_range <= 0: return False
+    
+    body_size = abs(close_p - open_p)
+    lower_wick = min(open_p, close_p) - low_p
+    upper_wick = high_p - max(open_p, close_p)
+    is_green = close_p > open_p
+    
+    # 1. HAMMER SIGNAL: Lower wick is dominant, very small upper body, closes near high
+    is_hammer = (lower_wick >= (body_size * 1.8)) and (upper_wick <= (candle_range * 0.20))
+    
+    # 2. STRONG BULLISH CONFIRMATION: Clean solid green body pushing up forcefully (>= 1.5% momentum)
+    is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 1.5)
+    
+    return is_hammer or is_strong_green
 
 def download_single_stock(stock):
     try:
@@ -104,7 +123,6 @@ for batch_num in range(total_batches):
                 current_max_profit = ((row['High'] / open_trade['Entry_Price']) - 1) * 100
                 current_sl = open_trade['SL_Price']
                 
-                # Bulletproof 2.5% Trailing Lock
                 if current_max_profit >= R['trail_trigger_pct']:
                     current_sl = open_trade['Entry_Price']
 
@@ -150,34 +168,27 @@ for batch_num in range(total_batches):
                 
                 is_pattern, pattern_type = check_best_combined_pattern(df, idx)
                 if is_pattern:
-                    c_range = row['High'] - row['Low']
-                    w_ratio = (min(row['Open'], row['Close']) - row['Low']) / c_range if c_range > 0 else 0
-                    v_mult = row['Volume'] / row['Vol_Avg20'] if row['Vol_Avg20'] > 0 else 1
-                    
-                    open_trade = {
-                        'Setup_Date': current_date,
-                        'Entry_Price': row['Close'],
-                        'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
-                        'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
-                        'Entry_Idx': idx,
-                        'Pattern_Type': pattern_type,
-                        'Wick_Ratio': round(w_ratio, 2),
-                        'Vol_Mult': round(v_mult, 2),
-                        'Max_High': row['High']
-                    }
+                    # CRITICAL: Enter ONLY if the current setup candle matches our Bullish Candlestick Filter
+                    if is_bullish_confirmation_candle(row):
+                        open_trade = {
+                            'Setup_Date': current_date,
+                            'Entry_Price': row['Close'],
+                            'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
+                            'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
+                            'Entry_Idx': idx,
+                            'Pattern_Type': pattern_type,
+                            'Max_High': row['High']
+                        }
 
 # --- SAVE TO GOOGLE SHEETS DATEWISE ---
 if trade_logs:
     df_logs = pd.DataFrame(trade_logs)
-    # Sorting everything perfectly by Setup Date
     df_logs = df_logs.sort_values(by='Setup_Date', ascending=True)
     
     ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
     ws_datewise.clear()
     
-    # Uploading Data
     ws_datewise.update([df_logs.columns.values.tolist()] + df_logs.values.tolist())
-    print(f"\n[SUCCESS] {len(df_logs)} Trades perfectly saved to 'PA_DATEWISE_LOGS' sheet date-wise!", flush=True)
+    print(f"\n[SUCCESS] {len(df_logs)} High-Confirmation Trades saved to 'PA_DATEWISE_LOGS' sheet!", flush=True)
 else:
-    print("\n[WARNING] No trades generated during this period.", flush=True)
-    
+    print("\n[WARNING] No trades passed the Bullish Candle Filter during this period.", flush=True)
