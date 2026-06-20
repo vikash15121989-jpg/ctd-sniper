@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V23 - TOP 10 STOCK FINDER ===", flush=True)
+print("=== RS BEATER V23 - REAL HOLY GRAIL FINDER ===", flush=True)
 print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,12 +22,12 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# V23 RULES WITH 10% TARGET & COST-TO-COST TRAILING
+# V23 STRICT TRADING PARAMETERS WITH 10% DYNAMIC JACKPOT TARGET
 R = {
     'min_daily_value_cr': 30.0,    
     'trend_days': 20,              
-    'fixed_target_pct': 10.0,      
-    'fixed_sl_pct': 3.5,           
+    'fixed_target_pct': 10.0,      # Target 10% for big moves like PANAMAPET
+    'fixed_sl_pct': 3.5,           # Stop Loss 3.5%
     'time_stop_days': 8,           
     'risk_per_trade': 10000,       
     'cooldown_days': 5,            
@@ -139,7 +139,7 @@ date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-
 debug_counter = {'nan':0, 'trend':0, 'no_base':0, 'no_breakout':0, 'volume':0, 'rsi':0, 'rs_weak':0, 'liquidity':0, 'cooldown':0, 'max_positions':0}
 last_exit_dates = {}
 
-# Performance tracker dictionary
+# Performance dictionary tracker
 stock_perf = {}
 
 for batch_num in range(total_batches):
@@ -166,11 +166,11 @@ for batch_num in range(total_batches):
             if current_date not in df.index: continue
             row = df.loc[current_date]
 
-            # COST-TO-COST TRAILING
+            # COST-TO-COST TRAILING LOGIC
             current_max_profit = ((row['High'] / pos['Entry']) - 1) * 100
             current_sl = pos['SL']
             if current_max_profit >= 5.0:
-                current_sl = pos['Entry']
+                current_sl = pos['Entry'] # Risk turns absolute zero
 
             sl_hit = row['Low'] <= current_sl
             target_hit = row['High'] >= pos['Target']
@@ -243,17 +243,20 @@ for batch_num in range(total_batches):
                 'SL': round(sl_price, 2), 'Target': round(target_price, 2), 'Qty': qty
             })
 
-# Final Analysis & Leaderboard
+# STRICT REAL LEADERBOARD ANALYSIS
 df_perf = pd.DataFrame.from_dict(stock_perf, orient='index').reset_index().rename(columns={'index': 'Stock'})
 if not df_perf.empty:
     df_perf['Win_Rate_%'] = round((df_perf['Wins'] / df_perf['Total_Trades']) * 100, 1)
+    
+    # FILTER: Kam se kam 3 ya usse zyada trades waale stocks hi allow honge
+    df_perf = df_perf[df_perf['Total_Trades'] >= 3]
     df_perf = df_perf.sort_values(by=['Wins', 'Win_Rate_%'], ascending=[False, False])
 
 print("\n" + "="*60)
-print("🏆 TOP 10 PERFORMING SHARES LEADEDBOARD (MOST WINS) 🏆")
+print("🏆 REAL HOLY GRAIL LEADERBOARD (MIN 3 TRADES) 🏆")
 print("="*60)
 if df_perf.empty:
-    print("No optimized stock data found.")
+    print("Koi bhi stock minimum 3 trades filter pass nahi kar paya. Watchlist choti hai.")
 else:
     print(df_perf.head(10).to_string(index=False))
     print("="*60)
@@ -267,4 +270,4 @@ try:
         print(f"\n[SUCCESS] Results saved to '20EMA_BREAKOUT_BT' Sheet!", flush=True)
 except Exception as e:
     print(f"GSheet error: {e}", flush=True)
-    
+            
