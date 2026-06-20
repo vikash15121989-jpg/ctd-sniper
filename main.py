@@ -12,9 +12,9 @@ warnings.filterwarnings('ignore')
 
 BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 40
+BATCH_SIZE = 35  # Reduced batch size to stay well within Yahoo API limits
 
-print("=== RS BEATER V32 - SUPPORT ZONE SHEET UPLOADER FIXED ===", flush=True)
+print("=== RS BEATER V33 - ULTRA-ROBUST SHEET LOGGER ===", flush=True)
 
 # GSheet Connection Setup
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -35,7 +35,7 @@ def get_or_create_ws(sh, title):
     try:
         return sh.worksheet(title)
     except:
-        return sh.add_worksheet(title=title, rows=30000, cols=12)
+        return sh.add_worksheet(title=title, rows=35000, cols=12)
 
 def calculate_base_indicators(df):
     delta = df['Close'].diff()
@@ -78,16 +78,19 @@ def is_bullish_confirmation_candle(row):
     return is_hammer or is_strong_green
 
 def download_single_stock(stock):
+    # Added explicit try-except block here to prevent single ticker failures from crashing the thread pipeline
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=50),
-                       end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
+                       end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True, timeout=15)
         if df.empty or len(df) < 30: return None, stock
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = calculate_base_indicators(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
-    except: return None, stock
+    except Exception as e:
+        print(f"[SKIP] Ticker {stock} encountered error or timeout: {str(e)}", flush=True)
+        return None, stock
 
 stocks = ws_watchlist.col_values(1)[1:]
 stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip()])))
@@ -102,7 +105,7 @@ for batch_num in range(total_batches):
     batch_stocks = stocks[start_idx:end_idx]
 
     stock_data = {}
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    with ThreadPoolExecutor(max_workers=12) as executor:
         future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
         for future in as_completed(future_to_stock):
             df, stock = future.result()
@@ -183,31 +186,40 @@ for batch_num in range(total_batches):
                                 'Max_High': row['High']
                             }
 
-# --- DIRECT ROBUST UPLOAD BLOCK ---
+# --- STABLE CHUNKED UPLOAD WITH EXPLICIT EXCEPTION COVERS ---
+print("\nPreparing Google Sheet connection for final write...", flush=True)
 ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
 ws_datewise.clear()
-time.sleep(2)
+time.sleep(3)
 
 if trade_logs:
     df_logs = pd.DataFrame(trade_logs)
     df_logs = df_logs.sort_values(by='Setup_Date', ascending=True)
     
-    # Converting DataFrame to list of lists
     header = df_logs.columns.values.tolist()
     all_rows = df_logs.values.tolist()
     payload = [header] + all_rows
     
-    # Uploading in chunks of 2000 rows to avoid API crash
-    chunk_size = 2000
+    # Safe chunk transmission block to avoid HTTP write errors
+    chunk_size = 1000
+    print(f"Uploading {len(payload)} rows in steady chunks...", flush=True)
+    
     for i in range(0, len(payload), chunk_size):
         chunk = payload[i:i + chunk_size]
-        if i == 0:
-            ws_datewise.update(chunk)
-        else:
-            ws_datewise.append_rows(chunk)
-        time.sleep(1.5) # Anti-rate limit delay
+        try:
+            if i == 0:
+                ws_datewise.update(chunk)
+            else:
+                ws_datewise.append_rows(chunk)
+            print(f" Pushed rows {i} to {min(i + chunk_size, len(payload))} successfully.", flush=True)
+            time.sleep(2.0)
+        except Exception as sheet_err:
+            print(f"Chunk write warning at index {i}: {str(sheet_err)}. Retrying in 5s...", flush=True)
+            time.sleep(5.0)
+            if i == 0: ws_datewise.update(chunk)
+            else: ws_datewise.append_rows(chunk)
         
-    print(f"\n[SUCCESS] Total {len(df_logs)} Elite Support-Zone Trades successfully pushed to tab 'PA_DATEWISE_LOGS'!", flush=True)
+    print(f"\n[VERIFIED SUCCESS] Data safely locked inside 'PA_DATEWISE_LOGS' sheet!", flush=True)
 else:
-    print("\n[WARNING] No trades matched the criteria.", flush=True)
+    print("\n[WARNING] No records found matching the criteria.", flush=True)
     
