@@ -1,334 +1,192 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import gspread
-import json
-import os
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-BACKTEST_MODE = True
-BACKTEST_END = datetime.now().date()
-BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 50
+# ========== CONFIG - YAHAN BADAL ==========
+STOCK = "MANKIND" # Konsa stock check karna hai
+MOVE_PCT = 10.0 # Kitne % move ko success manenge
+LOOKFORWARD_DAYS = 20 # Signal ke baad kitne din me 10% aana chahiye
+STOP_LOSS_PCT = 5.0 # Kitne % loss pe fail manenge
+LOOKBACK_PATTERN = 5 # Pattern ke liye kitne din peeche dekhna hai
+# ==========================================
 
-print("=== RS BEATER V22 - VOLUMETRIC COMPRESSION SNIPER EX ===", flush=True)
-print(f"Backtest Period: {BACKTEST_START} to {BACKTEST_END}", flush=True)
+print(f"=== {STOCK} - UC PATTERN BACKTEST ===", flush=True)
 
-gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
-gc = gspread.service_account_from_dict(gcp_json_creds)
-sh = gc.open("CTD_Sniper")
-ws_watchlist = sh.worksheet("Watchlist")
+# 1. DATA DOWNLOAD
+df = yf.download(f"{STOCK}.NS", period="max", progress=False, auto_adjust=True)
+if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+print(f"Data: {df.index[0].date()} to {df.index[-1].date()} | {len(df)} days", flush=True)
 
-# V22 OPTIMIZED RULES FOR COMPRESSION & STRICT BREAKOUT
-R = {
-    'min_daily_value_cr': 30.0,    
-    'trend_days': 20,              
-    'fixed_target_pct': 5.0,       # 5% Fixed Target
-    'fixed_sl_pct': 3.0,           # 3% Fixed Stop Loss
-    'time_stop_days': 8,           
-    'risk_per_trade': 10000,       
-    'cooldown_days': 5,            
-    'max_open_trades': 6,          
-    'rs_1m_min': 2.0,              
-}
+# 2. INDICATORS
+df['EMA20'] = df['Close'].ewm(span=20).mean()
+df['EMA50'] = df['Close'].ewm(span=50).mean()
+df['Vol_Avg20'] = df['Volume'].rolling(20).mean()
+df['Range_Pct'] = (df['High'] - df['Low']) / df['Low'] * 100
+delta = df['Close'].diff()
+gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+rs = gain / loss
+df['RSI'] = 100 - (100 / (1 + rs))
 
-def get_or_create_ws(sh, title):
-    try: return sh.worksheet(title)
-    except: return sh.add_worksheet(title=title, rows=10000, cols=30)
-
-def calculate_indicators(df):
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+# 3. STEP 1 - SABHI 10%+ MOVES DHUNDO
+success_signals = []
+for i in range(20, len(df) - LOOKFORWARD_DAYS):
+    entry_price = df['Close'].iloc[i]
+    future_high = df['High'].iloc[i+1:i+LOOKFORWARD_DAYS+1].max()
+    future_low = df['Low'].iloc[i+1:i+LOOKFORWARD_DAYS+1].min()
     
-    # 10 Days Max Volume and Max Price (Excluding current day for reference setup)
-    df['MaxVol_10D'] = df['Volume'].shift(1).rolling(window=10).max()
-    df['MaxHigh_10D'] = df['High'].shift(1).rolling(window=10).max()
-
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    return df
-
-print("\n Downloading Nifty 50 reference data...", flush=True)
-nifty_df = yf.download("^NSEI", start=BACKTEST_START - timedelta(days=100), end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
-if isinstance(nifty_df.columns, pd.MultiIndex): nifty_df.columns = nifty_df.columns.get_level_values(0)
-nifty_df.index = pd.to_datetime(nifty_df.index).strftime('%Y-%m-%d')
-nifty_df = nifty_df[~nifty_df.index.duplicated(keep='last')]
-
-def calculate_rs_1m(df, i, current_date, nifty_df):
-    try:
-        if current_date not in nifty_df.index or i < 21: return None
-        nifty_idx = nifty_df.index.get_loc(current_date)
-        if nifty_idx < 21: return None
-
-        stock_start = df['Close'].iloc[i-21]
-        stock_now = df['Close'].iloc[i]
-        stock_ret = ((stock_now - stock_start) / stock_start) * 100
-
-        nifty_start = nifty_df['Close'].iloc[nifty_idx-21]
-        nifty_now = nifty_df['Close'].iloc[nifty_idx]
-        nifty_ret = ((nifty_now - nifty_start) / nifty_start) * 100
-
-        return round(stock_ret - nifty_ret, 2)
-    except:
-        return None
-
-def check_compression_and_breakout(df, current_idx, debug_counter):
-    row_today = df.iloc[current_idx]
+    pct_up = (future_high / entry_price - 1) * 100
+    pct_down = (future_low / entry_price - 1) * 100
     
-    # 1. TREND CHECK
-    if not (row_today['Close'] > row_today['EMA20'] > row_today['EMA50']):
-        debug_counter['trend'] += 1
-        return False, 0
-        
-    # RSI Check
-    if not (53 <= row_today['RSI'] <= 75):
-        debug_counter['rsi'] += 1
-        return False, 0
-
-    # 2. PICHLE 10 DIN ME SETUP DAY DHUNDO
-    setup_found = False
-    trigger_level = 0
-    
-    for lookback in range(1, 11):
-        setup_idx = current_idx - lookback
-        if setup_idx < 20: break
-        
-        row_setup = df.iloc[setup_idx]
-        
-        vol_condition = row_setup['Volume'] > row_setup['MaxVol_10D']
-        price_condition = row_setup['High'] < row_setup['MaxHigh_10D']
-        
-        if vol_condition and price_condition:
-            setup_found = True
-            trigger_level = row_setup['MaxHigh_10D']
+    # SL pehle hit hua ya target?
+    sl_hit_day = None
+    target_hit_day = None
+    for j in range(i+1, i+LOOKFORWARD_DAYS+1):
+        if df['Low'].iloc[j] <= entry_price * (1 - STOP_LOSS_PCT/100):
+            sl_hit_day = j
             break
-            
-    if not setup_found:
-        debug_counter['no_base'] += 1 
-        return False, 0
-
-    # 3. ENTRY TRIGGER WITH BREAKOUT DAY VOLUME & STRICT CANDLE CONFIRMATION
-    if row_today['Close'] > trigger_level and df['Close'].iloc[current_idx-1] <= trigger_level:
+        if df['High'].iloc[j] >= entry_price * (1 + MOVE_PCT/100):
+            target_hit_day = j
+            break
+    
+    if target_hit_day and (sl_hit_day is None or target_hit_day < sl_hit_day):
+        # Ye successful 10% move tha
+        signal_date = df.index[i]
+        window = df.iloc[i-LOOKBACK_PATTERN:i] # Pehle ke 5 din
         
-        # ADDITION 1: Breakout wale din volume pichle 20 din ke Vol_MA se 1.2x bada hona chahiye
-        if row_today['Volume'] < (row_today['Vol_MA20'] * 1.2):
-            debug_counter['volume'] += 1
-            return False, 0
+        pattern = {
+            'Signal_Date': signal_date,
+            'Entry_Close': round(entry_price, 2),
+            'Days_to_Target': target_hit_day - i,
+            'Move_Achieved': round(pct_up, 1),
             
-        # ADDITION 2: Candle rejection filter ko tight (0.25) kiya taaki top pin bars reject hon
-        candle_range = row_today['High'] - row_today['Low']
-        if candle_range > 0:
-            upper_wick = row_today['High'] - max(row_today['Open'], row_today['Close'])
-            if (upper_wick / candle_range) > 0.25:
-                debug_counter['no_breakout'] += 1 
-                return False, 0
-                
-        return True, trigger_level
+            # PATTERN FEATURES - UC SE PEHLE KYA THA
+            'Range_5D': round((window['High'].max() - window['Low'].min()) / window['Low'].min() * 100, 1),
+            'Vol_Ratio': round(df['Volume'].iloc[i] / window['Volume'].mean(), 2),
+            'Vol_Dry_Days': int((window['Volume'] < window['Volume'].mean() * 0.8).sum()),
+            'Above_EMA20_Days': int((window['Close'] > window['EMA20']).sum()),
+            'Close_vs_EMA20': round((df['Close'].iloc[i] / df['EMA20'].iloc[i] - 1) * 100, 1),
+            'Higher_Lows': int((window['Low'].diff() > 0).sum()),
+            'Green_Days': int((window['Close'] > window['Open']).sum()),
+            'RSI': round(df['RSI'].iloc[i], 1),
+            'Consolidation': int(window['Range_Pct'].max() < 3.0), # 3% se kam range
+        }
+        success_signals.append(pattern)
 
-    debug_counter['no_breakout'] += 1
-    return False, 0
+df_success = pd.DataFrame(success_signals)
+print(f"\nTotal {MOVE_PCT}%+ moves found: {len(df_success)}", flush=True)
 
-def download_single_stock(stock):
-    try:
-        ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        df = yf.download(ticker, start=BACKTEST_START - timedelta(days=100),
-                       end=BACKTEST_END + timedelta(days=1), progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50: return None, stock
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df = calculate_indicators(df)
-        df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
-        df = df[~df.index.duplicated(keep='last')]
-        return df, stock
-    except:
-        return None, stock
-
-all_trades = []
-stocks = ws_watchlist.col_values(1)[1:]
-stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip()])))
-total_stocks = len(stocks)
-total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
-
-print(f"\nTotal Watchlist: {total_stocks} stocks | Batches: {total_batches}", flush=True)
-date_range = pd.date_range(BACKTEST_START, BACKTEST_END, freq='B').strftime('%Y-%m-%d')
-
-debug_counter = {'nan':0, 'trend':0, 'no_base':0, 'no_breakout':0, 'volume':0, 'rsi':0,
-                'rs_weak':0, 'liquidity':0, 'cooldown':0, 'max_positions':0}
-total_candles_checked = 0
-last_exit_dates = {}
-
-for batch_num in range(total_batches):
-    start_idx = batch_num * BATCH_SIZE
-    end_idx = min(start_idx + BATCH_SIZE, total_stocks)
-    batch_stocks = stocks[start_idx:end_idx]
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"BATCH {batch_num + 1}/{total_batches} | Stocks {start_idx+1}-{end_idx}", flush=True)
-
-    stock_data = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
-        for future in as_completed(future_to_stock):
-            df, stock = future.result()
-            if df is not None:
-                stock_data[stock] = df
-
-    open_positions = []
-
-    for current_date in date_range:
-        current_dt = pd.to_datetime(current_date).date()
-
-        for pos in open_positions[:]:
-            df = stock_data[pos['Stock']]
-            if current_date not in df.index: continue
-            row = df.loc[current_date]
-
-            sl_hit = row['Low'] <= pos['SL']
-            target_hit = row['High'] >= pos['Target']
-            exit_price = None
-            exit_status = None
-            days_held = (current_dt - pd.to_datetime(pos['Entry_Date']).date()).days
-
-            if sl_hit and target_hit:
-                exit_price = pos['SL']; exit_status = 'LOSS'
-            elif target_hit:
-                exit_price = pos['Target']; exit_status = 'WIN'
-            elif sl_hit:
-                exit_price = pos['SL']; exit_status = 'LOSS'
-            elif days_held >= R['time_stop_days']:
-                exit_price = row['Close']; exit_status = 'TIME'
-
-            if exit_price:
-                pnl_pct = round((exit_price / pos['Entry'] - 1) * 100, 1)
-                pnl_rs = round((exit_price - pos['Entry']) * pos['Qty'], 0)
-                all_trades.append({
-                    'Stock': pos['Stock'],
-                    'Entry_Date': pos['Entry_Date'], 'Exit_Date': current_date,
-                    'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
-                    'Status': exit_status, 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
-                    'Days_Held': days_held, 'RS_1M': pos['RS_1M'],
-                    'Base_High': pos['Base_High'], 'Qty': pos['Qty']
-                })
-                last_exit_dates[pos['Stock']] = current_dt
-                open_positions.remove(pos)
-
-        if len(open_positions) >= R['max_open_trades']:
-            debug_counter['max_positions'] += 1
-            continue
-
-        open_stocks = [p['Stock'] for p in open_positions]
-        for stock, df in stock_data.items():
-            if stock in open_stocks: continue
-
-            if stock in last_exit_dates:
-                days_since_exit = (current_dt - last_exit_dates[stock]).days
-                if days_since_exit < R['cooldown_days']:
-                    debug_counter['cooldown'] += 1
-                    continue
-
-            if current_date not in df.index: continue
-
-            i = df.index.get_loc(current_date)
-            if i < 50: continue
-            row = df.iloc[i]
-            total_candles_checked += 1
-
-            avg_value_cr = (df['Close'].iloc[max(0,i-20):i] * df['Volume'].iloc[max(0,i-20):i]).mean() / 1e7
-            if pd.isna(avg_value_cr) or avg_value_cr < R['min_daily_value_cr']:
-                debug_counter['liquidity'] += 1
-                continue
-
-            is_entry, trigger_level = check_compression_and_breakout(df, i, debug_counter)
-            if not is_entry:
-                continue
-
-            rs_1m = calculate_rs_1m(df, i, current_date, nifty_df)
-            if rs_1m is None or rs_1m < R['rs_1m_min']:
-                debug_counter['rs_weak'] += 1
-                continue
-
-            entry_price = row['Close']
-            
-            target_price = entry_price * (1 + (R['fixed_target_pct'] / 100))
-            sl_price = entry_price * (1 - (R['fixed_sl_pct'] / 100))
-            
-            risk_per_share = entry_price - sl_price
-            qty = int(R['risk_per_trade'] / risk_per_share) if risk_per_share > 0 else 0
-            if qty == 0: continue
-
-            open_positions.append({
-                'Stock': stock, 'Entry_Date': current_date,
-                'Entry': round(entry_price, 2), 'SL': round(sl_price, 2),
-                'Target': round(target_price, 2), 'RS_1M': rs_1m,
-                'Base_High': round(trigger_level, 2), 'Qty': qty
-            })
-
-    for pos in open_positions:
-        df = stock_data[pos['Stock']]
-        exit_price = df['Close'].iloc[-1]
-        pnl_pct = round((exit_price / pos['Entry'] - 1) * 100, 1)
-        pnl_rs = round((exit_price - pos['Entry']) * pos['Qty'], 0)
-        all_trades.append({
-            'Stock': pos['Stock'],
-            'Entry_Date': pos['Entry_Date'], 'Exit_Date': BACKTEST_END.strftime('%Y-%m-%d'),
-            'Entry': pos['Entry'], 'Exit_Price': round(exit_price, 2),
-            'Status': 'TIME', 'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs,
-            'Days_Held': (BACKTEST_END - pd.to_datetime(pos['Entry_Date']).date()).days,
-            'RS_1M': pos['RS_1M'], 'Base_High': pos['Base_High'], 'Qty': pos['Qty']
-        })
-
-df_bt = pd.DataFrame(all_trades)
-
-print("\n" + "="*60, flush=True)
-print("DEBUG SUMMARY - 20EMA BREAKOUT SNIPER V22", flush=True)
-print("="*60, flush=True)
-print(f"Total Candles Checked: {total_candles_checked}", flush=True)
-for k, v in debug_counter.items():
-    print(f"Rejected by {k}: {v}", flush=True)
-
-print("\n" + "="*60, flush=True)
-print("FINAL RESULTS - 20EMA BREAKOUT SNIPER V22", flush=True)
-print("="*60, flush=True)
-
-if df_bt.empty:
-    print("\nNo trades found.", flush=True)
+if df_success.empty:
+    print("Is stock me 10% move ka pattern nahi mila. Dusra stock try kar.", flush=True)
 else:
-    total = len(df_bt)
-    wins = len(df_bt[df_bt['Status'] == 'WIN'])
-    winrate = round(wins / total * 100, 1) if total else 0
-    total_pnl = df_bt['PnL_Rs'].sum()
-    win_amt = df_bt[df_bt['Status']=='WIN']['PnL_Rs'].sum()
-    loss_amt = abs(df_bt[df_bt['Status']=='LOSS']['PnL_Rs'].sum())
-    pf = round(win_amt / loss_amt, 2) if loss_amt > 0 else 999
-    avg_days = round(df_bt['Days_Held'].mean(), 1)
-
-    win_trades = df_bt[df_bt['Status'] == 'WIN']
-    avg_win = round(win_trades['PnL_%'].mean(), 1) if len(win_trades) > 0 else 0
-
-    loss_trades = df_bt[df_bt['Status'] == 'LOSS']
-    avg_loss = round(loss_trades['PnL_%'].mean(), 1) if len(loss_trades) > 0 else 0
-
-    print(f"\nTotal Trades: {total} | WR: {winrate}% | PF: {pf} | PnL: Rs.{total_pnl:,.0f}", flush=True)
-    print(f"Avg Win: {avg_win}% | Avg Loss: {avg_loss}% | Avg Days: {avg_days}", flush=True)
-    print(f"Avg RS_1M: {df_bt['RS_1M'].mean():.1f}%", flush=True)
-
-    trades_per_month = round(total / 12, 1)
-    print(f"Trades/Month: {trades_per_month} | Avg Gap: ~{round(30/trades_per_month, 0)} days", flush=True)
-
-try:
-    ws_bt = get_or_create_ws(sh, "20EMA_BREAKOUT_BT")
-    ws_bt.clear()
-    if not df_bt.empty:
-        ws_bt.update([df_bt.columns.values.tolist()] + df_bt.values.tolist())
-        print(f"\n[SUCCESS] Saved to '20EMA_BREAKOUT_BT' Sheet!", flush=True)
-except Exception as e:
-    print(f"GSheet error: {e}", flush=True)
-
-print("\n=== COMPLETE ===", flush=True)
+    # 4. COMMON PATTERN NIKALO - KYA COMMON HAI SAB SUCCESS ME?
+    print("\n" + "="*60, flush=True)
+    print("SUCCESSFUL MOVES KA COMMON PATTERN:", flush=True)
+    print("="*60, flush=True)
+    print(df_success[['Range_5D', 'Vol_Ratio', 'Above_EMA20_Days', 'RSI', 'Close_vs_EMA20']].describe(), flush=True)
+    
+    # Median values = Ye typical pattern hai
+    median_pattern = {
+        'Range_5D': df_success['Range_5D'].median(),
+        'Vol_Ratio': df_success['Vol_Ratio'].median(),
+        'Vol_Dry_Days': int(df_success['Vol_Dry_Days'].median()),
+        'Above_EMA20_Days': int(df_success['Above_EMA20_Days'].median()),
+        'RSI_Min': df_success['RSI'].quantile(0.25),
+        'RSI_Max': df_success['RSI'].quantile(0.75),
+        'Close_vs_EMA20_Min': df_success['Close_vs_EMA20'].quantile(0.25),
+        'Close_vs_EMA20_Max': df_success['Close_vs_EMA20'].quantile(0.75),
+    }
+    print(f"\nTYPICAL PATTERN FOR {STOCK}:", flush=True)
+    for k, v in median_pattern.items():
+        print(f"{k}: {v}", flush=True)
+    
+    # 5. STEP 2 - AB POORE HISTORY ME DEKHO YE PATTERN KITNI BAAR AAYA
+    print("\n" + "="*60, flush=True)
+    print("BACKTESTING SAME PATTERN ON FULL HISTORY:", flush=True)
+    print("="*60, flush=True)
+    
+    all_signals = []
+    for i in range(20, len(df) - LOOKFORWARD_DAYS):
+        window = df.iloc[i-LOOKBACK_PATTERN:i]
+        row = df.iloc[i]
         
+        # Check if current pattern matches median pattern
+        range_5d = (window['High'].max() - window['Low'].min()) / window['Low'].min() * 100
+        vol_ratio = row['Volume'] / window['Volume'].mean()
+        vol_dry = (window['Volume'] < window['Volume'].mean() * 0.8).sum()
+        above_ema = (window['Close'] > window['EMA20']).sum()
+        rsi = row['RSI']
+        close_vs_ema20 = (row['Close'] / row['EMA20'] - 1) * 100
+        
+        # Pattern match condition - 25-75 percentile range
+        match = (
+            median_pattern['Range_5D'] * 0.7 <= range_5d <= median_pattern['Range_5D'] * 1.3 and
+            median_pattern['Vol_Ratio'] * 0.7 <= vol_ratio <= median_pattern['Vol_Ratio'] * 1.3 and
+            abs(vol_dry - median_pattern['Vol_Dry_Days']) <= 1 and
+            abs(above_ema - median_pattern['Above_EMA20_Days']) <= 1 and
+            median_pattern['RSI_Min'] <= rsi <= median_pattern['RSI_Max'] and
+            median_pattern['Close_vs_EMA20_Min'] <= close_vs_ema20 <= median_pattern['Close_vs_EMA20_Max']
+        )
+        
+        if match:
+            # Pattern mila, ab result check karo
+            entry_price = row['Close']
+            sl_hit = False
+            target_hit = False
+            exit_day = None
+            exit_reason = None
+            
+            for j in range(i+1, i+LOOKFORWARD_DAYS+1):
+                if df['Low'].iloc[j] <= entry_price * (1 - STOP_LOSS_PCT/100):
+                    sl_hit = True
+                    exit_day = j
+                    exit_reason = 'SL'
+                    break
+                if df['High'].iloc[j] >= entry_price * (1 + MOVE_PCT/100):
+                    target_hit = True
+                    exit_day = j
+                    exit_reason = 'TARGET'
+                    break
+            
+            if not exit_day: # Time expire
+                exit_day = i + LOOKFORWARD_DAYS
+                exit_reason = 'TIME'
+            
+            exit_price = df['Close'].iloc[exit_day]
+            pnl_pct = (exit_price / entry_price - 1) * 100
+            
+            all_signals.append({
+                'Signal_Date': df.index[i],
+                'Entry': round(entry_price, 2),
+                'Exit': round(exit_price, 2),
+                'Exit_Reason': exit_reason,
+                'PnL_Pct': round(pnl_pct, 1),
+                'Result': 'WIN' if target_hit else 'LOSS' if sl_hit else 'NEUTRAL'
+            })
+    
+    df_backtest = pd.DataFrame(all_signals)
+    
+    if df_backtest.empty:
+        print("Pattern match nahi hua poore history me.", flush=True)
+    else:
+        wins = len(df_backtest[df_backtest['Result'] == 'WIN'])
+        losses = len(df_backtest[df_backtest['Result'] == 'LOSS'])
+        neutral = len(df_backtest[df_backtest['Result'] == 'NEUTRAL'])
+        total = len(df_backtest)
+        winrate = round(wins / total * 100, 1)
+        avg_win = df_backtest[df_backtest['PnL_Pct'] > 0]['PnL_Pct'].mean()
+        avg_loss = df_backtest[df_backtest['PnL_Pct'] < 0]['PnL_Pct'].mean()
+        
+        print(f"\nTOTAL PATTERN OCCURRENCES: {total}", flush=True)
+        print(f"WIN: {wins} | LOSS: {losses} | NEUTRAL: {neutral}", flush=True)
+        print(f"WINRATE: {winrate}%", flush=True)
+        print(f"Avg Win: +{round(avg_win,1)}% | Avg Loss: {round(avg_loss,1)}%", flush=True)
+        print(f"Expectancy: {round((winrate/100 * MOVE_PCT) + ((100-winrate)/100 * avg_loss), 2)}% per trade", flush=True)
+        
+        print("\nLAST 10 SIGNALS:", flush=True)
+        print(df_backtest.tail(10).to_string(index=False), flush=True)
+
+print("\n=== ANALYSIS COMPLETE ===", flush=True)
