@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V5 ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V6 ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -26,27 +26,22 @@ ws_watchlist = sh.worksheet("Watchlist")
 TARGET_PCT = 10.0        
 VALIDATION_SL = 5.0      
 MAX_HOLD_DAYS = 30
-COOLDOWN_DAYS = 10       # ट्रेड खत्म होने के बाद 10 दिनों तक स्टॉक को दोबारा टच नहीं करना है
+COOLDOWN_DAYS = 10       
 
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
-        ws.clear() # पुरानी कचरा वैल्यूज को पूरी तरह साफ करने के लिए
-        return ws
+        sh.del_worksheet(ws) # पुराने कचरा डेटा को जड़ से मिटाने के लिए पूरी वर्कशीट डिलीट करें
+        time.sleep(1)
+        return sh.add_worksheet(title=title, rows=50000, cols=12)
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_price_action_features(df):
-    # 1. Support Zone: पिछले 20 दिनों का सबसे निचला स्तर (Floor)
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
-    
-    # 2. Resistance Line (CHoCH के लिए): पिछले 10 दिनों का उच्चतम स्तर
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
-    
-    # 3. Volume Breakdown
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
     df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
-    
     return df
 
 def check_pure_price_action(df, idx):
@@ -61,14 +56,14 @@ def check_pure_price_action(df, idx):
     lower_wick = min(open_p, close_p) - low_p
     is_green = close_p > open_p
     
-    # --- PATTERN 1: SUPPORT RETEST ---
+    # PATTERN 1: SUPPORT RETEST
     at_support = abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
     has_buyer_rejection = lower_wick >= (body_size * 1.2)
     
     if at_support and (has_buyer_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # --- PATTERN 2: CHoCH BREAKOUT ---
+    # PATTERN 2: CHoCH BREAKOUT
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
     strong_volume = row['Vol_Multiple'] > 1.8
     
@@ -83,12 +78,9 @@ def download_single_stock(stock):
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=True, timeout=15, group_by='ticker')
-        
         if df.empty or len(df) < 40: return None, stock
-        
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(-1)
-            
         df = calculate_price_action_features(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
@@ -102,7 +94,6 @@ total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
 pa_logs = []
-# दो टोकन फिक्स स्ट्रैटेजी ताकि कचरा नाम जमा न हों
 strategy_tracker = {
     "PA_SUPPORT_RETEST": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0},
     "PA_CHoCH_BREAKOUT": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
@@ -124,8 +115,6 @@ for batch_num in range(total_batches):
         idx = 20
         while idx < len(df) - 1:
             has_setup, pa_logic = check_pure_price_action(df, idx)
-            
-            # स्ट्रिंग को साफ़ रखें ताकि डिक्शनरी में डुप्लीकेट कीज़ न बनें
             pa_logic = pa_logic.strip().upper()
             
             if has_setup and pa_logic in strategy_tracker:
@@ -137,20 +126,25 @@ for batch_num in range(total_batches):
                 exit_idx = idx + 1
                 max_gain = 0
                 
-                # लाइव सिमुलेशन: अगले 30 दिन का सफर ट्रैक करो
+                # लाइव सिमुलेशन: परफेक्ट आउटकम ट्रैकर
                 for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
                     f_row = df.iloc[future_idx]
                     
                     current_gain = ((f_row['High'] / entry_price) - 1) * 100
                     if current_gain > max_gain:
                         max_gain = current_gain
-                        
-                    if f_row['High'] >= target_price:
-                        trade_outcome = "PROFIT"
+                    
+                    # BIAS FIX: अगर दोनों एक ही दिन हिट हो रहे हैं, तो समझदारी स्टॉपलॉस मानने में है
+                    if f_row['Low'] <= sl_price and f_row['High'] >= target_price:
+                        trade_outcome = "LOSS"
                         exit_idx = future_idx
                         break
                     elif f_row['Low'] <= sl_price:
                         trade_outcome = "LOSS"
+                        exit_idx = future_idx
+                        break
+                    elif f_row['High'] >= target_price:
+                        trade_outcome = "PROFIT"
                         exit_idx = future_idx
                         break
                 
@@ -158,7 +152,6 @@ for batch_num in range(total_batches):
                     trade_outcome = "TIMEOUT"
                     exit_idx = min(idx + MAX_HOLD_DAYS, len(df) - 1)
                 
-                # सेव करें
                 pa_logs.append({
                     'Stock': stock,
                     'Entry_Date': df.index[idx],
@@ -170,7 +163,6 @@ for batch_num in range(total_batches):
                     'Days_Held': exit_idx - idx
                 })
                 
-                # सेग्रिगेशन ट्रैकर अपडेट
                 strategy_tracker[pa_logic]['Total'] += 1
                 if trade_outcome == "PROFIT": strategy_tracker[pa_logic]['Wins'] += 1
                 elif trade_outcome == "LOSS": strategy_tracker[pa_logic]['Losses'] += 1
@@ -181,25 +173,21 @@ for batch_num in range(total_batches):
                 idx += 1
 
 # --- GOOGLE SHEETS CLEAN UPLOAD ---
-print("\nUploading Pure Unbiased Performance to Google Sheets...", flush=True)
+print("\nResetting Worksheets & Uploading Clean Performance...", flush=True)
 
-# 1. Detailed Sheet साफ़ करके लिखें
 ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
 if pa_logs:
     df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
     header_rev = df_rev.columns.values.tolist()
     payload_rev = [header_rev] + df_rev.values.tolist()
-    
     for i in range(0, len(payload_rev), 1000):
         ws_logs.append_rows(payload_rev[i:i+1000])
         time.sleep(1)
 
-# 2. Summary Sheet साफ़ करके केवल 2 क्लीन रोज़ लिखें
 ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
 summary_rows = []
 for logic, metrics in strategy_tracker.items():
     total = metrics['Total']
-    # अगर किसी स्ट्रैटेजी का कोई ट्रिगर ही नहीं मिला तो उसे समरी में ब्लैंक या 0 दिखाएंगे
     if total == 0: continue 
     
     wins = metrics['Wins']
