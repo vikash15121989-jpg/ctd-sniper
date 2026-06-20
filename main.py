@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import gspread
@@ -13,9 +12,9 @@ warnings.filterwarnings('ignore')
 
 BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 25  # थ्रॉटलिंग से बचने के लिए बैच साइज थोड़ा छोटा किया
+BATCH_SIZE = 20 
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V14 (ANTI-BLOCK DIRECT API) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V15 (ULTIMATE WEB-SCRAPER METHOD) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -29,11 +28,6 @@ VALIDATION_SL = 5.0
 MAX_HOLD_DAYS = 30
 COOLDOWN_DAYS = 10       
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-})
-
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
@@ -42,30 +36,52 @@ def get_or_create_ws(sh, title):
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
-def calculate_price_action_features(df):
-    if df.empty:
-        return pd.DataFrame()
-        
-    # मल्टी-इंडेक्स या अजीब कॉलम लेयर्स को पूरी तरह हटाकर फ्रेश क्लीन डेटा निकालना
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-        
-    df.columns = [str(c).strip().capitalize() for c in df.columns]
+def download_raw_yahoo_data(stock):
+    """बिना yfinance लाइब्रेरी के सीधे Yahoo API से डेटा खींचने वाला एंटी-ब्लॉक मैकेनिज्म"""
+    ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
     
-    # अगर 'Close' गायब हो और 'Adj close' हो
-    if 'Close' not in df.columns and 'Adj close' in df.columns:
-        df['Close'] = df['Adj close']
+    # टाइमस्टैम्प्स कैलकुलेशन
+    period1 = int(time.mktime((BACKTEST_START - timedelta(days=60)).timetuple()))
+    period2 = int(time.mktime((BACKTEST_END + timedelta(days=5)).timetuple()))
+    
+    # डायरेक्ट ब्राउज़र यूआरएल जो कभी ब्लॉक नहीं होता
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5'
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return None
+            
+        data = res.json()
+        result = data['chart']['result'][0]
+        timestamps = result['timestamp']
+        indicators = result['indicators']['quote'][0]
         
-    required_cols = ['Open', 'High', 'Low', 'Close']
-    if any(c not in df.columns for c in required_cols):
+        # पांडास डेटाफ़्रेम क्रिएशन (रॉ डिक्शनरी से)
+        df = pd.DataFrame({
+            'Open': indicators['open'],
+            'High': indicators['high'],
+            'Low': indicators['low'],
+            'Close': indicators['close'],
+            'Volume': indicators['volume']
+        }, index=pd.to_datetime(timestamps, unit='s'))
+        
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        return df
+    except Exception:
+        return None
+
+def calculate_price_action_features(df):
+    if df.empty or len(df) < 25:
         return pd.DataFrame()
         
-    df = df.dropna(subset=required_cols)
-    if len(df) < 25:
-        return pd.DataFrame()
-        
-    # डेटा को शुद्ध फ्लोट में कन्वर्ट करें
-    for col in required_cols:
+    for col in ['Open', 'High', 'Low', 'Close']:
         df[col] = df[col].astype(float)
         
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
@@ -111,33 +127,19 @@ def check_pure_price_action(df, idx):
         
     return False, "NONE"
 
-def download_single_stock(stock):
+def pipeline_worker(stock):
     try:
-        ticker_str = stock if stock.endswith('.NS') else f"{stock}.NS"
-        
-        # एंटी-ब्लॉक फिक्स: डायरेक्ट Ticker हिस्ट्री मेथड का उपयोग जो ब्लॉक नहीं होता
-        t = yf.Ticker(ticker_str, session=SESSION)
-        df = t.history(start=BACKTEST_START - timedelta(days=60),
-                       end=BACKTEST_END + timedelta(days=5),
-                       interval="1d", proxy=None, raised=False)
-        
-        if df.empty:
-            # बैकअप फ़ॉलबैक अगर डायरेक्ट हिस्ट्री भी खाली आती है
-            df = yf.download(ticker_str, start=BACKTEST_START - timedelta(days=60),
-                             end=BACKTEST_END + timedelta(days=5), progress=False, 
-                             auto_adjust=False, timeout=10, session=SESSION)
-
-        if df.empty:
+        raw_df = download_raw_yahoo_data(stock)
+        if raw_df is None or raw_df.empty:
             return None, stock
             
-        df = calculate_price_action_features(df)
+        df = calculate_price_action_features(raw_df)
         if df.empty or len(df) < 40: 
             return None, stock
-        
+            
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
-    except Exception as e:
-        print(f"-> Skip {stock} due to network issue", flush=True)
+    except Exception:
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -152,8 +154,7 @@ strategy_tracker = {
     "PA_CHoCH_BREAKOUT": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
 }
 
-print(f"Processing {total_stocks} stocks in {total_batches} batches...", flush=True)
-
+print(f"Processing {total_stocks} stocks via Stealth Raw Scraper...", flush=True)
 success_download_count = 0
 
 for batch_num in range(total_batches):
@@ -162,8 +163,9 @@ for batch_num in range(total_batches):
     batch_stocks = stocks[start_idx:end_idx]
 
     stock_data = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:  
-        future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
+    # वर्कर्स कम किए ताकि याहू को शक न हो
+    with ThreadPoolExecutor(max_workers=3) as executor:  
+        future_to_stock = {executor.submit(pipeline_worker, stock): stock for stock in batch_stocks}
         for future in as_completed(future_to_stock):
             df, stock = future.result()
             if df is not None and not df.empty: 
@@ -229,12 +231,10 @@ for batch_num in range(total_batches):
             else:
                 idx += 1
                 
-    # याहू एपीआई ब्लॉकिंग पैच: हर बैच के बाद हल्का सा पॉज़ ताकि थ्रॉटलिंग न हो
-    time.sleep(2)
+    print(f"Batch {batch_num + 1}/{total_batches} done. Total Live Downloads: {success_download_count}", flush=True)
+    time.sleep(3) # सख्त कूलडाउन
 
-print(f"\nSuccessfully Downloaded and Processed {success_download_count} / {total_stocks} stocks.", flush=True)
-
-# --- GITHUB TERMINAL LOG REPORT ---
+# --- TERMINAL REPORT ---
 print("\n" + "="*60, flush=True)
 print("             🎯 BACKTEST PERFORMANCE REPORT 🎯", flush=True)
 print("="*60, flush=True)
@@ -250,10 +250,8 @@ for logic, metrics in strategy_tracker.items():
     print(f"{logic:<20} | {total:<6} | {wins:<5} | {losses:<6} | {timeouts:<8} | {win_rate}%", flush=True)
 print("="*60 + "\n", flush=True)
 
-# --- GOOGLE SHEETS FORCED OVERWRITE ---
+# --- GOOGLE SHEETS UPLOAD ---
 try:
-    print("Resetting Worksheets & Uploading Clean Performance to Google Sheets...", flush=True)
-
     ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
     if pa_logs:
         df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
@@ -268,18 +266,13 @@ try:
     for logic, metrics in strategy_tracker.items():
         total = metrics['Total']
         if total == 0: continue 
-        
-        wins = metrics['Wins']
-        losses = metrics['Losses']
-        timeouts = metrics['Timeouts']
-        win_rate = round((wins / total) * 100, 2)
-        summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
+        summary_rows.append([logic, total, metrics['Wins'], metrics['Losses'], metrics['Timeouts'], f"{round((metrics['Wins'] / total) * 100, 2)}%"])
 
     if summary_rows:
         header_sum = ["Price Action Mode", "Total Signal Count", "Target Hits (10% Profit)", "StopLoss Hits (5% Loss)", "Timeouts", "Real Price Action Win Rate %"]
         ws_summary.update([header_sum] + summary_rows)
     print("Google Sheets Update Successful!", flush=True)
 except Exception as sheet_err:
-    print(f"⚠️ Sheet Upload Failed! Error: {sheet_err}", flush=True)
+    print(f"⚠️ Sheet Upload Failed: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
