@@ -14,7 +14,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== REVERSE ENGINEERING & PATTERN DISCOVERY ENGINE ===", flush=True)
+print("=== REVERSE ENGINEERING V2 - RETEST & CHOCH TRACKER ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -22,10 +22,10 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# REVERSE ENGINEERING PARAMETERS
-LOOK_AHEAD_DAYS = 15     # 10% प्रॉफिट कितने दिनों के अंदर आना चाहिए
-TARGET_PCT = 10.0        # खोजा जाने वाला मिनिमम प्रॉफिट प्रतिशत
-VALIDATION_SL = 5.0      # स्ट्रेटजी टेस्ट करते वक्त स्टॉपलॉस प्रतिशत
+# STRICT RULES
+TARGET_PCT = 10.0        
+VALIDATION_SL = 5.0      
+MAX_HOLD_DAYS = 30
 
 def get_or_create_ws(sh, title):
     try: 
@@ -36,78 +36,50 @@ def get_or_create_ws(sh, title):
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_advanced_features(df):
-    # RSI
+    # RSI Calculation
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # Volume Analytics
+    # Volume Profile
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
     df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
     
-    # Price Action & Support
-    df['Low_Min_10D'] = df['Low'].shift(1).rolling(window=10).min()
+    # Structural Support & CHoCH Levels
+    df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
+    df['Recent_High_10D'] = df['High'].shift(1).rolling(window=10).max()
     df['SMA_20'] = df['Close'].rolling(20).mean()
-    df['SMA_50'] = df['Close'].rolling(50).mean()
     
     return df
 
 def identify_driving_logic(df, idx):
     """
-    यह फंक्शन 10% मूव आने के दिन के बैकग्राउंड डेटा को देखकर 
-    उसका मुख्य कारण (Logic) डिकोड करता है।
+    सटीक कारण खोजता है कि मूव Retest की वजह से आया या Change of Character (CHoCH) से।
     """
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1] if idx > 0 else row
-    
     reasons = []
     
-    # 1. Volume Spurt Logic
-    if row['Vol_Multiple'] > 2.5:
-        reasons.append("HIGH_VOLUME_BREAKOUT")
-    
-    # 2. RSI Oversold Recovery / Divergence Logic
-    if row['RSI'] < 35:
-        reasons.append("OVERSOLD_REBOUND")
-    elif row['RSI'] > 55 and row_prev['RSI'] <= 55:
-        reasons.append("RSI_MOMENTUM_SHIFT")
+    # 1. Retest Support Logic (Price testing the structural floor)
+    if abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.5:
+        reasons.append("SUPPORT_RETEST")
         
-    # 3. Support & Stop Hunt Logic
-    if row['Low'] < row['Low_Min_10D'] and row['Close'] > row['Low_Min_10D']:
-        reasons.append("STOP_HUNT_SHAKEOUT")
+    # 2. CHoCH / Breakout Logic (Price breaking recent lower highs with momentum)
+    if row['Close'] > row['Recent_High_10D'] and row_prev['Close'] <= row_prev['Recent_High_10D']:
+        reasons.append("CHoCH_BREAKOUT")
         
-    # 4. Moving Average Support
-    if row['Low'] <= row['SMA_20'] and row['Close'] > row['SMA_20']:
-        reasons.append("20SMA_DYNAMIC_SUPPORT")
+    # 3. Volume & RSI Conformation
+    if row['Vol_Multiple'] > 2.0:
+        reasons.append("INSTITUTIONAL_VOLUME")
+    if row['RSI'] > 55 and row_prev['RSI'] <= 55:
+        reasons.append("MOMENTUM_SHIFT")
         
-    # Default Logic if nothing specific matches
     if not reasons:
-        if row['Close'] > row['Open']:
-            reasons.append("STRONG_BULLISH_CANDLE")
-        else:
-            reasons.append("VOLATILITY_EXPANSION")
-            
+        reasons.append("PRICE_ACTION_STRUCTURE")
+        
     return " & ".join(reasons)
-
-def validate_strategy_performance(df, start_idx, target_pct, sl_pct):
-    """
-    जब वो लॉजिक दोबारा बना, तो कितनी बार प्रॉफिट और कितनी बार लॉस हुआ, 
-    यह उसे टेस्ट करता है।
-    """
-    entry_price = df['Close'].iloc[start_idx]
-    target_price = entry_price * (1 + target_pct / 100)
-    sl_price = entry_price * (1 - sl_pct / 100)
-    
-    for i in range(start_idx + 1, min(start_idx + 30, len(df))): # Max 30 days validation holding
-        row = df.iloc[i]
-        if row['High'] >= target_price:
-            return "PROFIT", i - start_idx
-        if row['Low'] <= sl_price:
-            return "LOSS", i - start_idx
-            
-    return "TIMEOUT/FAIL", 30
 
 def download_single_stock(stock):
     try:
@@ -129,7 +101,7 @@ total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
 reverse_logs = []
-strategy_tracker = {} # अलग-अलग लॉजिक्स की एक्यूरेसी ट्रैक करने के लिए
+strategy_tracker = {}
 
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
@@ -144,54 +116,77 @@ for batch_num in range(total_batches):
             if df is not None: stock_data[stock] = df
 
     for stock, df in stock_data.items():
-        # हम अंतिम LOOK_AHEAD_DAYS को छोड़ देंगे क्योंकि वहाँ से 10% चेक करने का पूरा समय नहीं मिलेगा
-        for idx in range(20, len(df) - LOOK_AHEAD_DAYS):
+        idx = 20
+        # WHILE LOOP का इस्तेमाल ताकि ट्रेड खत्म होने के बाद ही अगला इंडेक्स चेक हो
+        while idx < len(df) - 1:
             current_close = df['Close'].iloc[idx]
+            target_price = current_close * (1 + TARGET_PCT / 100)
+            sl_price = current_close * (1 - VALIDATION_SL / 100)
             
-            # आगे आने वाले दिनों का मैक्सिमम हाई खोजें
-            future_window = df['High'].iloc[idx + 1 : idx + 1 + LOOK_AHEAD_DAYS]
-            max_future_high = future_window.max()
+            # चेक करें कि इस तारीख से आगे बढ़ने पर पहले क्या हिट होता है
+            trade_outcome = None
+            days_held = 0
+            max_gain = 0
+            exit_idx = idx + 1
             
-            # चेक करें कि क्या 10% से ज्यादा का प्रॉफिट हुआ
-            potential_gain = ((max_future_high / current_close) - 1) * 100
+            for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
+                f_row = df.iloc[future_idx]
+                days_held = future_idx - idx
+                
+                # मैक्सिमम गेन ट्रैक करें
+                current_gain = ((f_row['High'] / current_close) - 1) * 100
+                if current_gain > max_gain:
+                    max_gain = current_gain
+                    
+                # Target vs SL Check
+                if f_row['High'] >= target_price:
+                    trade_outcome = "PROFIT"
+                    exit_idx = future_idx
+                    break
+                elif f_row['Low'] <= sl_price:
+                    trade_outcome = "LOSS"
+                    exit_idx = future_idx
+                    break
             
-            if potential_gain >= TARGET_PCT:
-                # 10% प्रॉफिट मिला! अब इसका कारण खोजते हैं
+            if not trade_outcome:
+                trade_outcome = "TIMEOUT"
+                exit_idx = min(idx + MAX_HOLD_DAYS, len(df) - 1)
+            
+            # अगर इस तारीख से सच में 10% का मूव आया था, तभी लॉग करेंगे
+            if max_gain >= TARGET_PCT:
                 detected_logic = identify_driving_logic(df, idx)
                 setup_date = df.index[idx]
                 
-                # अब इस सटीक लॉजिक को टेस्ट करते हैं कि पास्ट में इसके कारण प्रॉफिट हुआ या लॉस
-                perf_result, days_taken = validate_strategy_performance(df, idx, TARGET_PCT, VALIDATION_SL)
-                
-                # लॉग में सेव करें
                 reverse_logs.append({
                     'Stock': stock,
-                    'Date_Of_Origin': setup_date,
-                    'Max_Gain_Achieved_%': round(potential_gain, 2),
+                    'Entry_Date': setup_date,
+                    'Exit_Date': df.index[exit_idx],
+                    'Max_Gain_Achieved_%': round(max_gain, 2),
                     'Identified_Logic': detected_logic,
-                    'Strategy_Test_Result': perf_result,
-                    'Days_To_Result': days_taken
+                    'Result_Status': trade_outcome,
+                    'Days_Held': days_held
                 })
                 
-                # स्ट्रेटजी ट्रैकर को अपडेट करें (Segregation)
+                # Segregation Tracking
                 if detected_logic not in strategy_tracker:
-                    strategy_tracker[detected_logic] = {'Total_Triggers': 0, 'Profits': 0, 'Losses': 0, 'Timeouts': 0}
-                
-                strategy_tracker[detected_logic]['Total_Triggers'] += 1
-                if perf_result == "PROFIT": strategy_tracker[detected_logic]['Profits'] += 1
-                elif perf_result == "LOSS": strategy_tracker[detected_logic]['Losses'] += 1
+                    strategy_tracker[detected_logic] = {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
+                strategy_tracker[detected_logic]['Total'] += 1
+                if trade_outcome == "PROFIT": strategy_tracker[detected_logic]['Wins'] += 1
+                elif trade_outcome == "LOSS": strategy_tracker[detected_logic]['Losses'] += 1
                 else: strategy_tracker[detected_logic]['Timeouts'] += 1
                 
-                # एक बार मूव मिल जाने पर कुल्डॉउन दें ताकि एक ही रैली को बार-बार रिकॉर्ड न करे
-                idx += LOOK_AHEAD_DAYS 
+                # [CRITICAL FIX]: अब लूप सीधे एग्जिट वाले दिन पर जंप कर जाएगा!
+                # यानी जब तक पहला मूव पूरा खत्म नहीं होता (प्रॉफिट/लॉस), तब तक बीच की तारीखों (21, 22) पर दोबारा एंट्री काउंट नहीं होगी।
+                idx = exit_idx + 1
+            else:
+                idx += 1
 
 # --- GOOGLE SHEETS UPLOAD ---
-print("\nProcessing and Writing Logs to Google Sheets...", flush=True)
+print("\nWriting Cleaned Logs to Google Sheets...", flush=True)
 
-# Sheet 1: Stock-wise Detailed Reverse Logs
 ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
 if reverse_logs:
-    df_rev = pd.DataFrame(reverse_logs).sort_values(by=['Stock', 'Date_Of_Origin'])
+    df_rev = pd.DataFrame(reverse_logs).sort_values(by=['Stock', 'Entry_Date'])
     header_rev = df_rev.columns.values.tolist()
     rows_rev = df_rev.values.tolist()
     payload_rev = [header_rev] + rows_rev
@@ -199,30 +194,21 @@ if reverse_logs:
     for i in range(0, len(payload_rev), 1000):
         ws_logs.append_rows(payload_rev[i:i+1000])
         time.sleep(1)
-    print("✔ Detailed Reverse Logs updated.")
-else:
-    ws_logs.update([["Status"], ["No 10% moves found matching structural data."]])
+    print("✔ Cleaned Reverse Logs updated without overlapping entries.")
 
-# Sheet 2: Strategy Segregation & Modes Test Summary
 ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
 if strategy_tracker:
     summary_rows = []
     for logic, metrics in strategy_tracker.items():
-        total = metrics['Total_Triggers']
-        wins = metrics['Profits']
+        total = metrics['Total']
+        wins = metrics['Wins']
         losses = metrics['Losses']
         timeouts = metrics['Timeouts']
         win_rate = round((wins / total) * 100, 2) if total > 0 else 0.0
-        
-        summary_rows.append([
-            logic, total, wins, losses, timeouts, f"{win_rate}%"
-        ])
+        summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
     
-    header_sum = ["Identified Core Logic / Strategy Mode", "Total Times Triggered", "Profit Hits (Target 10%)", "Loss Hits (SL 5%)", "Timeouts/Flat", "Win Rate %"]
-    payload_sum = [header_sum] + summary_rows
-    ws_summary.update(payload_sum)
-    print("✔ Strategy Segregation & Modes Summary updated successfully.")
-else:
-    ws_summary.update([["Status"], ["No Strategy modes could be computed."]])
+    header_sum = ["Strategy Mode (Retest / CHoCH)", "Total Clean Triggers", "Profit Hits", "Loss Hits", "Timeouts", "Pure Win Rate %"]
+    ws_summary.update([header_sum] + summary_rows)
+    print("✔ Pure Strategy Summary generated.")
 
-print("\n=== SYSTEM EXECUTION COMPLETE ===")
+print("\n=== ENGINE RUN COMPLETE ===")
