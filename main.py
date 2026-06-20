@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V11 (STRICT COLUMN FIX) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V12 (ULTIMATE MULTIINDEX KILLER) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -43,42 +43,44 @@ def get_or_create_ws(sh, title):
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_price_action_features(df):
-    # मल्टी-इंडेक्स हटाकर कॉलम्स फ्लैट करें
+    # लेयर 1: अगर कॉलम्स में MultiIndex है, तो सिर्फ आखिरी लेयर (Price metrics) को बाहर निकालें
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(-1)
     
-    # कॉलम्स को नाम ठीक करें (Capitalize)
+    # लेयर 2: सारे कॉलम नामों को साफ़ और स्टैंडर्डाइज़ करें
     df.columns = [str(c).strip().capitalize() for c in df.columns]
     
-    # फॉलबैक: अगर 'Close' गायब है लेकिन 'Adj close' मौजूद है, तो उसे 'Close' बना दें
-    if 'Close' not in df.columns and 'Adj close' in df.columns:
-        df['Close'] = df['Adj close']
-    elif 'Close' not in df.columns and 'Adj close' not in df.columns:
-        # अगर दोनों ही गायब हैं, तो जो भी आखरी कॉलम क्लोज जैसा दिखे उसे चुनें
-        close_cols = [c for c in df.columns if 'close' in c.lower()]
-        if close_cols:
-            df['Close'] = df[close_cols[0]]
+    # लेयर 3: याहू फाइनेंस के अजीब रिनेमिंग (जैसे 'Upl.ns') को पूरी तरह कुचलने का अचूक इलाज
+    valid_cols = ['Open', 'High', 'Low', 'Close']
+    missing = [c for c in valid_cols if c not in df.columns]
+    
+    # अगर अभी भी कॉलम गायब हैं, तो पोजीशन के आधार पर ज़बरदस्ती नाम बदलें (OHLC हमेशा पहले 4-5 कॉलम्स होते हैं)
+    if missing and len(df.columns) >= 4:
+        new_cols = list(df.columns)
+        for i, name in enumerate(['Open', 'High', 'Low', 'Close']):
+            new_cols[i] = name
+        if len(new_cols) >= 5:
+            new_cols[4] = 'Volume'
+        df.columns = new_cols
 
-    # चेक करें कि सारे ज़रूरी कॉलम्स अब उपलब्ध हैं या नहीं
-    required_cols = ['Open', 'High', 'Low', 'Close']
-    missing_cols = [c for c in required_cols if c not in df.columns]
-    if missing_cols:
-        raise KeyError(f"Missing essential columns: {missing_cols}. Available: {list(df.columns)}")
+    # अंतिम सुरक्षा जांच
+    final_missing = [c for c in valid_cols if c not in df.columns]
+    if final_missing:
+        raise KeyError(f"Critical Fix Failed! Missing: {final_missing}. Found: {list(df.columns)}")
         
-    df = df.dropna(subset=required_cols)
+    df = df.dropna(subset=valid_cols)
     if len(df) < 25:
         return pd.DataFrame()
         
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     
-    # वॉल्यूम चेक और फॉलबैक
-    vol_col = 'Volume' if 'Volume' in df.columns else (df.columns[-1] if 'vol' in df.columns[-1].lower() else None)
-    if vol_col:
-        df['Vol_20MA'] = df[vol_col].rolling(20).mean()
-        df['Vol_Multiple'] = df[vol_col] / df['Vol_20MA']
+    # वॉल्यूम कैलकुलेशन सेफ्टी नेट
+    if 'Volume' in df.columns:
+        df['Vol_20MA'] = df['Volume'].rolling(20).mean()
+        df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
     else:
-        df['Vol_Multiple'] = 2.0  # सेफ्टी फॉलबैक ताकि वॉल्यूम की वजह से कोड न रुके
+        df['Vol_Multiple'] = 2.0
         
     return df
 
@@ -116,7 +118,7 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        # auto_adjust=False किया ताकि ट्रेडिशनल क्लोज कॉलम मिस न हो
+        # group_by को हटाकर सिंगल-टीकर ऑब्जेक्ट को बिना किसी झंझट के डाउनलोड करना
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=False, timeout=15, session=SESSION)
@@ -267,4 +269,4 @@ except Exception as sheet_err:
     print(f"⚠️ Sheet Upload Failed! Error: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
-                
+    
