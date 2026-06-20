@@ -13,7 +13,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V30 - BULLISH CANDLESTICK CONFIRMATION ENGINE ===", flush=True)
+print("=== RS BEATER V31 - SUPPORT ZONE & BULLISH CANDLE ENGINE ===", flush=True)
 
 # GSheet Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -23,9 +23,9 @@ ws_watchlist = sh.worksheet("Watchlist")
 
 R = {
     'min_daily_value_cr': 30.0,
-    'fixed_target_pct': 6.0,       # 6% Profit Target
-    'fixed_sl_pct': 3.0,           # 3% Initial SL
-    'trail_trigger_pct': 2.5,      # 2.5% Profit trailing to lock cost
+    'fixed_target_pct': 6.0,       # 6% Target
+    'fixed_sl_pct': 3.0,           # 3% SL
+    'trail_trigger_pct': 2.5,      # Trailing trigger to lock cost
     'time_stop_days': 8,
     'cooldown_days': 4
 }
@@ -41,6 +41,9 @@ def calculate_base_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     df['Low_Min_10D'] = df['Low'].shift(1).rolling(window=10).min()
+    
+    # NEW: 20-Day Swing Support Line Filter
+    df['Support_Zone_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Vol_Avg20'] = df['Volume'].rolling(window=20).mean()
     return df
 
@@ -58,7 +61,6 @@ def check_best_combined_pattern(df, idx):
     elif hidden_accum: return True, "HIDDEN_ACCUM"
     return False, "NONE"
 
-# --- NEW EXTRACTED BULLISH CANDLE CONFIRMATION FILTER ---
 def is_bullish_confirmation_candle(row):
     open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
     candle_range = high_p - low_p
@@ -69,10 +71,9 @@ def is_bullish_confirmation_candle(row):
     upper_wick = high_p - max(open_p, close_p)
     is_green = close_p > open_p
     
-    # 1. HAMMER SIGNAL: Lower wick is dominant, very small upper body, closes near high
+    # Hammer structure check
     is_hammer = (lower_wick >= (body_size * 1.8)) and (upper_wick <= (candle_range * 0.20))
-    
-    # 2. STRONG BULLISH CONFIRMATION: Clean solid green body pushing up forcefully (>= 1.5% momentum)
+    # Strong green institutional candle (>= 1.5% body expansion)
     is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 1.5)
     
     return is_hammer or is_strong_green
@@ -168,17 +169,22 @@ for batch_num in range(total_batches):
                 
                 is_pattern, pattern_type = check_best_combined_pattern(df, idx)
                 if is_pattern:
-                    # CRITICAL: Enter ONLY if the current setup candle matches our Bullish Candlestick Filter
                     if is_bullish_confirmation_candle(row):
-                        open_trade = {
-                            'Setup_Date': current_date,
-                            'Entry_Price': row['Close'],
-                            'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
-                            'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
-                            'Entry_Idx': idx,
-                            'Pattern_Type': pattern_type,
-                            'Max_High': row['High']
-                        }
+                        # CRITICAL FILTER: Proximity to 20-Day Swing Support Line
+                        support_line = row['Support_Zone_20D']
+                        # Candle low must be within 0.5% boundary of support line OR breaking below it (Stop Hunt)
+                        pct_from_support = ((row['Low'] / support_line) - 1) * 100
+                        
+                        if pct_from_support <= 0.5:
+                            open_trade = {
+                                'Setup_Date': current_date,
+                                'Entry_Price': row['Close'],
+                                'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
+                                'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
+                                'Entry_Idx': idx,
+                                'Pattern_Type': pattern_type,
+                                'Max_High': row['High']
+                            }
 
 # --- SAVE TO GOOGLE SHEETS DATEWISE ---
 if trade_logs:
@@ -189,6 +195,7 @@ if trade_logs:
     ws_datewise.clear()
     
     ws_datewise.update([df_logs.columns.values.tolist()] + df_logs.values.tolist())
-    print(f"\n[SUCCESS] {len(df_logs)} High-Confirmation Trades saved to 'PA_DATEWISE_LOGS' sheet!", flush=True)
+    print(f"\n[SUCCESS] {len(df_logs)} Elite Support-Zone Trades successfully saved to Google Sheets!", flush=True)
 else:
-    print("\n[WARNING] No trades passed the Bullish Candle Filter during this period.", flush=True)
+    print("\n[WARNING] No trades matched the pattern + candle + support confluence criteria.", flush=True)
+    
