@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V8 (AUTO-LOG FIXED) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V9 (CASE-FIXED) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -29,7 +29,6 @@ VALIDATION_SL = 5.0
 MAX_HOLD_DAYS = 30
 COOLDOWN_DAYS = 10       
 
-# एंटी-ब्लॉक सेशन हेडर
 SESSION = requests.Session()
 SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -38,13 +37,15 @@ SESSION.headers.update({
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
-        # सेफ और फ़ास्ट क्लियरिंग मेथड
         ws.batch_clear(["A1:Z50000"])  
         return ws
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
 def calculate_price_action_features(df):
+    # कॉलम नामों को बड़े अक्षरों में फ़ोर्स करें ताकि याहू फाइनेंस का चेंज कोड न तोड़े
+    df.columns = [c.capitalize() for c in df.columns]
+    
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     df['Vol_20MA'] = df['Volume'].rolling(20).mean()
@@ -136,7 +137,6 @@ for batch_num in range(total_batches):
                 exit_idx = idx + 1
                 max_gain = 0
                 
-                # लाइव सिमुलेशन विदाउट बायस
                 for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
                     f_row = df.iloc[future_idx]
                     
@@ -181,7 +181,7 @@ for batch_num in range(total_batches):
             else:
                 idx += 1
 
-# --- CRITICAL BUGFIX: GITHUB TERMINAL LOG REPORT ---
+# --- GITHUB TERMINAL LOG REPORT ---
 print("\n" + "="*60, flush=True)
 print("             🎯 BACKTEST PERFORMANCE REPORT 🎯", flush=True)
 print("="*60, flush=True)
@@ -190,16 +190,12 @@ print("-"*60, flush=True)
 
 for logic, metrics in strategy_tracker.items():
     total = metrics['Total']
-    if total == 0:
-        print(f"{logic:<20} | 0      | 0     | 0      | 0        | 0.0%", flush=True)
-        continue
     wins = metrics['Wins']
     losses = metrics['Losses']
     timeouts = metrics['Timeouts']
-    win_rate = round((wins / total) * 100, 2)
+    win_rate = round((wins / total) * 100, 2) if total > 0 else 0.0
     print(f"{logic:<20} | {total:<6} | {wins:<5} | {losses:<6} | {timeouts:<8} | {win_rate}%", flush=True)
 print("="*60 + "\n", flush=True)
-
 
 # --- GOOGLE SHEETS FORCED OVERWRITE ---
 try:
@@ -231,7 +227,6 @@ try:
         ws_summary.update([header_sum] + summary_rows)
     print("Google Sheets Update Successful!", flush=True)
 except Exception as sheet_err:
-    print(f"⚠️ Sheet Upload Failed due to Permissions, but GitHub logs are safe! Error: {sheet_err}", flush=True)
+    print(f"⚠️ Sheet Upload Failed! Error: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
-        
