@@ -14,21 +14,21 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== RS BEATER V38 - REVERSE BOTTOM SNIPER ENGINE ===", flush=True)
+print("=== RS BEATER V40 - ULTRA FILTERED ELITE SNIPER ENGINE ===", flush=True)
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# TARGET & SL SETTINGS (Optimized for Bottom Buying)
+# HIGH QUALITY STRICT PARAMETERS
 R = {
-    'min_daily_value_cr': 30.0,
-    'fixed_target_pct': 6.0,       
-    'fixed_sl_pct': 3.0, # Will act as max emergency SL           
-    'trail_trigger_pct': 2.5,      
+    'min_daily_value_cr': 70.0,       # Increased from 30cr to 70cr to filter out illiquid stocks
+    'fixed_target_pct': 4.0,         # Balanced target for high-quality institutional moves
+    'fixed_sl_pct': 2.0,             # Tight protection
+    'trail_trigger_pct': 2.0,      
     'time_stop_days': 8,
-    'cooldown_days': 4
+    'cooldown_days': 5               # Increased cooldown to avoid cluster trades in same stock
 }
 
 def get_or_create_ws(sh, title):
@@ -45,20 +45,22 @@ def calculate_base_indicators(df):
     df['Support_Zone_20D'] = df['Low'].shift(1).rolling(window=20).min()
     return df
 
-def check_best_combined_pattern(df, idx):
+def check_elite_combined_pattern(df, idx):
     if idx < 10: return False, "NONE"
     row_today = df.iloc[idx]
-    stop_hunt = (row_today['Low'] < row_today['Low_Min_10D']) and (row_today['Close'] > row_today['Low_Min_10D'])
-    price_flat_or_down = df['Close'].iloc[idx] <= df['Close'].iloc[idx-10]
-    rsi_rising = df['RSI'].iloc[idx] > df['RSI'].iloc[idx-10]
-    hidden_accum = price_flat_or_down and rsi_rising
     
-    if stop_hunt and hidden_accum: return True, "COMBINED_JACKPOT"
-    elif stop_hunt: return True, "STOP_HUNT"
-    elif hidden_accum: return True, "HIDDEN_ACCUM"
+    # QUALITY FILTER 1: Deep Stop Hunt (Lower wick must go significantly below 10D low, showing real shakeout)
+    stop_hunt = (row_today['Low'] < row_today['Low_Min_10D']) and (row_today['Close'] > row_today['Low_Min_10D'])
+    
+    # QUALITY FILTER 2: Strict RSI Divergence (RSI must rise by at least 3 points while price is flat/falling)
+    price_flat_or_down = df['Close'].iloc[idx] <= df['Close'].iloc[idx-10] * 1.01
+    rsi_surge = (df['RSI'].iloc[idx] - df['RSI'].iloc[idx-10]) >= 3.0
+    hidden_accum = price_flat_or_down and rsi_surge
+    
+    if stop_hunt and hidden_accum: return True, "ELITE_JACKPOT"
     return False, "NONE"
 
-def is_bullish_confirmation_candle(row):
+def is_elite_confirmation_candle(row):
     open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
     candle_range = high_p - low_p
     if candle_range <= 0: return False
@@ -68,8 +70,9 @@ def is_bullish_confirmation_candle(row):
     upper_wick = high_p - max(open_p, close_p)
     is_green = close_p > open_p
     
-    is_hammer = (lower_wick >= (body_size * 1.3)) and (upper_wick <= (candle_range * 0.30))
-    is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 0.5) # Gentle bounce tracking
+    # Only accepting high-conviction hammers or solid structural green candles
+    is_hammer = (lower_wick >= (body_size * 1.5)) and (upper_wick <= (candle_range * 0.20))
+    is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 0.75)
     
     return is_hammer or is_strong_green
 
@@ -148,17 +151,14 @@ for batch_num in range(total_batches):
                 avg_val = (df['Close'].iloc[max(0,idx-20):idx] * df['Volume'].iloc[max(0,idx-20):idx]).mean() / 1e7
                 if pd.isna(avg_val) or avg_val < R['min_daily_value_cr']: continue
                 
-                # Check Silent Accumulation & Stop Hunt
-                is_pattern, pattern_type = check_best_combined_pattern(df, idx)
+                # Check for strictly filtered Elite Jackpot Pattern
+                is_pattern, pattern_type = check_elite_combined_pattern(df, idx)
                 if is_pattern:
-                    # Check Bullish Candle Confirmation
-                    if is_bullish_confirmation_candle(row):
+                    if is_elite_confirmation_candle(row):
                         support_line = row['Support_Zone_20D']
                         pct_from_support = ((row['Low'] / support_line) - 1) * 100
                         
                         if pct_from_support <= 1.5:
-                            # CRITICAL REVERSE CHANGE: Direct entry on the SAME DAY close to capture cheap bottom
-                            # Dynamic SL is either the candle low or max 3% fixed SL
                             dynamic_sl_price = max(row['Low'], row['Close'] * (1 - R['fixed_sl_pct']/100))
                             
                             open_trade = {
@@ -167,11 +167,11 @@ for batch_num in range(total_batches):
                                 'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
                                 'SL_Price': dynamic_sl_price,
                                 'Entry_Idx': idx,
-                                'Pattern_Type': f"{pattern_type}_BOTTOM_BUY",
+                                'Pattern_Type': f"{pattern_type}_ELITE_SNIPER",
                                 'Max_High': row['High']
                             }
 
-# --- STABLE SHEET WRITE BLOCK ---
+# --- SHEET WRITE BLOCK ---
 print("\nConnecting to Google Sheet...", flush=True)
 ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
 ws_datewise.clear()
@@ -191,7 +191,7 @@ if trade_logs:
     avg_pnl_per_trade = round(df_logs['PnL_%'].mean(), 2)
 
     dashboard = [
-        ["📊 REVERSE SNIPER ENGINE (BOTTOM BUYING ON SUPPORT)", "", "", "", "", "", "", "", "", ""],
+        ["🎯 ULTRA-FILTERED HIGH QUALITY SNIPER DASHBOARD", "", "", "", "", "", "", "", "", ""],
         ["Total Trades", "Wins (Targets)", "Losses (SL)", "Cost Exits", "Time Outs", "WIN RATE %", "NET P&L %", "AVG P&L/TRADE", "", ""],
         [total_trades, wins, losses, cost_exits, timeouts, f"{win_rate}%", f"{net_pnl}%", f"{avg_pnl_per_trade}%", "", ""],
         ["", "", "", "", "", "", "", "", "", ""],
@@ -207,7 +207,6 @@ if trade_logs:
         if i == 0: ws_datewise.update(chunk)
         else: ws_datewise.append_rows(chunk)
         time.sleep(1.5)
-    print(f"\n[VERIFIED] Clean Bottom-buying Strategy saved!", flush=True)
+    print(f"\n[VERIFIED] Ultra-pure Elite trades pushed successfully!", flush=True)
 else:
-    ws_datewise.update([["System_Status"], ["No Trades Matched."]])
-    
+    ws_datewise.update([["System_Status"], ["No Trades Matched the Strict Elite filters."]])
