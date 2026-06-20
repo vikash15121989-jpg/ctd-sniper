@@ -1,278 +1,265 @@
+import os
+import datetime
 import pandas as pd
 import numpy as np
-import gspread
-import json
-import os
-import time
 import requests
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
-warnings.filterwarnings('ignore')
+import gspread
+from google.oauth2.service_account import Credentials
 
-BACKTEST_END = datetime.now().date()
-BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 20 
+# ==========================================
+# 1. SETTINGS & CONFIGURATIONS
+# ==========================================
+Ticker_URL = "https://raw.githubusercontent.com/vikash15121989/ctd-sniper/main/ind_niftytotalmarket_list.csv"
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V15 (ULTIMATE WEB-SCRAPER METHOD) ===", flush=True)
-
-# GCP Sheets Connection
-gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
-gc = gspread.service_account_from_dict(gcp_json_creds)
-sh = gc.open("CTD_Sniper")
-ws_watchlist = sh.worksheet("Watchlist")
-
-# STRICT PARAMETERS
-TARGET_PCT = 10.0        
-VALIDATION_SL = 5.0      
 MAX_HOLD_DAYS = 30
-COOLDOWN_DAYS = 10       
+COOLDOWN_DAYS = 10
+TARGET_PCT = 0.10
+STOP_LOSS_PCT = 0.05
 
-def get_or_create_ws(sh, title):
-    try: 
-        ws = sh.worksheet(title)
-        ws.batch_clear(["A1:Z50000"])  
-        return ws
-    except: 
-        return sh.add_worksheet(title=title, rows=50000, cols=12)
+# Google Sheets Setup via Environment Variables
+Creds_Dict = {
+    "type": os.environ.get("GCP_TYPE"),
+    "project_id": os.environ.get("GCP_PROJECT_ID"),
+    "private_key_id": os.environ.get("GCP_PRIVATE_KEY_ID"),
+    "private_key": os.environ.get("GCP_PRIVATE_KEY", "").replace("\\n", "\n"),
+    "client_email": os.environ.get("GCP_CLIENT_EMAIL"),
+    "client_id": os.environ.get("GCP_CLIENT_ID"),
+    "auth_uri": os.environ.get("GCP_AUTH_URI"),
+    "token_uri": os.environ.get("GCP_TOKEN_URI"),
+    "auth_provider_x509_cert_url": os.environ.get("GCP_AUTH_PROVIDER_X509_CERT_URL"),
+    "client_x509_cert_url": os.environ.get("GCP_CLIENT_X509_CERT_URL"),
+    "universe_domain": os.environ.get("GCP_UNIVERSE_DOMAIN")
+}
 
-def download_raw_yahoo_data(stock):
-    """बिना yfinance लाइब्रेरी के सीधे Yahoo API से डेटा खींचने वाला एंटी-ब्लॉक मैकेनिज्म"""
-    ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
+# ==========================================
+# 2. YAHOO FINANCE STEALTH SCRAPER
+# ==========================================
+def fetch_yfinance_stealth(ticker, days=365):
+    end_dt = datetime.datetime.now()
+    start_dt = end_dt - datetime.timedelta(days=days)
     
-    # टाइमस्टैम्प्स कैलकुलेशन
-    period1 = int(time.mktime((BACKTEST_START - timedelta(days=60)).timetuple()))
-    period2 = int(time.mktime((BACKTEST_END + timedelta(days=5)).timetuple()))
+    period1 = int(start_dt.timestamp())
+    period2 = int(end_dt.timestamp())
     
-    # डायरेक्ट ब्राउज़र यूआरएल जो कभी ब्लॉक नहीं होता
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history"
+    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5'
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
             return None
+        
+        lines = res.text.split('\n')
+        if len(lines) <= 1:
+            return None
             
-        data = res.json()
-        result = data['chart']['result'][0]
-        timestamps = result['timestamp']
-        indicators = result['indicators']['quote'][0]
-        
-        # पांडास डेटाफ़्रेम क्रिएशन (रॉ डिक्शनरी से)
-        df = pd.DataFrame({
-            'Open': indicators['open'],
-            'High': indicators['high'],
-            'Low': indicators['low'],
-            'Close': indicators['close'],
-            'Volume': indicators['volume']
-        }, index=pd.to_datetime(timestamps, unit='s'))
-        
-        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        data = []
+        for line in lines[1:]:
+            row = line.strip().split(',')
+            if len(row) == 7 and 'null' not in row:
+                data.append(row)
+                
+        if not data:
+            return None
+            
+        df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'])
+        df['Date'] = pd.to_datetime(df['Date'])
+        for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col])
+            
+        df = df.sort_values('Date').reset_index(drop=True)
         return df
     except Exception:
         return None
 
-def calculate_price_action_features(df):
-    if df.empty or len(df) < 25:
-        return pd.DataFrame()
-        
-    for col in ['Open', 'High', 'Low', 'Close']:
-        df[col] = df[col].astype(float)
-        
+# ==========================================
+# 3. PRICE ACTION LOGIC ENGINE (CHoCH & Support)
+# ==========================================
+def build_indicators(df):
+    if len(df) < 21:
+        return df
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
-    
-    if 'Volume' in df.columns:
-        df['Volume'] = df['Volume'].astype(float)
-        df['Vol_20MA'] = df['Volume'].rolling(20).mean()
-        df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
-    else:
-        df['Vol_Multiple'] = 2.0
-        
+    df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
+    df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
     return df
 
 def check_pure_price_action(df, idx):
-    row = df.iloc[idx]
-    row_prev = df.iloc[idx-1] if idx > 0 else row
-    
-    if pd.isna(row['Low']) or pd.isna(row['Support_20D']) or pd.isna(row['Resistance_10D']):
-        return False, "NONE"
+    if idx < 1:
+        return False, None
         
-    open_p, high_p, low_p, close_p = row['Open'], row['High'], row['Low'], row['Close']
-    candle_range = high_p - low_p
-    if candle_range <= 0: return False, "NONE"
+    row = df.iloc[idx]
+    row_prev = df.iloc[idx-1]
     
-    body_size = abs(close_p - open_p)
-    lower_wick = min(open_p, close_p) - low_p
-    is_green = close_p > open_p
+    is_green = row['Close'] > row['Open']
     
-    # 1. SUPPORT RETEST
-    at_support = abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
-    has_buyer_rejection = lower_wick >= (body_size * 1.2)
+    # ----------------------------------------------------
+    # STRATEGY 1: PA_SUPPORT_RETEST
+    # ----------------------------------------------------
+    low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
+    body = abs(row['Close'] - row['Open'])
+    lower_wick = min(row['Open'], row['Close']) - row['Low']
+    strong_rejection = lower_wick >= (body * 1.2)
     
-    if at_support and (has_buyer_rejection or is_green):
+    if low_near_support and (strong_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # 2. CHoCH BREAKOUT
+    # ----------------------------------------------------
+    # STRATEGY 2: PA_CHoCH_BREAKOUT (V16 Optimized)
+    # ----------------------------------------------------
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row.get('Vol_Multiple', 2.0) > 1.8
+    strong_volume = row.get('Vol_Multiple', 1.5) > 1.25  # Volume filter lowered to 1.25x
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
         
-    return False, "NONE"
+    return False, None
 
-def pipeline_worker(stock):
+# ==========================================
+# 4. BACKTESTING BACKBONE
+# ==========================================
+def run_backtest_for_ticker(ticker, df):
+    if df is None or len(df) < 30:
+        return []
+        
+    df = build_indicators(df)
+    signals = []
+    idx = 21
+    total_rows = len(df)
+    
+    while idx < total_rows:
+        is_signal, mode = check_pure_price_action(df, idx)
+        if is_signal:
+            entry_row = df.iloc[idx]
+            entry_price = entry_row['Close']
+            entry_date = entry_row['Date']
+            
+            target_price = entry_price * (1 + TARGET_PCT)
+            sl_price = entry_price * (1 - STOP_LOSS_PCT)
+            
+            result = "TIMEOUT"
+            exit_date = None
+            exit_price = entry_price
+            
+            exit_idx = idx + 1
+            while exit_idx < min(idx + 1 + MAX_HOLD_DAYS, total_rows):
+                future_row = df.iloc[exit_idx]
+                
+                if future_row['High'] >= target_price:
+                    result = "PROFIT"
+                    exit_date = future_row['Date']
+                    exit_price = target_price
+                    break
+                elif future_row['Low'] <= sl_price:
+                    result = "LOSS"
+                    exit_date = future_row['Date']
+                    exit_price = sl_price
+                    break
+                    
+                exit_price = future_row['Close']
+                exit_date = future_row['Date']
+                exit_idx += 1
+                
+            signals.append({
+                "Ticker": ticker,
+                "Strategy Mode": mode,
+                "Entry Date": entry_date.strftime('%Y-%m-%d'),
+                "Entry Price": round(entry_price, 2),
+                "Exit Date": exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
+                "Exit Price": round(exit_price, 2),
+                "Result": result
+            })
+            idx = exit_idx + COOLDOWN_DAYS
+        else:
+            idx += 1
+            
+    return signals
+
+# ==========================================
+# 5. MAIN EXECUTION ROUTINE
+# ==========================================
+def main():
+    print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V16 ===")
+    
     try:
-        raw_df = download_raw_yahoo_data(stock)
-        if raw_df is None or raw_df.empty:
-            return None, stock
+        tickers_df = pd.read_csv(Ticker_URL)
+        ticker_list = tickers_df['Symbol'].dropna().tolist()
+        ticker_list = [t + ".NS" for t in ticker_list if not t.endswith(".NS")]
+    except Exception as e:
+        print(f"Error downloading ticker list: {e}")
+        return
+        
+    print(f"Processing {len(ticker_list)} stocks via Stealth Scraper...")
+    
+    all_signals = []
+    batch_size = 20
+    
+    for i in range(0, len(ticker_list), batch_size):
+        batch = ticker_list[i:i+batch_size]
+        for ticker in batch:
+            df = fetch_yfinance_stealth(ticker, days=365)
+            if df is not None:
+                ticker_signals = run_backtest_for_ticker(ticker, df)
+                all_signals.extend(ticker_signals)
+        print(f"Batch {int(i/batch_size)+1} done. Total Live Downloads: {min(i+batch_size, len(ticker_list))}")
+        
+    if not all_signals:
+        print("⚠️ Alert: No price action signals discovered across entire market dataset.")
+        return
+        
+    final_df = pd.DataFrame(all_signals)
+    
+    # Print Summary Report in Console
+    print("\n=======================================================")
+    print("📢 BACKTEST PERFORMANCE REPORT 📢")
+    print("=======================================================")
+    print(f"{'Strategy Mode':<20} | {'Total':<5} | {'Wins':<5} | {'Losses':<6} | {'Timeouts':<8} | {'Win Rate %'}")
+    print("-" * 65)
+    
+    for m in ["PA_SUPPORT_RETEST", "PA_CHoCH_BREAKOUT"]:
+        m_df = final_df[final_df["Strategy Mode"] == m]
+        tot = len(m_df)
+        if tot > 0:
+            w = len(m_df[m_df["Result"] == "PROFIT"])
+            l = len(m_df[m_df["Result"] == "LOSS"])
+            t = len(m_df[m_df["Result"] == "TIMEOUT"])
+            wr = round((w / tot) * 100, 2)
+            print(f"{m:<20} | {tot:<5} | {w:<5} | {l:<6} | {t:<8} | {wr}%")
+        else:
+            print(f"{m:<20} | 0     | 0     | 0      | 0        | 0.0%")
+    print("=======================================================\n")
+    
+    # ----------------------------------------------------
+    # CRITICAL FIX: SAFE GOOGLE SHEETS UPLOAD
+    # ----------------------------------------------------
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(Creds_Dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        
+        sheet = client.open("CTD_Sniper_Scanner")
+        wks = sheet.get_worksheet(0)
+        
+        # Safe dataframe handling
+        if final_df is not None and len(final_df) > 0:
+            final_df = final_df.fillna("") # Fill any NaN values to prevent API crashes
+            wks.clear() # Clear the sheet safely
             
-        df = calculate_price_action_features(raw_df)
-        if df.empty or len(df) < 40: 
-            return None, stock
+            # Combine headers and rows into a single list structure
+            sheet_data = [final_df.columns.values.tolist()] + final_df.values.tolist()
+            wks.update(sheet_data) # Force upload the full data chunk
+            print("Google Sheets Update Successful with Data Matrix!")
+        else:
+            print("Google Sheets upload skipped: Final table is empty.")
             
-        df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
-        return df, stock
-    except Exception:
-        return None, stock
+    except Exception as e:
+        print(f"Google Sheets Upload Failed: {e}")
+        
+    print("=== SYSTEM EXECUTION COMPLETE ===")
 
-# --- MAIN SYSTEM EXECUTION ---
-stocks = ws_watchlist.col_values(1)[1:]
-stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip() and not s.startswith(('LTIM', 'AKZO'))])))
-total_stocks = len(stocks)
-total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
-
-pa_logs = []
-strategy_tracker = {
-    "PA_SUPPORT_RETEST": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0},
-    "PA_CHoCH_BREAKOUT": {'Total': 0, 'Wins': 0, 'Losses': 0, 'Timeouts': 0}
-}
-
-print(f"Processing {total_stocks} stocks via Stealth Raw Scraper...", flush=True)
-success_download_count = 0
-
-for batch_num in range(total_batches):
-    start_idx = batch_num * BATCH_SIZE
-    end_idx = min(start_idx + BATCH_SIZE, total_stocks)
-    batch_stocks = stocks[start_idx:end_idx]
-
-    stock_data = {}
-    # वर्कर्स कम किए ताकि याहू को शक न हो
-    with ThreadPoolExecutor(max_workers=3) as executor:  
-        future_to_stock = {executor.submit(pipeline_worker, stock): stock for stock in batch_stocks}
-        for future in as_completed(future_to_stock):
-            df, stock = future.result()
-            if df is not None and not df.empty: 
-                stock_data[stock] = df
-                success_download_count += 1
-
-    for stock, df in stock_data.items():
-        idx = 20
-        while idx < len(df) - 1:
-            has_setup, pa_logic = check_pure_price_action(df, idx)
-            pa_logic = pa_logic.strip().upper()
-            
-            if has_setup and pa_logic in strategy_tracker:
-                entry_price = df['Close'].iloc[idx]
-                target_price = entry_price * (1 + TARGET_PCT / 100)
-                sl_price = entry_price * (1 - VALIDATION_SL / 100)
-                
-                trade_outcome = None
-                exit_idx = idx + 1
-                max_gain = 0
-                
-                for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
-                    f_row = df.iloc[future_idx]
-                    
-                    current_gain = ((f_row['High'] / entry_price) - 1) * 100
-                    if current_gain > max_gain:
-                        max_gain = current_gain
-                    
-                    if f_row['Low'] <= sl_price and f_row['High'] >= target_price:
-                        trade_outcome = "LOSS"
-                        exit_idx = future_idx
-                        break
-                    elif f_row['Low'] <= sl_price:
-                        trade_outcome = "LOSS"
-                        exit_idx = future_idx
-                        break
-                    elif f_row['High'] >= target_price:
-                        trade_outcome = "PROFIT"
-                        exit_idx = future_idx
-                        break
-                
-                if not trade_outcome:
-                    trade_outcome = "TIMEOUT"
-                    exit_idx = min(idx + MAX_HOLD_DAYS, len(df) - 1)
-                
-                pa_logs.append({
-                    'Stock': stock,
-                    'Entry_Date': df.index[idx],
-                    'Exit_Date': df.index[exit_idx],
-                    'Entry_Price': round(entry_price, 2),
-                    'Max_Gain_%': round(max_gain, 2),
-                    'PA_Pattern': pa_logic,
-                    'Outcome': trade_outcome,
-                    'Days_Held': exit_idx - idx
-                })
-                
-                strategy_tracker[pa_logic]['Total'] += 1
-                if trade_outcome == "PROFIT": strategy_tracker[pa_logic]['Wins'] += 1
-                elif trade_outcome == "LOSS": strategy_tracker[pa_logic]['Losses'] += 1
-                else: strategy_tracker[pa_logic]['Timeouts'] += 1
-                
-                idx = exit_idx + COOLDOWN_DAYS
-            else:
-                idx += 1
-                
-    print(f"Batch {batch_num + 1}/{total_batches} done. Total Live Downloads: {success_download_count}", flush=True)
-    time.sleep(3) # सख्त कूलडाउन
-
-# --- TERMINAL REPORT ---
-print("\n" + "="*60, flush=True)
-print("             🎯 BACKTEST PERFORMANCE REPORT 🎯", flush=True)
-print("="*60, flush=True)
-print(f"{'Strategy Mode':<20} | {'Total':<6} | {'Wins':<5} | {'Losses':<6} | {'Timeouts':<8} | {'Real Win Rate %':<15}", flush=True)
-print("-"*60, flush=True)
-
-for logic, metrics in strategy_tracker.items():
-    total = metrics['Total']
-    wins = metrics['Wins']
-    losses = metrics['Losses']
-    timeouts = metrics['Timeouts']
-    win_rate = round((wins / total) * 100, 2) if total > 0 else 0.0
-    print(f"{logic:<20} | {total:<6} | {wins:<5} | {losses:<6} | {timeouts:<8} | {win_rate}%", flush=True)
-print("="*60 + "\n", flush=True)
-
-# --- GOOGLE SHEETS UPLOAD ---
-try:
-    ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
-    if pa_logs:
-        df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
-        header_rev = df_rev.columns.values.tolist()
-        payload_rev = [header_rev] + df_rev.values.tolist()
-        for i in range(0, len(payload_rev), 1000):
-            ws_logs.append_rows(payload_rev[i:i+1000])
-            time.sleep(1)
-
-    ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
-    summary_rows = []
-    for logic, metrics in strategy_tracker.items():
-        total = metrics['Total']
-        if total == 0: continue 
-        summary_rows.append([logic, total, metrics['Wins'], metrics['Losses'], metrics['Timeouts'], f"{round((metrics['Wins'] / total) * 100, 2)}%"])
-
-    if summary_rows:
-        header_sum = ["Price Action Mode", "Total Signal Count", "Target Hits (10% Profit)", "StopLoss Hits (5% Loss)", "Timeouts", "Real Price Action Win Rate %"]
-        ws_summary.update([header_sum] + summary_rows)
-    print("Google Sheets Update Successful!", flush=True)
-except Exception as sheet_err:
-    print(f"⚠️ Sheet Upload Failed: {sheet_err}", flush=True)
-
-print("\n=== SYSTEM EXECUTION COMPLETE ===")
+if __name__ == "__main__":
+    main()
+    
