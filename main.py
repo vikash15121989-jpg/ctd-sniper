@@ -15,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V7 (ANTI-BLOCK FIXED) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V8 (AUTO-LOG FIXED) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -29,7 +29,7 @@ VALIDATION_SL = 5.0
 MAX_HOLD_DAYS = 30
 COOLDOWN_DAYS = 10       
 
-# ब्राउज़र जैसा हेडर ताकि Yahoo Finance 'Unauthorized Crumb' एरर न दे
+# एंटी-ब्लॉक सेशन हेडर
 SESSION = requests.Session()
 SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -38,7 +38,8 @@ SESSION.headers.update({
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
-        ws.clear()  # शीट को बिना डिलीट किए उसके अंदर के पूरे डेटा का सफाया करने का सबसे सुरक्षित तरीका
+        # सेफ और फ़ास्ट क्लियरिंग मेथड
+        ws.batch_clear(["A1:Z50000"])  
         return ws
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
@@ -81,7 +82,6 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        # session पास करने से 'Invalid Crumb' एरर फिक्स हो जाएगी
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
                        auto_adjust=True, timeout=15, session=SESSION)
@@ -99,7 +99,6 @@ def download_single_stock(stock):
 
 # --- MAIN SYSTEM EXECUTION ---
 stocks = ws_watchlist.col_values(1)[1:]
-# फ़िल्टर करें ताकि शीट में लिखे फालतू या डेलिस्टेड नाम पहले ही साफ़ हो जाएं
 stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip() and not s.startswith(('LTIM', 'AKZO'))])))
 total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
@@ -145,7 +144,6 @@ for batch_num in range(total_batches):
                     if current_gain > max_gain:
                         max_gain = current_gain
                     
-                    # Intraday Check: दोनों हिट होने पर लॉस मानेंगे
                     if f_row['Low'] <= sl_price and f_row['High'] >= target_price:
                         trade_outcome = "LOSS"
                         exit_idx = future_idx
@@ -183,32 +181,57 @@ for batch_num in range(total_batches):
             else:
                 idx += 1
 
-# --- GOOGLE SHEETS FORCED OVERWRITE ---
-print("\nResetting Worksheets & Uploading Clean Performance...", flush=True)
+# --- CRITICAL BUGFIX: GITHUB TERMINAL LOG REPORT ---
+print("\n" + "="*60, flush=True)
+print("             🎯 BACKTEST PERFORMANCE REPORT 🎯", flush=True)
+print("="*60, flush=True)
+print(f"{'Strategy Mode':<20} | {'Total':<6} | {'Wins':<5} | {'Losses':<6} | {'Timeouts':<8} | {'Real Win Rate %':<15}", flush=True)
+print("-"*60, flush=True)
 
-ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
-if pa_logs:
-    df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
-    header_rev = df_rev.columns.values.tolist()
-    payload_rev = [header_rev] + df_rev.values.tolist()
-    for i in range(0, len(payload_rev), 1000):
-        ws_logs.append_rows(payload_rev[i:i+1000])
-        time.sleep(1)
-
-ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
-summary_rows = []
 for logic, metrics in strategy_tracker.items():
     total = metrics['Total']
-    if total == 0: continue 
-    
+    if total == 0:
+        print(f"{logic:<20} | 0      | 0     | 0      | 0        | 0.0%", flush=True)
+        continue
     wins = metrics['Wins']
     losses = metrics['Losses']
     timeouts = metrics['Timeouts']
     win_rate = round((wins / total) * 100, 2)
-    summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
+    print(f"{logic:<20} | {total:<6} | {wins:<5} | {losses:<6} | {timeouts:<8} | {win_rate}%", flush=True)
+print("="*60 + "\n", flush=True)
 
-if summary_rows:
-    header_sum = ["Price Action Mode", "Total Signal Count", "Target Hits (10% Profit)", "StopLoss Hits (5% Loss)", "Timeouts", "Real Price Action Win Rate %"]
-    ws_summary.update([header_sum] + summary_rows)
+
+# --- GOOGLE SHEETS FORCED OVERWRITE ---
+try:
+    print("Resetting Worksheets & Uploading Clean Performance to Google Sheets...", flush=True)
+
+    ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
+    if pa_logs:
+        df_rev = pd.DataFrame(pa_logs).sort_values(by=['Stock', 'Entry_Date'])
+        header_rev = df_rev.columns.values.tolist()
+        payload_rev = [header_rev] + df_rev.values.tolist()
+        for i in range(0, len(payload_rev), 1000):
+            ws_logs.append_rows(payload_rev[i:i+1000])
+            time.sleep(1)
+
+    ws_summary = get_or_create_ws(sh, "STRATEGY_PERFORMANCE_SUMMARY")
+    summary_rows = []
+    for logic, metrics in strategy_tracker.items():
+        total = metrics['Total']
+        if total == 0: continue 
+        
+        wins = metrics['Wins']
+        losses = metrics['Losses']
+        timeouts = metrics['Timeouts']
+        win_rate = round((wins / total) * 100, 2)
+        summary_rows.append([logic, total, wins, losses, timeouts, f"{win_rate}%"])
+
+    if summary_rows:
+        header_sum = ["Price Action Mode", "Total Signal Count", "Target Hits (10% Profit)", "StopLoss Hits (5% Loss)", "Timeouts", "Real Price Action Win Rate %"]
+        ws_summary.update([header_sum] + summary_rows)
+    print("Google Sheets Update Successful!", flush=True)
+except Exception as sheet_err:
+    print(f"⚠️ Sheet Upload Failed due to Permissions, but GitHub logs are safe! Error: {sheet_err}", flush=True)
 
 print("\n=== SYSTEM EXECUTION COMPLETE ===")
+        
