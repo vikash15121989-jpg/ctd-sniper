@@ -4,6 +4,7 @@ import numpy as np
 import gspread
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
@@ -11,11 +12,11 @@ warnings.filterwarnings('ignore')
 
 BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 50
+BATCH_SIZE = 40
 
-print("=== RS BEATER V31 - SUPPORT ZONE & BULLISH CANDLE ENGINE ===", flush=True)
+print("=== RS BEATER V32 - SUPPORT ZONE SHEET UPLOADER FIXED ===", flush=True)
 
-# GSheet Connection
+# GSheet Connection Setup
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
@@ -23,16 +24,18 @@ ws_watchlist = sh.worksheet("Watchlist")
 
 R = {
     'min_daily_value_cr': 30.0,
-    'fixed_target_pct': 6.0,       # 6% Target
-    'fixed_sl_pct': 3.0,           # 3% SL
-    'trail_trigger_pct': 2.5,      # Trailing trigger to lock cost
+    'fixed_target_pct': 6.0,       
+    'fixed_sl_pct': 3.0,           
+    'trail_trigger_pct': 2.5,      
     'time_stop_days': 8,
     'cooldown_days': 4
 }
 
 def get_or_create_ws(sh, title):
-    try: return sh.worksheet(title)
-    except: return sh.add_worksheet(title=title, rows=20000, cols=15)
+    try:
+        return sh.worksheet(title)
+    except:
+        return sh.add_worksheet(title=title, rows=30000, cols=12)
 
 def calculate_base_indicators(df):
     delta = df['Close'].diff()
@@ -41,8 +44,6 @@ def calculate_base_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     df['Low_Min_10D'] = df['Low'].shift(1).rolling(window=10).min()
-    
-    # NEW: 20-Day Swing Support Line Filter
     df['Support_Zone_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Vol_Avg20'] = df['Volume'].rolling(window=20).mean()
     return df
@@ -71,9 +72,7 @@ def is_bullish_confirmation_candle(row):
     upper_wick = high_p - max(open_p, close_p)
     is_green = close_p > open_p
     
-    # Hammer structure check
     is_hammer = (lower_wick >= (body_size * 1.8)) and (upper_wick <= (candle_range * 0.20))
-    # Strong green institutional candle (>= 1.5% body expansion)
     is_strong_green = is_green and (((close_p / open_p) - 1) * 100 >= 1.5)
     
     return is_hammer or is_strong_green
@@ -103,7 +102,7 @@ for batch_num in range(total_batches):
     batch_stocks = stocks[start_idx:end_idx]
 
     stock_data = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=15) as executor:
         future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
         for future in as_completed(future_to_stock):
             df, stock = future.result()
@@ -170,9 +169,7 @@ for batch_num in range(total_batches):
                 is_pattern, pattern_type = check_best_combined_pattern(df, idx)
                 if is_pattern:
                     if is_bullish_confirmation_candle(row):
-                        # CRITICAL FILTER: Proximity to 20-Day Swing Support Line
                         support_line = row['Support_Zone_20D']
-                        # Candle low must be within 0.5% boundary of support line OR breaking below it (Stop Hunt)
                         pct_from_support = ((row['Low'] / support_line) - 1) * 100
                         
                         if pct_from_support <= 0.5:
@@ -186,16 +183,31 @@ for batch_num in range(total_batches):
                                 'Max_High': row['High']
                             }
 
-# --- SAVE TO GOOGLE SHEETS DATEWISE ---
+# --- DIRECT ROBUST UPLOAD BLOCK ---
+ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
+ws_datewise.clear()
+time.sleep(2)
+
 if trade_logs:
     df_logs = pd.DataFrame(trade_logs)
     df_logs = df_logs.sort_values(by='Setup_Date', ascending=True)
     
-    ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
-    ws_datewise.clear()
+    # Converting DataFrame to list of lists
+    header = df_logs.columns.values.tolist()
+    all_rows = df_logs.values.tolist()
+    payload = [header] + all_rows
     
-    ws_datewise.update([df_logs.columns.values.tolist()] + df_logs.values.tolist())
-    print(f"\n[SUCCESS] {len(df_logs)} Elite Support-Zone Trades successfully saved to Google Sheets!", flush=True)
+    # Uploading in chunks of 2000 rows to avoid API crash
+    chunk_size = 2000
+    for i in range(0, len(payload), chunk_size):
+        chunk = payload[i:i + chunk_size]
+        if i == 0:
+            ws_datewise.update(chunk)
+        else:
+            ws_datewise.append_rows(chunk)
+        time.sleep(1.5) # Anti-rate limit delay
+        
+    print(f"\n[SUCCESS] Total {len(df_logs)} Elite Support-Zone Trades successfully pushed to tab 'PA_DATEWISE_LOGS'!", flush=True)
 else:
-    print("\n[WARNING] No trades matched the pattern + candle + support confluence criteria.", flush=True)
+    print("\n[WARNING] No trades matched the criteria.", flush=True)
     
