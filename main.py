@@ -13,8 +13,9 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 50
 
-print("=== RS BEATER V28 - BEST STRATEGY CONDITION DIGGER ===", flush=True)
+print("=== RS BEATER V29 - DATE-WISE GOOGLE SHEET LOGGER ===", flush=True)
 
+# GSheet Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
@@ -22,10 +23,16 @@ ws_watchlist = sh.worksheet("Watchlist")
 
 R = {
     'min_daily_value_cr': 30.0,
-    'fixed_target_pct': 6.0,
-    'fixed_sl_pct': 3.0,
+    'fixed_target_pct': 6.0,       # 6% Profit Target
+    'fixed_sl_pct': 3.0,           # 3% Initial SL
+    'trail_trigger_pct': 2.5,      # Lock at cost if price hits 2.5% runup
     'time_stop_days': 8,
+    'cooldown_days': 4
 }
+
+def get_or_create_ws(sh, title):
+    try: return sh.worksheet(title)
+    except: return sh.add_worksheet(title=title, rows=20000, cols=15)
 
 def calculate_base_indicators(df):
     delta = df['Close'].diff()
@@ -37,25 +44,18 @@ def calculate_base_indicators(df):
     df['Vol_Avg20'] = df['Volume'].rolling(window=20).mean()
     return df
 
-# Merging our best two structural strategies for analysis
 def check_best_combined_pattern(df, idx):
     if idx < 10: return False, "NONE"
     row_today = df.iloc[idx]
     
-    # 1. Stop Hunt Rejection
     stop_hunt = (row_today['Low'] < row_today['Low_Min_10D']) and (row_today['Close'] > row_today['Low_Min_10D'])
-    # 2. Hidden Accumulation
     price_flat_or_down = df['Close'].iloc[idx] <= df['Close'].iloc[idx-10]
     rsi_rising = df['RSI'].iloc[idx] > df['RSI'].iloc[idx-10]
     hidden_accum = price_flat_or_down and rsi_rising
     
-    if stop_hunt and hidden_accum:
-        return True, "COMBINED_JACKPOT"
-    elif stop_hunt:
-        return True, "STOP_HUNT"
-    elif hidden_accum:
-        return True, "HIDDEN_ACCUM"
-        
+    if stop_hunt and hidden_accum: return True, "COMBINED_JACKPOT"
+    elif stop_hunt: return True, "STOP_HUNT"
+    elif hidden_accum: return True, "HIDDEN_ACCUM"
     return False, "NONE"
 
 def download_single_stock(stock):
@@ -75,8 +75,7 @@ stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if
 total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
-winning_conditions = []
-losing_conditions = []
+trade_logs = []
 
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
@@ -92,19 +91,21 @@ for batch_num in range(total_batches):
 
     for stock, df in stock_data.items():
         open_trade = None
+        last_exit_idx = -100
         
         for idx in range(20, len(df)):
             row = df.iloc[idx]
+            current_date = df.index[idx]
             
             if open_trade:
-                # Track maximum favorable movement during the trade
                 if row['High'] > open_trade['Max_High']:
                     open_trade['Max_High'] = row['High']
                 
-                # Trailing logic at 3%
                 current_max_profit = ((row['High'] / open_trade['Entry_Price']) - 1) * 100
                 current_sl = open_trade['SL_Price']
-                if current_max_profit >= 3.0:
+                
+                # Bulletproof 2.5% Trailing Lock
+                if current_max_profit >= R['trail_trigger_pct']:
                     current_sl = open_trade['Entry_Price']
 
                 sl_hit = row['Low'] <= current_sl
@@ -112,29 +113,38 @@ for batch_num in range(total_batches):
                 days_held = idx - open_trade['Entry_Idx']
                 
                 exit_status = None
-                if sl_hit and target_hit: exit_status = 'LOSS'
-                elif target_hit: exit_status = 'WIN'
-                elif sl_hit: exit_status = 'LOSS'
-                elif days_held >= R['time_stop_days']: exit_status = 'TIME_OUT'
+                exit_price = None
+                
+                if sl_hit and target_hit:
+                    exit_price = current_sl; exit_status = 'LOSS' if current_sl < open_trade['Entry_Price'] else 'COST_EXIT'
+                elif target_hit:
+                    exit_price = open_trade['Target_Price']; exit_status = 'PROFIT'
+                elif sl_hit:
+                    exit_price = current_sl; exit_status = 'LOSS' if current_sl < open_trade['Entry_Price'] else 'COST_EXIT'
+                elif days_held >= R['time_stop_days']:
+                    exit_price = row['Close']; exit_status = 'TIME_OUT'
                 
                 if exit_status:
+                    pnl_pct = ((exit_price / open_trade['Entry_Price']) - 1) * 100
                     max_runup = ((open_trade['Max_High'] / open_trade['Entry_Price']) - 1) * 100
-                    trade_stats = {
-                        'Stock': stock,
-                        'Pattern': open_trade['Pattern_Type'],
-                        'Wick_Ratio': open_trade['Wick_Ratio'],
-                        'Volume_Multiplier': open_trade['Vol_Mult'],
-                        'Max_Runup_%': round(max_runup, 2),
-                        'Days_Held': days_held
-                    }
                     
-                    if exit_status == 'WIN':
-                        winning_conditions.append(trade_stats)
-                    else:
-                        losing_conditions.append(trade_stats)
-                        
+                    trade_logs.append({
+                        'Setup_Date': open_trade['Setup_Date'],
+                        'Exit_Date': current_date,
+                        'Stock': stock,
+                        'Pattern_Type': open_trade['Pattern_Type'],
+                        'Entry_Price': round(open_trade['Entry_Price'], 2),
+                        'Exit_Price': round(exit_price, 2),
+                        'Max_Runup_%': round(max_runup, 2),
+                        'PnL_%': round(pnl_pct, 2),
+                        'Result': exit_status,
+                        'Days_Held': days_held
+                    })
+                    last_exit_idx = idx
                     open_trade = None
             else:
+                if (idx - last_exit_idx) < R['cooldown_days']: continue
+                
                 avg_val = (df['Close'].iloc[max(0,idx-20):idx] * df['Volume'].iloc[max(0,idx-20):idx]).mean() / 1e7
                 if pd.isna(avg_val) or avg_val < R['min_daily_value_cr']: continue
                 
@@ -145,6 +155,7 @@ for batch_num in range(total_batches):
                     v_mult = row['Volume'] / row['Vol_Avg20'] if row['Vol_Avg20'] > 0 else 1
                     
                     open_trade = {
+                        'Setup_Date': current_date,
                         'Entry_Price': row['Close'],
                         'Target_Price': row['Close'] * (1 + R['fixed_target_pct']/100),
                         'SL_Price': row['Close'] * (1 - R['fixed_sl_pct']/100),
@@ -155,28 +166,18 @@ for batch_num in range(total_batches):
                         'Max_High': row['High']
                     }
 
-# --- REPORT GENERATION ---
-df_wins = pd.DataFrame(winning_conditions)
-df_loss = pd.DataFrame(losing_conditions)
-
-print("\n" + "="*70)
-print("🟩 WINNING TRADES STRUCTURAL PROFILE (WHEN PATTERN PROFITED) 🟩")
-print("="*70)
-if not df_wins.empty:
-    print(f"Average Wick Rejection Ratio : {round(df_wins['Wick_Ratio'].mean()*100, 1)}%")
-    print(f"Average Volume Multiplier    : {round(df_wins['Volume_Multiplier'].mean(), 2)}x (vs 20-day avg)")
-    print(f"Most Profitable Pattern Type : {df_wins['Pattern'].value_counts().idxmax()}")
+# --- SAVE TO GOOGLE SHEETS DATEWISE ---
+if trade_logs:
+    df_logs = pd.DataFrame(trade_logs)
+    # Sorting everything perfectly by Setup Date
+    df_logs = df_logs.sort_values(by='Setup_Date', ascending=True)
+    
+    ws_datewise = get_or_create_ws(sh, "PA_DATEWISE_LOGS")
+    ws_datewise.clear()
+    
+    # Uploading Data
+    ws_datewise.update([df_logs.columns.values.tolist()] + df_logs.values.tolist())
+    print(f"\n[SUCCESS] {len(df_logs)} Trades perfectly saved to 'PA_DATEWISE_LOGS' sheet date-wise!", flush=True)
 else:
-    print("No winning samples recorded.")
-
-print("\n" + "="*70)
-print("🟥 LOSING TRADES STRUCTURAL PROFILE (WHEN PATTERN FAILED) 🟥")
-print("="*70)
-if not df_loss.empty:
-    print(f"Average Wick Rejection Ratio : {round(df_loss['Wick_Ratio'].mean()*100, 1)}%")
-    print(f"Average Volume Multiplier    : {round(df_loss['Volume_Multiplier'].mean(), 2)}x")
-    print(f"Average Max Upward Runup     : {round(df_loss['Max_Runup_%'].mean(), 2)}% (Before hitting SL)")
-    print(f"Average Days Before Failure  : {round(df_loss['Days_Held'].mean(), 1)} Days")
-else:
-    print("No losing samples recorded.")
-print("="*70)
+    print("\n[WARNING] No trades generated during this period.", flush=True)
+    
