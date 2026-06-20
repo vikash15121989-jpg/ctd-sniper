@@ -13,9 +13,9 @@ warnings.filterwarnings('ignore')
 
 BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
-BATCH_SIZE = 35
+BATCH_SIZE = 25  # थ्रॉटलिंग से बचने के लिए बैच साइज थोड़ा छोटा किया
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V13 (FINAL STRUCTURE FIX) ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V14 (ANTI-BLOCK DIRECT API) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -31,7 +31,7 @@ COOLDOWN_DAYS = 10
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 })
 
 def get_or_create_ws(sh, title):
@@ -42,48 +42,32 @@ def get_or_create_ws(sh, title):
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
-def clean_and_flatten_df(df):
-    """याहू फाइनेंस के मल्टी-इंडेक्स और टुपल स्ट्रक्चर को पूरी तरह नष्ट करके सादा DF बनाने वाला फंक्शन"""
+def calculate_price_action_features(df):
     if df.empty:
         return pd.DataFrame()
         
-    new_data = {}
-    # चेक करें कि कॉलम्स में टुपल या मल्टी-इंडेक्स तो नहीं फंसा है
-    for col in df.columns:
-        col_name = col[-1] if isinstance(col, tuple) else (col[1] if isinstance(col, pd.MultiIndex) else col)
-        col_clean = str(col_name).strip().capitalize()
+    # मल्टी-इंडेक्स या अजीब कॉलम लेयर्स को पूरी तरह हटाकर फ्रेश क्लीन डेटा निकालना
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
         
-        # सिर्फ काम के कॉलम्स को ही सादे डिक्शनरी फॉर्मेट में निकालें
-        if col_clean in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj close']:
-            # डेटा को 1D Series में फ़ोर्स करें ताकि Calculations न टूटें
-            new_data[col_clean] = df[col].to_numpy().flatten()
-            
-    # एक नया और बिल्कुल फ्रेश सिंगल-लेयर डेटाफ़्रेम तैयार करें
-    flat_df = pd.DataFrame(new_data, index=df.index)
+    df.columns = [str(c).strip().capitalize() for c in df.columns]
     
-    # फॉलबैक: अगर 'Close' गायब है तो 'Adj close' को ही मेन क्लोज बनाएं
-    if 'Close' not in flat_df.columns and 'Adj close' in flat_df.columns:
-        flat_df['Close'] = flat_df['Adj close']
+    # अगर 'Close' गायब हो और 'Adj close' हो
+    if 'Close' not in df.columns and 'Adj close' in df.columns:
+        df['Close'] = df['Adj close']
         
-    return flat_df
-
-def calculate_price_action_features(df):
-    df = clean_and_flatten_df(df)
-    
     required_cols = ['Open', 'High', 'Low', 'Close']
     if any(c not in df.columns for c in required_cols):
-        return pd.DataFrame() # आवश्यक कॉलम्स न होने पर खाली छोड़ें
+        return pd.DataFrame()
         
     df = df.dropna(subset=required_cols)
     if len(df) < 25:
         return pd.DataFrame()
         
-    # शुद्ध फ्लोट एरे में कन्वर्ट करें ताकि कोई पांडास इंडेक्सिंग इशू न रहे
-    df['Open'] = df['Open'].astype(float)
-    df['High'] = df['High'].astype(float)
-    df['Low'] = df['Low'].astype(float)
-    df['Close'] = df['Close'].astype(float)
-    
+    # डेटा को शुद्ध फ्लोट में कन्वर्ट करें
+    for col in required_cols:
+        df[col] = df[col].astype(float)
+        
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     
@@ -129,19 +113,31 @@ def check_pure_price_action(df, idx):
 
 def download_single_stock(stock):
     try:
-        ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
-        df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
-                       end=BACKTEST_END + timedelta(days=5), progress=False, 
-                       auto_adjust=False, timeout=15, session=SESSION)
+        ticker_str = stock if stock.endswith('.NS') else f"{stock}.NS"
         
-        if df.empty: return None, stock
+        # एंटी-ब्लॉक फिक्स: डायरेक्ट Ticker हिस्ट्री मेथड का उपयोग जो ब्लॉक नहीं होता
+        t = yf.Ticker(ticker_str, session=SESSION)
+        df = t.history(start=BACKTEST_START - timedelta(days=60),
+                       end=BACKTEST_END + timedelta(days=5),
+                       interval="1d", proxy=None, raised=False)
         
+        if df.empty:
+            # बैकअप फ़ॉलबैक अगर डायरेक्ट हिस्ट्री भी खाली आती है
+            df = yf.download(ticker_str, start=BACKTEST_START - timedelta(days=60),
+                             end=BACKTEST_END + timedelta(days=5), progress=False, 
+                             auto_adjust=False, timeout=10, session=SESSION)
+
+        if df.empty:
+            return None, stock
+            
         df = calculate_price_action_features(df)
-        if df.empty or len(df) < 40: return None, stock
+        if df.empty or len(df) < 40: 
+            return None, stock
         
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
     except Exception as e:
+        print(f"-> Skip {stock} due to network issue", flush=True)
         return None, stock
 
 # --- MAIN SYSTEM EXECUTION ---
@@ -158,18 +154,21 @@ strategy_tracker = {
 
 print(f"Processing {total_stocks} stocks in {total_batches} batches...", flush=True)
 
+success_download_count = 0
+
 for batch_num in range(total_batches):
     start_idx = batch_num * BATCH_SIZE
     end_idx = min(start_idx + BATCH_SIZE, total_stocks)
     batch_stocks = stocks[start_idx:end_idx]
 
     stock_data = {}
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:  
         future_to_stock = {executor.submit(download_single_stock, stock): stock for stock in batch_stocks}
         for future in as_completed(future_to_stock):
             df, stock = future.result()
             if df is not None and not df.empty: 
                 stock_data[stock] = df
+                success_download_count += 1
 
     for stock, df in stock_data.items():
         idx = 20
@@ -229,6 +228,11 @@ for batch_num in range(total_batches):
                 idx = exit_idx + COOLDOWN_DAYS
             else:
                 idx += 1
+                
+    # याहू एपीआई ब्लॉकिंग पैच: हर बैच के बाद हल्का सा पॉज़ ताकि थ्रॉटलिंग न हो
+    time.sleep(2)
+
+print(f"\nSuccessfully Downloaded and Processed {success_download_count} / {total_stocks} stocks.", flush=True)
 
 # --- GITHUB TERMINAL LOG REPORT ---
 print("\n" + "="*60, flush=True)
