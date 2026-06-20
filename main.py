@@ -5,6 +5,7 @@ import gspread
 import json
 import os
 import time
+import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
@@ -14,7 +15,7 @@ BACKTEST_END = datetime.now().date()
 BACKTEST_START = BACKTEST_END - timedelta(days=365)
 BATCH_SIZE = 35
 
-print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V6 ===", flush=True)
+print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V7 (ANTI-BLOCK FIXED) ===", flush=True)
 
 # GCP Sheets Connection
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -28,12 +29,17 @@ VALIDATION_SL = 5.0
 MAX_HOLD_DAYS = 30
 COOLDOWN_DAYS = 10       
 
+# ब्राउज़र जैसा हेडर ताकि Yahoo Finance 'Unauthorized Crumb' एरर न दे
+SESSION = requests.Session()
+SESSION.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+
 def get_or_create_ws(sh, title):
     try: 
         ws = sh.worksheet(title)
-        sh.del_worksheet(ws) # पुराने कचरा डेटा को जड़ से मिटाने के लिए पूरी वर्कशीट डिलीट करें
-        time.sleep(1)
-        return sh.add_worksheet(title=title, rows=50000, cols=12)
+        ws.clear()  # शीट को बिना डिलीट किए उसके अंदर के पूरे डेटा का सफाया करने का सबसे सुरक्षित तरीका
+        return ws
     except: 
         return sh.add_worksheet(title=title, rows=50000, cols=12)
 
@@ -56,14 +62,14 @@ def check_pure_price_action(df, idx):
     lower_wick = min(open_p, close_p) - low_p
     is_green = close_p > open_p
     
-    # PATTERN 1: SUPPORT RETEST
+    # 1. SUPPORT RETEST
     at_support = abs((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
     has_buyer_rejection = lower_wick >= (body_size * 1.2)
     
     if at_support and (has_buyer_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # PATTERN 2: CHoCH BREAKOUT
+    # 2. CHoCH BREAKOUT
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
     strong_volume = row['Vol_Multiple'] > 1.8
     
@@ -75,12 +81,16 @@ def check_pure_price_action(df, idx):
 def download_single_stock(stock):
     try:
         ticker = stock if stock.endswith('.NS') else f"{stock}.NS"
+        # session पास करने से 'Invalid Crumb' एरर फिक्स हो जाएगी
         df = yf.download(ticker, start=BACKTEST_START - timedelta(days=60),
                        end=BACKTEST_END + timedelta(days=5), progress=False, 
-                       auto_adjust=True, timeout=15, group_by='ticker')
+                       auto_adjust=True, timeout=15, session=SESSION)
+        
         if df.empty or len(df) < 40: return None, stock
+        
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(-1)
+            
         df = calculate_price_action_features(df)
         df.index = pd.to_datetime(df.index).strftime('%Y-%m-%d')
         return df, stock
@@ -89,7 +99,8 @@ def download_single_stock(stock):
 
 # --- MAIN SYSTEM EXECUTION ---
 stocks = ws_watchlist.col_values(1)[1:]
-stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip()])))
+# फ़िल्टर करें ताकि शीट में लिखे फालतू या डेलिस्टेड नाम पहले ही साफ़ हो जाएं
+stocks = sorted(list(set([s.strip().upper().replace('.NS','') for s in stocks if s.strip() and not s.startswith(('LTIM', 'AKZO'))])))
 total_stocks = len(stocks)
 total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -126,7 +137,7 @@ for batch_num in range(total_batches):
                 exit_idx = idx + 1
                 max_gain = 0
                 
-                # लाइव सिमुलेशन: परफेक्ट आउटकम ट्रैकर
+                # लाइव सिमुलेशन विदाउट बायस
                 for future_idx in range(idx + 1, min(idx + 1 + MAX_HOLD_DAYS, len(df))):
                     f_row = df.iloc[future_idx]
                     
@@ -134,7 +145,7 @@ for batch_num in range(total_batches):
                     if current_gain > max_gain:
                         max_gain = current_gain
                     
-                    # BIAS FIX: अगर दोनों एक ही दिन हिट हो रहे हैं, तो समझदारी स्टॉपलॉस मानने में है
+                    # Intraday Check: दोनों हिट होने पर लॉस मानेंगे
                     if f_row['Low'] <= sl_price and f_row['High'] >= target_price:
                         trade_outcome = "LOSS"
                         exit_idx = future_idx
@@ -172,7 +183,7 @@ for batch_num in range(total_batches):
             else:
                 idx += 1
 
-# --- GOOGLE SHEETS CLEAN UPLOAD ---
+# --- GOOGLE SHEETS FORCED OVERWRITE ---
 print("\nResetting Worksheets & Uploading Clean Performance...", flush=True)
 
 ws_logs = get_or_create_ws(sh, "10PCT_REVERSE_LOGS")
