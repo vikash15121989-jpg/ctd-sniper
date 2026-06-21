@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== BUG-FIXED LIVE ENGINE V12.5: UNIVERSE LOCK & EXACT 10-DAY TRACER ===", flush=True)
+print("=== LIVE ENGINE V13.0: DUPLICATE TRACKER & COOLDOWN FILTER ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. SETUP & CONFIGURATION =====
@@ -21,10 +21,10 @@ ws_watchlist = sh.worksheet("Watchlist")
 R = {
     'min_price': 60,
     'max_hold_days': 30,
-    'cooldown_days': 15,
+    'cooldown_days': 15,     # Lock window after trade trigger
     'target_pct': 0.12,     # 12% Target Profit
     'sl_loss_pct': 0.05,     # 5% Stop Loss
-    'lookback_trading_days': 10  # Strict 10 trading days back lookup
+    'lookback_trading_days': 10
 }
 
 def get_or_create_ws(sh, title):
@@ -122,7 +122,7 @@ for count, stock in enumerate(stocks, 1):
         continue
 
 if not qualified_stocks:
-    print("⚠️ Alert: No stocks matched 50%+ Win Rate criteria. Retaining from Sheet database...", flush=True)
+    print("⚠️ Alert: No stocks matched 50%+ Win Rate criteria.", flush=True)
     try: vip_stocks = [r[0] for r in ws_filter.get_all_values()[1:] if r]
     except: vip_stocks = []
 else:
@@ -132,17 +132,16 @@ else:
     vip_stocks = df_vip_list['Stock'].tolist()
     print(f"🎯 VIP Universe Locked! {len(vip_stocks)} stocks updated in 'HIGH_WINRATE_STOCKS'.", flush=True)
 
-# ===== 4. PHASE 2: STRICT LOOKBACK ENGINE FOR VIP UNIVERSE =====
+# ===== 4. PHASE 2: RECENT SCAN WITH STRICT COOLDOWN ENGINE =====
 if not vip_stocks:
     print("\n🛑 Live Signal Engine stopped: VIP Universe is empty.", flush=True)
 else:
-    print(f"\n[PHASE 2] Fetching exact recent signals for {len(vip_stocks)} VIP Stocks...", flush=True)
+    print(f"\n[PHASE 2] Fetching recent signals without duplicates for {len(vip_stocks)} VIP Stocks...", flush=True)
     live_signals_pool = []
     
     for stock in vip_stocks:
         try:
             ticker_formatted = f"{stock}.NS"
-            # FIX: Pura 1y manga rahe hain taaki indicators (20D High/50 EMA) bilkul backtest wale match ho!
             df = yf.download(ticker_formatted, period="1y", progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             if df.empty or len(df) < 40: continue
@@ -150,43 +149,71 @@ else:
             df = build_indicators(df)
             total_rows = len(df)
             
-            # Pure dataset mein se strict last 10 rows ko window map karenge
-            start_lookback_idx = max(21, total_rows - R['lookback_trading_days'])
+            # Pure dataset mein strict sequence ko read karenge trace karte hue
+            idx = 21
+            stock_recent_triggers = []
             
-            for idx in range(start_lookback_idx, total_rows):
-                if df.iloc[idx]['Close'] < R['min_price']: continue
+            while idx < total_rows:
+                if df.iloc[idx]['Close'] < R['min_price']:
+                    idx += 1
+                    continue
                 
                 if check_signal(df, idx):
                     row_signal = df.iloc[idx]
-                    sig_date = df.index[idx].strftime('%Y-%m-%d')
+                    sig_date = df.index[idx]
                     entry_price = round(row_signal['Close'], 2)
                     stop_loss = round(entry_price * (1 - R['sl_loss_pct']), 2)
                     target_level = round(entry_price * (1 + R['target_pct']), 2)
                     
-                    live_signals_pool.append({
-                        'Stock_Name': stock,
-                        'Signal_Date': sig_date,
-                        'Entry_Price': entry_price,
-                        'StopLoss_Price': stop_loss,
-                        'Target_Price': target_level
-                    })
+                    # Simulation forward to trace the actual exit for exact cooldown mapping
+                    exit_idx = idx + 1
+                    while exit_idx < min(idx + 1 + R['max_hold_days'], total_rows):
+                        f_row = df.iloc[exit_idx]
+                        if f_row['High'] >= target_level or f_row['Low'] <= stop_loss:
+                            break
+                        exit_idx += 1
+                    
+                    # Track data ONLY if it falls in the last 10 trading days window
+                    if idx >= (total_rows - R['lookback_trading_days']):
+                        stock_recent_triggers.append({
+                            'Stock_Name': stock,
+                            'Signal_Date': sig_date.strftime('%Y-%m-%d'),
+                            'Entry_Price': entry_price,
+                            'StopLoss_Price': stop_loss,
+                            'Target_Price': target_level,
+                            'raw_idx': idx
+                        })
+                    
+                    # Skip bars according to the strategy cooldown rule (Deduplication Core)
+                    idx = exit_idx + R['cooldown_days']
+                else:
+                    idx += 1
+            
+            if stock_recent_triggers:
+                # Add only unique strategy entries found inside the window
+                live_signals_pool.extend(stock_recent_triggers)
+                
             time.sleep(0.01)
         except Exception:
             continue
 
-    # ===== 5. EXPORT LIVE RECENT SIGNALS TO GOOGLE SHEET =====
+    # ===== 5. EXPORT UNIQUE LOGS TO GOOGLE SHEET =====
     try:
         ws_signals.clear()
         if live_signals_pool:
-            df_signals_push = pd.DataFrame(live_signals_pool).sort_values(by='Signal_Date', ascending=False)
+            df_signals_push = pd.DataFrame(live_signals_pool)
+            # Drop structural raw tracker index before uploading
+            df_signals_push = df_signals_push.drop(columns=['raw_idx'])
+            df_signals_push = df_signals_push.sort_values(by='Signal_Date', ascending=False)
+            
             ws_signals.update([df_signals_push.columns.values.tolist()] + df_signals_push.values.tolist())
-            print(f"\n🚀 SUCCESS! {len(df_signals_push)} Signals pushed to 'NEW_SIGNALS_TODAY'.", flush=True)
+            print(f"\n🚀 SUCCESS! Cleaned unique signals updated in 'NEW_SIGNALS_TODAY'.", flush=True)
             print(df_signals_push.to_string(index=False))
         else:
             headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
             ws_signals.update([headers] + [["No signals generated in last 10 trading days.", "", "", "", ""]])
-            print("\n⚠️ Alert: Pichle 10 trading dino me ek bhi VIP stock me setup nahi bana.", flush=True)
+            print("\n⚠️ Alert: Pichle 10 trading dino me ek bhi unique signal nahi bana.", flush=True)
     except Exception as e:
         print(f"❌ Live Sheet update error: {str(e)}", flush=True)
 
-print(f"\n=== AUTOMATED WORKFLOW V12.5 COMPLETE ===", flush=True)
+print(f"\n=== AUTOMATED WORKFLOW V13.0 COMPLETE ===", flush=True)
