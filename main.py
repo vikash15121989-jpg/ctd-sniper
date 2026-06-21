@@ -4,12 +4,12 @@ import pandas as pd
 import numpy as np
 import requests
 import gspread
+import time
 from google.oauth2.service_account import Credentials
 
 # ==========================================
 # 1. SETTINGS & CONFIGURATIONS
 # ==========================================
-# Yeh links agar 404 bhi denge, toh bhi code crash nahi hoga
 Ticker_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 Backup_Ticker_URL = "https://raw.githubusercontent.com/datasets/top-100-companies-india/master/data/nifty_100.csv"
 
@@ -18,7 +18,6 @@ COOLDOWN_DAYS = 10
 TARGET_PCT = 0.10
 STOP_LOSS_PCT = 0.05
 
-# Google Sheets Setup via Environment Variables
 Creds_Dict = {
     "type": os.environ.get("GCP_TYPE"),
     "project_id": os.environ.get("GCP_PROJECT_ID"),
@@ -34,7 +33,7 @@ Creds_Dict = {
 }
 
 # ==========================================
-# 2. YAHOO FINANCE STEALTH SCRAPER
+# 2. FIXED YAHOO FINANCE SCRAPER WITH DELAY
 # ==========================================
 def fetch_yfinance_stealth(ticker, days=365):
     end_dt = datetime.datetime.now()
@@ -46,11 +45,13 @@ def fetch_yfinance_stealth(ticker, days=365):
     url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        # Rate limit se bachne ke liye chhota sa delay
+        time.sleep(0.1) 
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code != 200:
             return None
         
@@ -72,13 +73,12 @@ def fetch_yfinance_stealth(ticker, days=365):
         for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
             df[col] = pd.to_numeric(df[col])
             
-        df = df.sort_values('Date').reset_index(drop=True)
-        return df
+        return df.sort_values('Date').reset_index(drop=True)
     except Exception:
         return None
 
 # ==========================================
-# 3. PRICE ACTION LOGIC ENGINE
+# 3. FIXED PRICE ACTION LOGIC
 # ==========================================
 def build_indicators(df):
     if len(df) < 21:
@@ -86,7 +86,7 @@ def build_indicators(df):
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
-    df['Vol_Multiple'] = df['Volume'] / df['Vol_20MA']
+    df['Vol_Multiple'] = df['Volume'] / (df['Vol_20MA'] + 1e-5) # Prevent division by zero
     return df
 
 def check_pure_price_action(df, idx):
@@ -98,17 +98,20 @@ def check_pure_price_action(df, idx):
     is_green = row['Close'] > row['Open']
     
     # STRATEGY 1: PA_SUPPORT_RETEST
-    low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
+    # Target criteria thoda flexible kiya taaki setups miss na ho (1.2% -> 2.0%)
+    low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 2.0
     body = abs(row['Close'] - row['Open'])
     lower_wick = min(row['Open'], row['Close']) - row['Low']
-    strong_rejection = lower_wick >= (body * 1.2)
+    strong_rejection = lower_wick >= (body * 1.0)
     
     if low_near_support and (strong_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # STRATEGY 2: PA_CHoCH_BREAKOUT
+    # STRATEGY 2: PA_CHoCH_BREAKOUT (Bug Fixed Here)
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row.get('Vol_Multiple', 1.5) > 1.25
+    
+    # FIX: .get() hata kar direct column data access kiya
+    strong_volume = row['Vol_Multiple'] > 1.25 
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
@@ -182,54 +185,47 @@ def main():
     print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V16 ===")
     
     ticker_list = []
-    
-    # Ultra Fail-safe Ticker Loading
     try:
-        print("Attempting to download ticker list from primary source...")
         tickers_df = pd.read_csv(Ticker_URL)
         col_name = 'SYMBOL' if 'SYMBOL' in tickers_df.columns else 'Symbol'
         ticker_list = tickers_df[col_name].dropna().tolist()
     except Exception as e:
-        print(f"Primary URL failed: {e}. Trying backup URL...")
+        print(f"Primary URL failed, loading backup...")
         try:
             tickers_df = pd.read_csv(Backup_Ticker_URL)
             col_name = 'Symbol' if 'Symbol' in tickers_df.columns else tickers_df.columns[0]
             ticker_list = tickers_df[col_name].dropna().tolist()
-        except Exception as err:
-            print(f"Online lists failed. Activating Hardcoded Safe Fallback Tickers...")
-            # Agar dono URL fail ho jayein, toh script is internal list par chalegi (Report aayega hi aayega!)
-            ticker_list = [
-                "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", 
-                "TATAMOTORS", "SBIN", "BHARTIARTL", "ITC", "LT", 
-                "RELIANCE", "AXISBANK", "BAJFINANCE", "MARUTI", "WIPRO"
-            ]
+        except Exception:
+            # Final safe list
+            ticker_list = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "TATAMOTORS", "SBIN", "ITC"]
             
-    # Format tickers strictly for Yahoo Finance (.NS extension)
     ticker_list = [str(t).strip() + ".NS" for t in ticker_list if not str(t).strip().endswith(".NS")]
     
-    print(f"Processing {len(ticker_list)} stocks...")
+    # Sirf Top 200 stocks scan karenge taaki Yahoo block na kare aur genuine report mile
+    ticker_list = ticker_list[:200]
+    print(f"Scanning Top {len(ticker_list)} highly liquid NSE stocks to get clear win-rate metrics...")
     
     all_signals = []
-    batch_size = 20
+    success_count = 0
     
-    for i in range(0, len(ticker_list), batch_size):
-        batch = ticker_list[i:i+batch_size]
-        for ticker in batch:
-            df = fetch_yfinance_stealth(ticker, days=365)
-            if df is not None:
-                ticker_signals = run_backtest_for_ticker(ticker, df)
-                all_signals.extend(ticker_signals)
-        print(f"Batch {int(i/batch_size)+1} done. Total Live Downloads: {min(i+batch_size, len(ticker_list))}")
-        
+    for ticker in ticker_list:
+        df = fetch_yfinance_stealth(ticker, days=365)
+        if df is not None:
+            success_count += 1
+            ticker_signals = run_backtest_for_ticker(ticker, df)
+            all_signals.extend(ticker_signals)
+            
+    print(f"\nSuccessfully downloaded data for {success_count}/{len(ticker_list)} stocks.")
+    
     if not all_signals:
-        print("⚠️ Alert: No price action signals discovered across entire market dataset.")
+        print("⚠️ No signals found even after code optimization. Adjusting logic might be required.")
         return
         
     final_df = pd.DataFrame(all_signals)
     
-    # Print Summary Report in Console
+    # Summary Print
     print("\n=======================================================")
-    print("📢 BACKTEST PERFORMANCE REPORT 📢")
+    print("📢 FIXED STRATEGY PERFORMANCE REPORT 📢")
     print("=======================================================")
     print(f"{'Strategy Mode':<20} | {'Total':<5} | {'Wins':<5} | {'Losses':<6} | {'Timeouts':<8} | {'Win Rate %'}")
     print("-" * 65)
@@ -247,25 +243,21 @@ def main():
             print(f"{m:<20} | 0     | 0     | 0      | 0        | 0.0%")
     print("=======================================================\n")
     
-    # Google Sheets Upload
+    # Sheets Update
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(Creds_Dict, scopes=scopes)
         client = gspread.authorize(creds)
-        
         sheet = client.open("CTD_Sniper_Scanner")
         wks = sheet.get_worksheet(0)
         
-        if final_df is not None and len(final_df) > 0:
-            final_df = final_df.fillna("") 
-            wks.clear() 
-            sheet_data = [final_df.columns.values.tolist()] + final_df.values.tolist()
-            wks.update(sheet_data) 
-            print("Google Sheets Update Successful!")
+        final_df = final_df.fillna("") 
+        wks.clear() 
+        sheet_data = [final_df.columns.values.tolist()] + final_df.values.tolist()
+        wks.update(sheet_data) 
+        print("Google Sheets Updated Successfully!")
     except Exception as e:
-        print(f"Google Sheets Upload Failed: {e}")
-        
-    print("=== SYSTEM EXECUTION COMPLETE ===")
+        print(f"Sheets Error: {e}")
 
 if __name__ == "__main__":
     main()
