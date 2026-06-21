@@ -9,7 +9,9 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 # 1. SETTINGS & CONFIGURATIONS
 # ==========================================
-Ticker_URL = "https://raw.githubusercontent.com/vikash15121989/ctd-sniper/main/ind_niftytotalmarket_list.csv"
+# Yeh links agar 404 bhi denge, toh bhi code crash nahi hoga
+Ticker_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+Backup_Ticker_URL = "https://raw.githubusercontent.com/datasets/top-100-companies-india/master/data/nifty_100.csv"
 
 MAX_HOLD_DAYS = 30
 COOLDOWN_DAYS = 10
@@ -76,7 +78,7 @@ def fetch_yfinance_stealth(ticker, days=365):
         return None
 
 # ==========================================
-# 3. PRICE ACTION LOGIC ENGINE (CHoCH & Support)
+# 3. PRICE ACTION LOGIC ENGINE
 # ==========================================
 def build_indicators(df):
     if len(df) < 21:
@@ -93,12 +95,9 @@ def check_pure_price_action(df, idx):
         
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1]
-    
     is_green = row['Close'] > row['Open']
     
-    # ----------------------------------------------------
     # STRATEGY 1: PA_SUPPORT_RETEST
-    # ----------------------------------------------------
     low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.2
     body = abs(row['Close'] - row['Open'])
     lower_wick = min(row['Open'], row['Close']) - row['Low']
@@ -107,11 +106,9 @@ def check_pure_price_action(df, idx):
     if low_near_support and (strong_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # ----------------------------------------------------
-    # STRATEGY 2: PA_CHoCH_BREAKOUT (V16 Optimized)
-    # ----------------------------------------------------
+    # STRATEGY 2: PA_CHoCH_BREAKOUT
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row.get('Vol_Multiple', 1.5) > 1.25  # Volume filter lowered to 1.25x
+    strong_volume = row.get('Vol_Multiple', 1.5) > 1.25
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
@@ -184,15 +181,33 @@ def run_backtest_for_ticker(ticker, df):
 def main():
     print("=== PURE PRICE ACTION RAW BACKTEST ENGINE V16 ===")
     
+    ticker_list = []
+    
+    # Ultra Fail-safe Ticker Loading
     try:
+        print("Attempting to download ticker list from primary source...")
         tickers_df = pd.read_csv(Ticker_URL)
-        ticker_list = tickers_df['Symbol'].dropna().tolist()
-        ticker_list = [t + ".NS" for t in ticker_list if not t.endswith(".NS")]
+        col_name = 'SYMBOL' if 'SYMBOL' in tickers_df.columns else 'Symbol'
+        ticker_list = tickers_df[col_name].dropna().tolist()
     except Exception as e:
-        print(f"Error downloading ticker list: {e}")
-        return
-        
-    print(f"Processing {len(ticker_list)} stocks via Stealth Scraper...")
+        print(f"Primary URL failed: {e}. Trying backup URL...")
+        try:
+            tickers_df = pd.read_csv(Backup_Ticker_URL)
+            col_name = 'Symbol' if 'Symbol' in tickers_df.columns else tickers_df.columns[0]
+            ticker_list = tickers_df[col_name].dropna().tolist()
+        except Exception as err:
+            print(f"Online lists failed. Activating Hardcoded Safe Fallback Tickers...")
+            # Agar dono URL fail ho jayein, toh script is internal list par chalegi (Report aayega hi aayega!)
+            ticker_list = [
+                "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", 
+                "TATAMOTORS", "SBIN", "BHARTIARTL", "ITC", "LT", 
+                "RELIANCE", "AXISBANK", "BAJFINANCE", "MARUTI", "WIPRO"
+            ]
+            
+    # Format tickers strictly for Yahoo Finance (.NS extension)
+    ticker_list = [str(t).strip() + ".NS" for t in ticker_list if not str(t).strip().endswith(".NS")]
+    
+    print(f"Processing {len(ticker_list)} stocks...")
     
     all_signals = []
     batch_size = 20
@@ -232,9 +247,7 @@ def main():
             print(f"{m:<20} | 0     | 0     | 0      | 0        | 0.0%")
     print("=======================================================\n")
     
-    # ----------------------------------------------------
-    # CRITICAL FIX: SAFE GOOGLE SHEETS UPLOAD
-    # ----------------------------------------------------
+    # Google Sheets Upload
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(Creds_Dict, scopes=scopes)
@@ -243,18 +256,12 @@ def main():
         sheet = client.open("CTD_Sniper_Scanner")
         wks = sheet.get_worksheet(0)
         
-        # Safe dataframe handling
         if final_df is not None and len(final_df) > 0:
-            final_df = final_df.fillna("") # Fill any NaN values to prevent API crashes
-            wks.clear() # Clear the sheet safely
-            
-            # Combine headers and rows into a single list structure
+            final_df = final_df.fillna("") 
+            wks.clear() 
             sheet_data = [final_df.columns.values.tolist()] + final_df.values.tolist()
-            wks.update(sheet_data) # Force upload the full data chunk
-            print("Google Sheets Update Successful with Data Matrix!")
-        else:
-            print("Google Sheets upload skipped: Final table is empty.")
-            
+            wks.update(sheet_data) 
+            print("Google Sheets Update Successful!")
     except Exception as e:
         print(f"Google Sheets Upload Failed: {e}")
         
