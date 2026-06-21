@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== VA-PA Q-FACTOR V8.3 PRICE ACTION LIVE ===", flush=True)
+print("=== PURE PRICE ACTION BACKTEST ENGINE V8.3 ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. SETUP =====
@@ -18,31 +18,18 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# Price Action Settings & Rules
+# Backtest Core Configuration
 R = {
     'min_price': 50,
-    'max_hold_days': 30,
+    'max_hold_days': 30,    # Max 30 days hold
     'cooldown_days': 10,
-    'target_pct': 0.10,     # 10% Target
+    'target_pct': 0.10,     # 10% Profit Target
     'sl_loss_pct': 0.05,     # 5% Stop Loss
-    'rs_days': 30
 }
 
 today = datetime.now().date()
 
-# ===== 2. NIFTY RS CHECK =====
-nifty = yf.download("^NSEI", period="2y", progress=False, auto_adjust=True)
-if isinstance(nifty.columns, pd.MultiIndex): nifty.columns = nifty.columns.droplevel(1)
-nifty['52W_High'] = nifty['High'].rolling(252, min_periods=252).max()
-nifty_52h_date = nifty['52W_High'].idxmax()
-days_since_52h = (nifty.index[-1] - nifty_52h_date).days
-rs_window_active = days_since_52h <= R['rs_days']
-
-print(f"\n=== NIFTY STATUS ===", flush=True)
-print(f"Last 52W High: {nifty_52h_date.strftime('%Y-%m-%d')} | Days Ago: {days_since_52h}", flush=True)
-print(f"RS Window: {'ACTIVE' if rs_window_active else 'CLOSED'} | New trades: {'YES' if rs_window_active else 'NO'}", flush=True)
-
-# ===== 3. LOAD EXISTING POSITIONS =====
+# ===== 2. LOAD EXISTING POSITIONS FUNCTION =====
 def get_or_create_ws(sh, title):
     try: return sh.worksheet(title)
     except: return sh.add_worksheet(title=title, rows=1000, cols=30)
@@ -55,65 +42,8 @@ except:
     df_live = pd.DataFrame(columns=['Stock','Entry_Date','Entry','SL','Target','Qty','Status','Exit_Date','Exit_Price','PnL_%','PnL_Rs'])
 
 open_trades = df_live[df_live['Status'] == 'OPEN'].copy() if not df_live.empty else pd.DataFrame()
-print(f"\nOpen Positions: {len(open_trades)}", flush=True)
 
-# ===== 4. CHECK OPEN POSITIONS FOR SL/TARGET =====
-exits_today = []
-if not open_trades.empty:
-    for idx, pos in open_trades.iterrows():
-        stock = pos['Stock']
-        try:
-            data = yf.download(f"{stock}.NS", period="5d", progress=False, auto_adjust=True)
-            if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-            if data.empty: continue
-            
-            today_low = data['Low'].iloc[-1]
-            today_high = data['High'].iloc[-1]
-            today_close = data['Close'].iloc[-1]
-            
-            sl_hit = today_low <= pos['SL']
-            target_hit = today_high >= pos['Target']
-            
-            if sl_hit and target_hit:
-                exit_price = pos['SL']
-                exit_status = 'LOSS'
-            elif sl_hit:
-                exit_price = pos['SL']
-                exit_status = 'LOSS'
-            elif target_hit:
-                exit_price = pos['Target']
-                exit_status = 'WIN'
-            else:
-                # Max Hold Days check (30 days logic from Price Action)
-                entry_date = datetime.strptime(str(pos['Entry_Date']), '%Y-%m-%d').date()
-                days_held = (today - entry_date).days
-                if days_held >= R['max_hold_days']:
-                    exit_price = today_close
-                    exit_status = 'TIMEOUT'
-                else:
-                    continue  # Still open
-            
-            pnl_pct = round((exit_price / pos['Entry'] - 1) * 100, 1)
-            pnl_rs = round((exit_price - pos['Entry']) * (pos['Qty'] if pos['Qty'] else 1), 0)
-            
-            exits_today.append({
-                'Stock': stock, 'Exit_Date': today.strftime('%Y-%m-%d'), 
-                'Exit_Price': round(exit_price, 2), 'Status': exit_status,
-                'PnL_%': pnl_pct, 'PnL_Rs': pnl_rs, 'Index': idx
-            })
-            print(f"EXIT: {stock} | {exit_status} | {pnl_pct}% | Rs.{pnl_rs}", flush=True)
-        except Exception as e:
-            print(f"Error checking {stock}: {str(e)[:50]}", flush=True)
-
-# Update exits in df_live
-for ex in exits_today:
-    df_live.loc[ex['Index'], 'Status'] = ex['Status']
-    df_live.loc[ex['Index'], 'Exit_Date'] = ex['Exit_Date']
-    df_live.loc[ex['Index'], 'Exit_Price'] = ex['Exit_Price']
-    df_live.loc[ex['Index'], 'PnL_%'] = ex['PnL_%']
-    df_live.loc[ex['Index'], 'PnL_Rs'] = ex['PnL_Rs']
-
-# ===== 5. NEW PRICE ACTION INDICATORS & LOGIC =====
+# ===== 3. PRICE ACTION TECHNICAL INDICATORS =====
 def build_indicators(df):
     if len(df) < 21: return df
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
@@ -122,12 +52,11 @@ def build_indicators(df):
     df['Vol_Multiple'] = df['Volume'] / (df['Vol_20MA'] + 1e-5)
     return df
 
-def check_price_action_signal(df):
-    """Last row par criteria check karega"""
-    if len(df) < 22: return False, None
+def check_price_action_at_index(df, idx):
+    if idx < 1: return False, None
     
-    row = df.iloc[-1]
-    row_prev = df.iloc[-2]
+    row = df.iloc[idx]
+    row_prev = df.iloc[idx-1]
     is_green = row['Close'] > row['Open']
     
     # STRATEGY 1: PA_SUPPORT_RETEST
@@ -148,126 +77,140 @@ def check_price_action_signal(df):
         
     return False, None
 
-# ===== 6. SCAN FOR NEW SIGNALS - ONLY IF RS WINDOW ACTIVE =====
-new_signals = []
-if rs_window_active:
-    # Watchlist sheet se tickers read karna
-    stocks = ws_watchlist.col_values(1)[1:]
-    stocks = sorted(list(set([s.strip().upper() for s in stocks if s.strip()])))
-    
-    # Header cleaning
-    if stocks and stocks[0] in ['SYMBOL', 'TICKER', 'STOCKS', 'STOCK']:
-        stocks = stocks[1:]
+# ===== 4. READ WATCHLIST STOCKS & RUN BACKTEST =====
+stocks = ws_watchlist.col_values(1)[1:]
+stocks = sorted(list(set([s.strip().upper() for s in stocks if s.strip()])))
+
+if stocks and stocks[0] in ['SYMBOL', 'TICKER', 'STOCKS', 'STOCK']:
+    stocks = stocks[1:]
+
+print(f"\nRunning Price Action Backtest on {len(stocks)} stocks from your Watchlist...", flush=True)
+
+all_historical_signals = []
+
+for stock in stocks:
+    try:
+        ticker_formatted = f"{stock}.NS" if not stock.endswith(".NS") else stock
+        df = yf.download(ticker_formatted, period="1y", progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 30: continue
         
-    # Open positions wale stocks skip karo
-    open_stocks = open_trades['Stock'].tolist() if not open_trades.empty else []
-    stocks = [s for s in stocks if s not in open_stocks]
-    
-    print(f"\nScanning {len(stocks)} Watchlist stocks for new Price Action entries...", flush=True)
-    
-    for stock in stocks:
-        try:
-            ticker_formatted = f"{stock}.NS" if not stock.endswith(".NS") else stock
-            df = yf.download(ticker_formatted, period="1y", progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if df.empty or len(df) < 30: continue
-            
-            # Indicators build karo
-            df = build_indicators(df)
-            row = df.iloc[-1]
-            
-            # Minimum Price check
-            if row['Close'] < R['min_price']: continue
-            
-            # Price Action logic verification
-            is_signal, mode = check_price_action_signal(df)
-            
+        df = build_indicators(df)
+        total_rows = len(df)
+        idx = 21
+        
+        # Loop over historical rows to find and track strategy entries
+        while idx < total_rows:
+            row = df.iloc[idx]
+            if row['Close'] < R['min_price']:
+                idx += 1
+                continue
+                
+            is_signal, mode = check_price_action_at_index(df, idx)
             if is_signal:
                 entry_price = row['Close']
-                # Target fix 10% aur SL fix 5% system as per strategy rules
+                entry_date = df.index[idx]
+                
                 target_price = entry_price * (1 + R['target_pct'])
                 sl_price = entry_price * (1 - R['sl_loss_pct'])
                 
-                new_signals.append({
-                    'Stock': stock.replace(".NS", ""),
-                    'Entry_Date': today.strftime('%Y-%m-%d'),
+                result = "TIMEOUT"
+                exit_date = None
+                exit_price = entry_price
+                
+                # Forward trace for Target/SL simulation
+                exit_idx = idx + 1
+                while exit_idx < min(idx + 1 + R['max_hold_days'], total_rows):
+                    future_row = df.iloc[exit_idx]
+                    if future_row['High'] >= target_price:
+                        result = "WIN"
+                        exit_date = df.index[exit_idx]
+                        exit_price = target_price
+                        break
+                    elif future_row['Low'] <= sl_price:
+                        result = "LOSS"
+                        exit_date = df.index[exit_idx]
+                        exit_price = sl_price
+                        break
+                    exit_price = future_row['Close']
+                    exit_date = df.index[exit_idx]
+                    exit_idx += 1
+                
+                pnl_pct = round((exit_price / entry_price - 1) * 100, 1)
+                
+                all_historical_signals.append({
+                    'Stock': stock,
+                    'Entry_Date': entry_date.strftime('%Y-%m-%d'),
                     'Entry': round(entry_price, 2),
                     'SL': round(sl_price, 2),
                     'Target': round(target_price, 2),
-                    'Qty': 10, # Default Qty setup, sheet calculation ke hisab se badal sakte hain
-                    'Status': 'OPEN',
-                    'Exit_Date': 'N/A',
-                    'Exit_Price': 'N/A',
-                    'PnL_%': 'N/A',
-                    'PnL_Rs': 'N/A',
+                    'Qty': 10,
+                    'Status': result,
+                    'Exit_Date': exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
+                    'Exit_Price': round(exit_price, 2),
+                    'PnL_%': pnl_pct,
+                    'PnL_Rs': round(pnl_pct * 10, 0),
                     'Strategy_Mode': mode
                 })
-                print(f"SIGNAL: {stock} [{mode}] | Entry: {entry_price:.2f} | SL: {sl_price:.2f} | Target: {target_price:.2f}", flush=True)
+                idx = exit_idx + R['cooldown_days']
+            else:
+                idx += 1
                 
-            time.sleep(0.1) # Yahoo safe boundary buffer
-        except Exception as e:
-            continue
-else:
-    print(f"\nRS Window closed. No new trades. Only managing existing positions.", flush=True)
+        time.sleep(0.05)
+    except Exception:
+        continue
 
-# ===== 7. UPDATE GSHEET =====
-try:
-    # 1. Update live trades tab
-    ws_live.clear()
-    if not df_live.empty:
-        ws_live.update([df_live.columns.values.tolist()] + df_live.values.tolist())
+# ===== 5. EXPORT RESULTS AND GENERATE WIN RATE REPORT =====
+if not all_historical_signals:
+    print("\n⚠️ Alert: No price action signals discovered across the watchlist dataset.", flush=True)
+else:
+    df_results = pd.DataFrame(all_historical_signals)
     
-    # 2. Update New signals sheet (Isme pure schema matching rows jayenge)
-    ws_signals = get_or_create_ws(sh, "NEW_SIGNALS_TODAY")
-    ws_signals.clear()
-    if new_signals:
-        df_signals = pd.DataFrame(new_signals)
-        ws_signals.update([df_signals.columns.values.tolist()] + df_signals.values.tolist())
+    total_trades = len(df_results)
+    wins = len(df_results[df_results['Status'] == 'WIN'])
+    losses = len(df_results[df_results['Status'] == 'LOSS'])
+    timeouts = len(df_results[df_results['Status'] == 'TIMEOUT'])
+    winrate = round((wins / total_trades) * 100, 1) if total_trades else 0
+    
+    print("\n=======================================================")
+    print("📢 STRATEGY WINNING RATE METRICS REPORT 📢")
+    print("=======================================================")
+    print(f"Total Backtest Signals  : {total_trades}")
+    print(f"Profitable Trades (Wins): {wins}")
+    print(f"Stop Loss Trades (Loss): {losses}")
+    print(f"Expired Trades (Timeout): {timeouts}")
+    print(f"Strategy Master Win Rate: {winrate}%")
+    print("=======================================================\n")
+    
+    try:
+        # 1. LIVE_TRADES tab par report write karna
+        ws_live.clear()
+        cols_to_push = ['Stock','Entry_Date','Entry','SL','Target','Qty','Status','Exit_Date','Exit_Price','PnL_%','PnL_Rs']
+        df_sheet = df_results[cols_to_push].fillna("")
+        ws_live.update([df_sheet.columns.values.tolist()] + df_sheet.values.tolist())
         
-        # Auto-append signals to Live Trades if you want them trackable
-        # df_live = pd.concat([df_live, df_signals.drop(columns=['Strategy_Mode'])], ignore_index=True)
-        # ws_live.clear()
-        # ws_live.update([df_live.columns.values.tolist()] + df_live.values.tolist())
-    else:
-        ws_signals.update([['No new signals today']])
-    
-    # 3. Summary metrics sheet generation
-    total_trades = len(df_live)
-    open_count = len(df_live[df_live['Status'] == 'OPEN']) if total_trades else 0
-    closed_trades = df_live[df_live['Status'].isin(['WIN', 'LOSS', 'TIMEOUT'])] if total_trades else pd.DataFrame()
-    wins = len(closed_trades[closed_trades['Status'] == 'WIN']) if not closed_trades.empty else 0
-    total_closed = len(closed_trades) if not closed_trades.empty else 0
-    winrate = round(wins / total_closed * 100, 1) if total_closed else 0
-    
-    # PnL computation safely converting strings if any
-    total_pnl = 0
-    if not closed_trades.empty:
-        total_pnl = pd.to_numeric(closed_trades['PnL_Rs'], errors='coerce').sum()
-    
-    summary = pd.DataFrame([{
-        'Date': today.strftime('%Y-%m-%d'),
-        'Nifty_52H_Date': nifty_52h_date.strftime('%Y-%m-%d'),
-        'Days_Since_52H': days_since_52h,
-        'RS_Window': 'ACTIVE' if rs_window_active else 'CLOSED',
-        'Total_Trades': total_trades,
-        'Open_Positions': open_count,
-        'Closed_Trades': total_closed,
-        'Winrate_%': winrate,
-        'Total_PnL_Rs': round(total_pnl, 0),
-        'New_Signals_Today': len(new_signals),
-        'Exits_Today': len(exits_today)
-    }])
-    
-    ws_summary = get_or_create_ws(sh, "LIVE_SUMMARY")
-    ws_summary.clear()
-    ws_summary.update([summary.columns.values.tolist()] + summary.values.tolist())
-    
-    print(f"\n=== GSHEET UPDATED ===", flush=True)
-    print(f"LIVE_TRADES_V8_3: {len(df_live)} rows updated", flush=True)
-    print(f"NEW_SIGNALS_TODAY: {len(new_signals)} signals found", flush=True)
-    print(f"LIVE_SUMMARY: Updated successfully", flush=True)
-    
-except Exception as e:
-    print(f"GSheet update failed: {str(e)}", flush=True)
+        # 2. LIVE_SUMMARY tab create/update karna
+        ws_summary = get_or_create_ws(sh, "LIVE_SUMMARY")
+        ws_summary.clear()
+        
+        summary_df = pd.DataFrame([{
+            'Execution_Date': datetime.now().strftime('%Y-%m-%d'),
+            'Total_Backtest_Trades': total_trades,
+            'Strategy_Winrate_%': winrate,
+            'Total_Wins': wins,
+            'Total_Losses': losses,
+            'Total_Timeouts': timeouts
+        }])
+        ws_summary.update([summary_df.columns.values.tolist()] + summary_df.values.tolist())
+        
+        # 3. NEW_SIGNALS_TODAY tab update karna (Isme sirf last strategy mode validation save hoga)
+        ws_signals = get_or_create_ws(sh, "NEW_SIGNALS_TODAY")
+        ws_signals.clear()
+        df_signals_push = df_results[['Stock', 'Entry_Date', 'Entry', 'SL', 'Target', 'Strategy_Mode']].fillna("")
+        ws_signals.update([df_signals_push.columns.values.tolist()] + df_signals_push.values.tolist())
+        
+        print("=== GSHEET BACKTEST METRICS UPDATED SUCCESSFULLY ===", flush=True)
+    except Exception as e:
+        print(f"❌ GSheet write error: {str(e)}", flush=True)
 
 print(f"\n=== LIVE RUN COMPLETE ===", flush=True)
