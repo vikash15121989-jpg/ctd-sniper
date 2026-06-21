@@ -5,11 +5,11 @@ import gspread
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== PURE PRICE ACTION BACKTEST ENGINE V8.3 ===", flush=True)
+print("=== OPTIMIZED PRICE ACTION ENGINE V8.4 ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. SETUP =====
@@ -18,38 +18,40 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
-# Backtest Core Configuration
+# Optimized Backtest Parameters
 R = {
     'min_price': 50,
-    'max_hold_days': 30,    # Max 30 days hold
+    'max_hold_days': 30,
     'cooldown_days': 10,
-    'target_pct': 0.10,     # 10% Profit Target
-    'sl_loss_pct': 0.05,     # 5% Stop Loss
+    'target_r_multiple': 2.0, # 1:2 Risk-Reward based on ATR/Structure
 }
 
-today = datetime.now().date()
-
-# ===== 2. LOAD EXISTING POSITIONS FUNCTION =====
 def get_or_create_ws(sh, title):
     try: return sh.worksheet(title)
-    except: return sh.add_worksheet(title=title, rows=1000, cols=30)
+    except: return sh.add_worksheet(title=title, rows=1000, cols=15)
 
 ws_live = get_or_create_ws(sh, "LIVE_TRADES_V8_3")
-try:
-    df_live = pd.DataFrame(ws_live.get_all_records())
-    if df_live.empty: df_live = pd.DataFrame(columns=['Stock','Entry_Date','Entry','SL','Target','Qty','Status','Exit_Date','Exit_Price','PnL_%','PnL_Rs'])
-except:
-    df_live = pd.DataFrame(columns=['Stock','Entry_Date','Entry','SL','Target','Qty','Status','Exit_Date','Exit_Price','PnL_%','PnL_Rs'])
 
-open_trades = df_live[df_live['Status'] == 'OPEN'].copy() if not df_live.empty else pd.DataFrame()
-
-# ===== 3. PRICE ACTION TECHNICAL INDICATORS =====
+# ===== 2. IMPROVED INDICATORS (200 EMA & ATR ADDED) =====
 def build_indicators(df):
-    if len(df) < 21: return df
+    if len(df) < 200: return df
+    
+    # Trend Filter
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
+    # Price Action Structure
     df['Support_20D'] = df['Low'].shift(1).rolling(window=20).min()
     df['Resistance_10D'] = df['High'].shift(1).rolling(window=10).max()
     df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
     df['Vol_Multiple'] = df['Volume'] / (df['Vol_20MA'] + 1e-5)
+    
+    # ATR Calculation for Dynamic SL
+    high_low = df['High'] - df['Low']
+    high_cp = abs(df['High'] - df['Close'].shift(1))
+    low_cp = abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    df['ATR_14'] = tr.rolling(window=14).mean()
+    
     return df
 
 def check_price_action_at_index(df, idx):
@@ -57,49 +59,55 @@ def check_price_action_at_index(df, idx):
     
     row = df.iloc[idx]
     row_prev = df.iloc[idx-1]
+    
+    # FILTER 1: Girte huye market/stock se bachne ke liye 200 EMA Check
+    if row['Close'] < row['EMA_200']: return False, None
+    
     is_green = row['Close'] > row['Open']
     
-    # STRATEGY 1: PA_SUPPORT_RETEST
-    low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 2.0
+    # Strategy 1: Support Retest
+    low_near_support = ((row['Low'] / row['Support_20D']) - 1) * 100 <= 1.5
     body = abs(row['Close'] - row['Open'])
     lower_wick = min(row['Open'], row['Close']) - row['Low']
-    strong_rejection = lower_wick >= (body * 1.0)
+    strong_rejection = lower_wick >= (body * 1.2)
     
     if low_near_support and (strong_rejection or is_green):
         return True, "PA_SUPPORT_RETEST"
         
-    # STRATEGY 2: PA_CHoCH_BREAKOUT
+    # Strategy 2: CHoCH Breakout (SUDHAR: Volume condition 1.25x se badhakar 2.0x ki gayi)
     broke_resistance = row['Close'] > row['Resistance_10D'] and row_prev['Close'] <= row_prev['Resistance_10D']
-    strong_volume = row['Vol_Multiple'] > 1.25
+    strong_volume = row['Vol_Multiple'] > 2.0
     
     if broke_resistance and strong_volume and is_green:
         return True, "PA_CHoCH_BREAKOUT"
         
     return False, None
 
-# ===== 4. READ WATCHLIST STOCKS & RUN BACKTEST =====
-stocks = ws_watchlist.col_values(1)[1:]
-stocks = sorted(list(set([s.strip().upper() for s in stocks if s.strip()])))
+# ===== 3. READ & CLEAN TICKERS =====
+raw_stocks = ws_watchlist.col_values(1)[1:]
+stocks = []
+for s in raw_stocks:
+    cleaned = s.strip().upper().replace("$", "")
+    if cleaned and cleaned not in ['SYMBOL', 'TICKER', 'STOCKS', 'STOCK']:
+        stocks.append(cleaned)
+stocks = sorted(list(set(stocks)))
 
-if stocks and stocks[0] in ['SYMBOL', 'TICKER', 'STOCKS', 'STOCK']:
-    stocks = stocks[1:]
-
-print(f"\nRunning Price Action Backtest on {len(stocks)} stocks from your Watchlist...", flush=True)
+print(f"\nScanning {len(stocks)} stocks using loss-minimization filters...", flush=True)
 
 all_historical_signals = []
 
+# ===== 4. OPTIMIZED BACKTEST LOOP =====
 for stock in stocks:
     try:
-        ticker_formatted = f"{stock}.NS" if not stock.endswith(".NS") else stock
+        ticker_formatted = f"{stock}.NS"
         df = yf.download(ticker_formatted, period="1y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        if df.empty or len(df) < 30: continue
+        if df.empty or len(df) < 200: continue # Minimum 200 rows required for EMA
         
         df = build_indicators(df)
         total_rows = len(df)
-        idx = 21
+        idx = 200 # Start after 200 EMA is ready
         
-        # Loop over historical rows to find and track strategy entries
         while idx < total_rows:
             row = df.iloc[idx]
             if row['Close'] < R['min_price']:
@@ -110,15 +118,25 @@ for stock in stocks:
             if is_signal:
                 entry_price = row['Close']
                 entry_date = df.index[idx]
+                atr = row['ATR_14']
                 
-                target_price = entry_price * (1 + R['target_pct'])
-                sl_price = entry_price * (1 - R['sl_loss_pct'])
+                # SUDHAR: Dynamic SL based on 1.5x ATR instead of fixed 5%
+                sl_distance = atr * 1.5
+                sl_price = entry_price - sl_distance
+                
+                # Target based on 1:2 Risk-Reward
+                target_distance = sl_distance * R['target_r_multiple']
+                target_price = entry_price + target_distance
+                
+                # Safety limits to avoid absurd bands
+                if sl_price <= 0 or ((entry_price - sl_price)/entry_price) > 0.15:
+                    idx += 1
+                    continue
                 
                 result = "TIMEOUT"
                 exit_date = None
                 exit_price = entry_price
                 
-                # Forward trace for Target/SL simulation
                 exit_idx = idx + 1
                 while exit_idx < min(idx + 1 + R['max_hold_days'], total_rows):
                     future_row = df.iloc[exit_idx]
@@ -144,12 +162,10 @@ for stock in stocks:
                     'Entry': round(entry_price, 2),
                     'SL': round(sl_price, 2),
                     'Target': round(target_price, 2),
-                    'Qty': 10,
                     'Status': result,
                     'Exit_Date': exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
                     'Exit_Price': round(exit_price, 2),
                     'PnL_%': pnl_pct,
-                    'PnL_Rs': round(pnl_pct * 10, 0),
                     'Strategy_Mode': mode
                 })
                 idx = exit_idx + R['cooldown_days']
@@ -160,9 +176,9 @@ for stock in stocks:
     except Exception:
         continue
 
-# ===== 5. EXPORT RESULTS AND GENERATE WIN RATE REPORT =====
+# ===== 5. EXPORT AND METRICS =====
 if not all_historical_signals:
-    print("\n⚠️ Alert: No price action signals discovered across the watchlist dataset.", flush=True)
+    print("\n⚠️ Alert: No optimized price action signals discovered.", flush=True)
 else:
     df_results = pd.DataFrame(all_historical_signals)
     
@@ -173,44 +189,34 @@ else:
     winrate = round((wins / total_trades) * 100, 1) if total_trades else 0
     
     print("\n=======================================================")
-    print("📢 STRATEGY WINNING RATE METRICS REPORT 📢")
+    print("📢 OPTIMIZED STRATEGY PERFORMANCE REPORT 📢")
     print("=======================================================")
     print(f"Total Backtest Signals  : {total_trades}")
     print(f"Profitable Trades (Wins): {wins}")
     print(f"Stop Loss Trades (Loss): {losses}")
     print(f"Expired Trades (Timeout): {timeouts}")
-    print(f"Strategy Master Win Rate: {winrate}%")
+    print(f"Strategy New Win Rate   : {winrate}%")
     print("=======================================================\n")
     
     try:
-        # 1. LIVE_TRADES tab par report write karna
+        # Update Sheets
         ws_live.clear()
-        cols_to_push = ['Stock','Entry_Date','Entry','SL','Target','Qty','Status','Exit_Date','Exit_Price','PnL_%','PnL_Rs']
-        df_sheet = df_results[cols_to_push].fillna("")
+        df_sheet = df_results.fillna("")
         ws_live.update([df_sheet.columns.values.tolist()] + df_sheet.values.tolist())
         
-        # 2. LIVE_SUMMARY tab create/update karna
         ws_summary = get_or_create_ws(sh, "LIVE_SUMMARY")
         ws_summary.clear()
-        
         summary_df = pd.DataFrame([{
             'Execution_Date': datetime.now().strftime('%Y-%m-%d'),
-            'Total_Backtest_Trades': total_trades,
-            'Strategy_Winrate_%': winrate,
-            'Total_Wins': wins,
-            'Total_Losses': losses,
-            'Total_Timeouts': timeouts
+            'Total_Trades': total_trades,
+            'Winrate_%': winrate,
+            'Wins': wins,
+            'Losses': losses,
+            'Timeouts': timeouts
         }])
         ws_summary.update([summary_df.columns.values.tolist()] + summary_df.values.tolist())
-        
-        # 3. NEW_SIGNALS_TODAY tab update karna (Isme sirf last strategy mode validation save hoga)
-        ws_signals = get_or_create_ws(sh, "NEW_SIGNALS_TODAY")
-        ws_signals.clear()
-        df_signals_push = df_results[['Stock', 'Entry_Date', 'Entry', 'SL', 'Target', 'Strategy_Mode']].fillna("")
-        ws_signals.update([df_signals_push.columns.values.tolist()] + df_signals_push.values.tolist())
-        
-        print("=== GSHEET BACKTEST METRICS UPDATED SUCCESSFULLY ===", flush=True)
+        print("=== GSHEET METRICS UPDATED SUCCESSFULLY ===", flush=True)
     except Exception as e:
         print(f"❌ GSheet write error: {str(e)}", flush=True)
 
-print(f"\n=== LIVE RUN COMPLETE ===", flush=True)
+print(f"\n=== RUN COMPLETE ===", flush=True)
