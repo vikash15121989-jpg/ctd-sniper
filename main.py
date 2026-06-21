@@ -9,7 +9,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== AUTOMATED DYNAMIC UNIVERSE & BACKTEST ENGINE V11.0 ===", flush=True)
+print("=== LIVE ENGINE V12.0: DYNAMIC UNIVERSE & 10-DAY SIGNAL SCANNER ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. SETUP & CONFIGURATION =====
@@ -24,17 +24,17 @@ R = {
     'cooldown_days': 15,
     'target_pct': 0.12,     # 12% Target Profit
     'sl_loss_pct': 0.05,     # 5% Stop Loss
+    'lookback_days': 10      # Pichle 10 trading days ka signal check karne ke liye
 }
 
 def get_or_create_ws(sh, title):
     try: return sh.worksheet(title)
-    except: return sh.add_worksheet(title=title, rows=1000, cols=15)
+    except: return sh.add_worksheet(title=title, rows=1000, cols=10)
 
 ws_filter = get_or_create_ws(sh, "HIGH_WINRATE_STOCKS")
-ws_live = get_or_create_ws(sh, "LIVE_TRADES_V8_3")
-ws_summary = get_or_create_ws(sh, "LIVE_SUMMARY")
+ws_signals = get_or_create_ws(sh, "NEW_SIGNALS_TODAY")
 
-# ===== 2. INDICATORS LOGIC =====
+# ===== 2. TECHNICAL INDICATORS LOGIC =====
 def build_indicators(df):
     if len(df) < 30: return df
     df['Breakout_High_20D'] = df['High'].shift(1).rolling(window=20).max()
@@ -56,7 +56,7 @@ def check_signal(df, idx):
         return True
     return False
 
-# ===== 3. PHASE 1: SCANNING ALL 500 STOCKS FOR 50%+ WINRATE =====
+# ===== 3. PHASE 1: FILTER 50%+ WIN RATE STOCKS =====
 raw_stocks = ws_watchlist.col_values(1)[1:]
 stocks = []
 for s in raw_stocks:
@@ -65,7 +65,7 @@ for s in raw_stocks:
         stocks.append(cleaned)
 stocks = sorted(list(set(stocks)))
 
-print(f"\n[PHASE 1] Filtering 50%+ Win Rate stocks out of {len(stocks)} symbols...", flush=True)
+print(f"\n[PHASE 1] Checking 1-Year history of {len(stocks)} stocks for 50%+ Win Rate...", flush=True)
 
 qualified_stocks = []
 
@@ -115,137 +115,82 @@ for count, stock in enumerate(stocks, 1):
         if t >= 3:
             win_rate = round((w / t) * 100, 1)
             if win_rate >= 50.0:
-                qualified_stocks.append({'Stock': stock, 'Win_Rate_%': win_rate})
+                qualified_stocks.append({'Stock': stock, 'Win_Rate_%': win_rate, 'Total_Trades': t})
                 
-        if count % 25 == 0: time.sleep(0.5)
+        if count % 30 == 0: time.sleep(0.5)
     except Exception:
         continue
 
-# Save Phase 1 Results to Sheet
+# High Winrate Stocks Sheet Update
 if not qualified_stocks:
-    print("⚠️ Alert: No stocks crossed the 50% Win Rate mark. Keeping previous setup.", flush=True)
-    vip_stocks = []
+    print("⚠️ Alert: No stocks matched 50%+ Win Rate criteria. Retaining list from previous sheet data.", flush=True)
+    # Background fetch fallback directly from sheet to avoid breaking live signals
+    try: vip_stocks = [r[0] for r in ws_filter.get_all_values()[1:] if r]
+    except: vip_stocks = []
 else:
     df_vip_list = pd.DataFrame(qualified_stocks).sort_values(by='Win_Rate_%', ascending=False)
     ws_filter.clear()
     ws_filter.update([df_vip_list.columns.values.tolist()] + df_vip_list.values.tolist())
     vip_stocks = df_vip_list['Stock'].tolist()
-    print(f"🎯 VIP Universe Ready! {len(vip_stocks)} stocks saved in 'HIGH_WINRATE_STOCKS'.", flush=True)
+    print(f"🎯 VIP Universe Locked! {len(vip_stocks)} stocks updated in 'HIGH_WINRATE_STOCKS'.", flush=True)
 
-# ===== 4. PHASE 2: DETAILED DATE-WISE BACKTEST ON VIP STOCKS =====
+# ===== 4. PHASE 2: RECENT 10-DAY SIGNAL SCANNER FOR VIP UNIVERSE =====
 if not vip_stocks:
-    print("\n🛑 Phase 2 stopped because VIP Universe is empty.", flush=True)
+    print("\n🛑 Live Signal Engine stopped: VIP Universe is empty.", flush=True)
 else:
-    print(f"\n[PHASE 2] Running Detailed Date-wise Backtest on {len(vip_stocks)} VIP Stocks...", flush=True)
-    detailed_trades = []
+    print(f"\n[PHASE 2] Scanning pichle 10 Trading Days signals for {len(vip_stocks)} VIP Stocks...", flush=True)
+    live_signals_pool = []
     
     for stock in vip_stocks:
         try:
             ticker_formatted = f"{stock}.NS"
-            df = yf.download(ticker_formatted, period="1y", progress=False, auto_adjust=True)
+            # Hum pichle 2 mahine ka data manga rahe hain taaki indicators (20 Day High/50 EMA) sahi calculate ho sakein
+            df = yf.download(ticker_formatted, period="2m", progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if df.empty: continue
+            if df.empty or len(df) < 25: continue
             
             df = build_indicators(df)
             total_rows = len(df)
-            idx = 21
             
-            while idx < total_rows:
-                row = df.iloc[idx]
-                if row['Close'] < R['min_price']:
-                    idx += 1
-                    continue
-                    
+            # Pichle 10 trading rows (days) ka array nikalenge
+            start_lookback_idx = max(21, total_rows - R['lookback_days'])
+            
+            # Pichle 10 dino me check karenge kab-kab fresh entry bani
+            for idx in range(start_lookback_idx, total_rows):
+                if df.iloc[idx]['Close'] < R['min_price']: continue
+                
                 if check_signal(df, idx):
-                    entry_price = row['Close']
-                    entry_date = df.index[idx]
+                    row_signal = df.iloc[idx]
+                    sig_date = df.index[idx].strftime('%Y-%m-%d')
+                    entry_price = round(row_signal['Close'], 2)
+                    stop_loss = round(entry_price * (1 - R['sl_loss_pct']), 2)
+                    target_level = round(entry_price * (1 + R['target_pct']), 2)
                     
-                    target_price = entry_price * (1 + R['target_pct'])
-                    sl_price = entry_price * (1 - R['sl_loss_pct'])
-                    
-                    result = "TIMEOUT"
-                    exit_date = None
-                    exit_price = entry_price
-                    
-                    exit_idx = idx + 1
-                    while exit_idx < min(idx + 1 + R['max_hold_days'], total_rows):
-                        future_row = df.iloc[exit_idx]
-                        if future_row['High'] >= target_price:
-                            result = "WIN"
-                            exit_price = target_price
-                            exit_date = df.index[exit_idx]
-                            break
-                        elif future_row['Low'] <= sl_price:
-                            result = "LOSS"
-                            exit_price = sl_price
-                            exit_date = df.index[exit_idx]
-                            break
-                        exit_price = future_row['Close']
-                        exit_date = df.index[exit_idx]
-                        exit_idx += 1
-                    
-                    pnl_pct = round((exit_price / entry_price - 1) * 100, 1)
-                    
-                    detailed_trades.append({
-                        'Stock': stock,
-                        'Entry_Date': entry_date.strftime('%Y-%m-%d'),
-                        'Entry_Price': round(entry_price, 2),
-                        'SL_Level': round(sl_price, 2),
-                        'Target_Level': round(target_price, 2),
-                        'Status': result,
-                        'Exit_Date': exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
-                        'Exit_Price': round(exit_price, 2),
-                        'PnL_%': pnl_pct
+                    live_signals_pool.append({
+                        'Stock_Name': stock,
+                        'Signal_Date': sig_date,
+                        'Entry_Price': entry_price,
+                        'StopLoss_Price': stop_loss,
+                        'Target_Price': target_level
                     })
-                    idx = exit_idx + R['cooldown_days']
-                else:
-                    idx += 1
             time.sleep(0.02)
         except Exception:
             continue
 
-    # ===== 5. EXPORT FINAL FILTERED REPORT TO GOOGLE SHEET =====
-    if detailed_trades:
-        df_final_report = pd.DataFrame(detailed_trades).sort_values(by='Entry_Date', ascending=False)
-        
-        # Calculate VIP Metrics
-        total_vip_trades = len(df_final_report)
-        vip_wins = len(df_final_report[df_final_report['Status'] == 'WIN'])
-        vip_losses = len(df_final_report[df_final_report['Status'] == 'LOSS'])
-        vip_timeouts = len(df_final_report[df_final_report['Status'] == 'TIMEOUT'])
-        vip_winrate = round((vip_wins / total_vip_trades) * 100, 1) if total_vip_trades else 0
-        
-        print("\n=======================================================")
-        print("🏆 STRATEGIC VIP REPORT (FILTERED UNIVERSE RUN) 🏆")
-        print("=======================================================")
-        print(f"Total High-Conviction Signals : {total_vip_trades}")
-        print(f"Profitable Trades (Wins)      : {vip_wins}")
-        print(f"Controlled Losses             : {vip_losses}")
-        print(f"Time Expired Trades           : {vip_timeouts}")
-        print(f"Optimized VIP Win Rate        : {vip_winrate}%")
-        print("=======================================================\n")
-        
-        try:
-            # 1. Clear & Update LIVE_TRADES_V8_3 (Date-wise results)
-            ws_live.clear()
-            df_push = df_final_report.fillna("")
-            ws_live.update([df_push.columns.values.tolist()] + df_push.values.tolist())
-            
-            # 2. Update LIVE_SUMMARY
-            ws_summary.clear()
-            summary_df = pd.DataFrame([{
-                'Execution_Date': datetime.now().strftime('%Y-%m-%d'),
-                'VIP_Total_Trades': total_vip_trades,
-                'VIP_Winrate_%': vip_winrate,
-                'Wins': vip_wins,
-                'Losses': vip_losses,
-                'Timeouts': vip_timeouts
-            }])
-            ws_summary.update([summary_df.columns.values.tolist()] + summary_df.values.tolist())
-            print("=== GSHEET DYNAMIC METRICS UPDATED SUCCESSFULLY ===", flush=True)
-        except Exception as e:
-            print(f"❌ GSheet update error: {str(e)}", flush=True)
-    else:
-        print("\n⚠️ Alert: No historical signals triggered inside the filtered VIP universe.", flush=True)
+    # ===== 5. EXPORT LIVE RECENT SIGNALS TO GOOGLE SHEET =====
+    try:
+        ws_signals.clear()
+        if live_signals_pool:
+            df_signals_push = pd.DataFrame(live_signals_pool).sort_values(by='Signal_Date', ascending=False)
+            ws_signals.update([df_signals_push.columns.values.tolist()] + df_signals_push.values.tolist())
+            print(f"\n🚀 SUCCESS! {len(df_signals_push)} Recent Signals dumped into 'NEW_SIGNALS_TODAY' Sheet.", flush=True)
+            print(df_signals_push.to_string(index=False))
+        else:
+            # Empty structural row management if no signal in last 10 days
+            headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
+            ws_signals.update([headers] + [["No signals generated in last 10 trading days.", "", "", "", ""]])
+            print("\n⚠️ Alert: Pichle 10 trading dino me ek bhi VIP stock me setup nahi bana.", flush=True)
+    except Exception as e:
+        print(f"❌ Live Sheet update error: {str(e)}", flush=True)
 
-print(f"\n=== MASTER RUN COMPLETE ===", flush=True)
+print(f"\n=== AUTOMATED WORKFLOW COMPLETE ===", flush=True)
