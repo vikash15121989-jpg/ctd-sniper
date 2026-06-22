@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== STATEFUL TRADING ENGINE V17.4: DUAL-SHEET SEPARATION ===", flush=True)
+print("=== STATEFUL TRADING ENGINE V17.5: ONE TRADE PER STOCK ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -25,18 +25,18 @@ R = {
     'target_pct': 0.12,
     'sl_loss_pct': 0.05,
     'lookback_trading_days': 10,
-    'min_wr_for_vip': 0.50,       
-    'vip_min_trades': 4,          
-    'min_avg_volume': 500000,     
-    'min_daily_turnover': 30000000, 
+    'min_wr_for_vip': 0.50,
+    'vip_min_trades': 4,
+    'min_avg_volume': 500000,
+    'min_daily_turnover': 30000000,
     'max_workers': 15
 }
 
 DEBUG = {
     'total_download': 0, 'download_fail': 0, 'rejected_by_rules': 0, 'nan_skip': 0,
     'below_ema': 0, 'no_breakout': 0, 'weak_vol': 0, 'red_candle': 0,
-    'below_min_price': 0, 'setups_found': 0,
-    'low_liquidity_skip': 0       
+    'below_min_price': 0, 'setups_found': 0, 'low_liquidity_skip': 0,
+    'open_trade_skip': 0 # NEW
 }
 
 def get_or_create_ws(sh, title, rows=1000, cols=10):
@@ -70,7 +70,7 @@ def build_indicators(df):
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
     df['Vol_Multiple'] = df['Volume'] / (df['Vol_20MA'] + 1e-5)
-    
+
     df['Turnover'] = df['Close'] * df['Volume']
     df['Turnover_20MA'] = df['Turnover'].shift(1).rolling(window=20).mean()
     return df
@@ -80,10 +80,10 @@ def check_liquidity(df, idx):
     row = df.iloc[idx]
     avg_vol = row['Vol_20MA']
     avg_turnover = row['Turnover_20MA']
-    
+
     if pd.isna(avg_vol) or pd.isna(avg_turnover):
         return False
-        
+
     if avg_vol >= R['min_avg_volume'] and avg_turnover >= R['min_daily_turnover']:
         return True
     return False
@@ -150,7 +150,7 @@ def run_backtest_for_ticker(ticker, df, debug_mode=False):
                 exit_idx += 1
 
             signals.append({"Ticker": ticker, "Result": status})
-            idx = exit_idx + 1 
+            idx = exit_idx + 1
         else:
             idx += 1
     return signals
@@ -192,10 +192,10 @@ def main():
             if lock_string.startswith("LOCK_UNTIL:"):
                 lock_date_str = lock_string.split(":")[1].strip()
                 lock_date = datetime.strptime(lock_date_str, '%Y-%m-%d').date()
-                
+
                 if today <= lock_date:
                     print(f"🔒 VIP Sheet is LOCKED until {lock_date_str}. Fetching locked stocks.", flush=True)
-                    for row in all_vip_data[2:]: 
+                    for row in all_vip_data[2:]:
                         if row[0]:
                             vip_stocks.append(row[0])
                 else:
@@ -213,7 +213,7 @@ def main():
         print("🔄 Running Fresh Re-Backtest with Liquidity Check...", flush=True)
         raw_stocks = ws_watchlist.col_values(1)[1:]
         stocks = sorted(list(set([s.strip().upper().replace(".NS", "") for s in raw_stocks if s.strip()])))
-        
+
         qualified_stocks = []
         with ThreadPoolExecutor(max_workers=R['max_workers']) as executor:
             futures = {executor.submit(build_vip_for_stock, stock): stock for stock in stocks}
@@ -229,11 +229,11 @@ def main():
 
         df_vip = pd.DataFrame(qualified_stocks)
         ws_filter.clear()
-        
+
         unlock_date_str = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
         lock_header = [f"LOCK_UNTIL:{unlock_date_str}", "", "", ""]
         vip_headers = ['Stock', 'Win_Rate_%', 'Trades', 'Wins']
-        
+
         if not df_vip.empty:
             df_vip = df_vip.sort_values('Win_Rate_%', ascending=False)
             df_vip = df_vip.astype(object).where(pd.notnull(df_vip), "")
@@ -242,7 +242,7 @@ def main():
         else:
             ws_filter.update('A1', [lock_header, vip_headers])
             vip_stocks = []
-            
+
         print(f"🔒 VIP Universe locked for 1 week until: {unlock_date_str}", flush=True)
 
     print(f"🎯 Total Active VIP Stocks for Scan: {len(vip_stocks)}", flush=True)
@@ -263,24 +263,24 @@ def main():
             sig_date_str = trade.get('Signal_Date')
             sl_val = safe_float(trade.get('StopLoss_Price'))
             tgt_val = safe_float(trade.get('Target_Price'))
-            
+
             if not sig_date_str or sl_val <= 0 or tgt_val <= 0:
                 continue
-                
+
             sig_date = datetime.strptime(sig_date_str, '%Y-%m-%d').date()
             entry_start_date = sig_date + timedelta(days=1)
-            
+
             if entry_start_date > today:
                 continue
 
             df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=True)
-            if df.empty or len(df) < 2: 
+            if df.empty or len(df) < 2:
                 continue
-            
+
             df = build_indicators(df)
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
-                
+
             df_after_signal = df[df.index.date >= entry_start_date]
             if df_after_signal.empty:
                 continue
@@ -306,7 +306,14 @@ def main():
                     exit_date_str = date_str
                     break
 
-            if trade_status != "OPEN":
+            # TIMEOUT CHECK
+            if trade_status == "OPEN":
+                days_held = (today - sig_date).days
+                if days_held >= R['max_hold_days']:
+                    trade_status = "TIMEOUT"
+                    exit_date_str = today.strftime('%Y-%m-%d')
+
+            if trade_status!= "OPEN":
                 for idx, item in enumerate(all_historical_trades):
                     if item.get('Stock_Name') == stock and (not item.get('Status') or item.get('Status') == 'OPEN') and item.get('Signal_Date') == sig_date_str:
                         all_historical_trades[idx]['Status'] = trade_status
@@ -314,22 +321,30 @@ def main():
                         print(f"🎯 {stock} status updated to {trade_status} on {exit_date_str}", flush=True)
                         open_trades.pop(stock, None)
                         break
-                        
+
         except Exception as e:
             print(f"Error tracking active stock {stock}: {e}", flush=True)
 
-    # --- PHASE 3: FRESH BREAKOUT SCANNING (10 DAYS LOOKBACK) ---
+    # --- PHASE 3: FRESH BREAKOUT SCANNING WITH ONE-TRADE RULE ---
     print(f"\n[PHASE 3] Scanning {R['lookback_trading_days']}-day window...", flush=True)
     live_signals_pool = []
 
+    # 🎯 CRITICAL FIX: Open trades ki list nikal lo
+    open_trade_stocks = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') == 'OPEN'}
+    print(f"🔒 Currently OPEN trades: {len(open_trade_stocks)} stocks", flush=True)
+
     for stock in vip_stocks:
+        # 🎯 FIX: Agar stock pehle se OPEN hai to skip kar de
+        if stock in open_trade_stocks:
+            DEBUG['open_trade_skip'] += 1
+            continue
+
         try:
             df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=True)
             if df.empty or len(df) < 35: continue
             df = build_indicators(df)
             total_rows = len(df)
-            
-            # Aaj yaani sabse aakhiri trading day ki date nikal lo
+
             last_trading_date_str = df.index[-1].strftime('%Y-%m-%d')
             start_idx = max(21, total_rows - R['lookback_trading_days'])
 
@@ -341,8 +356,8 @@ def main():
                 if check_breakout_signal(df, idx, debug_mode=True):
                     row_sig = df.iloc[idx]
                     sig_date_str = df.index[idx].strftime('%Y-%m-%d')
-                    
-                    # Duplicate Guard: Agar yeh exact stock + signal_date pehle se saved hai toh aage badho
+
+                    # Duplicate Guard: same date check
                     already_exists = any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades)
                     if already_exists: continue
 
@@ -350,26 +365,28 @@ def main():
                     sl = round(ep * (1 - R['sl_loss_pct']), 2)
                     tgt = round(ep * (1 + R['target_pct']), 2)
 
-                    # 🎯 RULE 1: NEW_SIGNALS_TODAY mein sirf AAJ (Last Trading Day) ka taza signal jayega
+                    # RULE 1: NEW_SIGNALS_TODAY - Sirf aaj ka signal
                     if sig_date_str == last_trading_date_str:
                         live_signals_pool.append({
                             'Stock_Name': stock, 'Signal_Date': sig_date_str,
                             'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
                         })
 
-                    # 🎯 RULE 2: ACTIVE_TRADES mein pichle saare 10 din ka master data safe rahega
+                    # RULE 2: ACTIVE_TRADES - Master record
                     all_historical_trades.append({
                         'Stock_Name': stock, 'Signal_Date': sig_date_str,
                         'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
                         'Exit_Date': '', 'Status': 'OPEN'
                     })
-                    break 
+
+                    # 🎯 FIX: Ek signal milte hi break. Ek stock = ek trade at a time
+                    break
         except:
             continue
 
     # DEBUG SUMMARY PRINT
     print("\n" + "="*60, flush=True)
-    print("DEBUG SUMMARY V17.4", flush=True)
+    print("DEBUG SUMMARY V17.5", flush=True)
     print("="*60, flush=True)
     for k, v in DEBUG.items():
         print(f"{k}: {v}", flush=True)
@@ -377,16 +394,13 @@ def main():
 
     # --- PHASE 4: GLOBAL SYNC WITH CHRONOLOGICAL SORTING ---
     try:
-        # 1. Master Tracker Sync (ACTIVE_TRADES) - Pichle 10 dino ka poora sorted data
+        # 1. Master Tracker Sync (ACTIVE_TRADES)
         ws_active.clear()
         master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status']
         if all_historical_trades:
             df_master = pd.DataFrame(all_historical_trades)
-            
-            # 🎯 RECENT DATE UPAR: Isko date ke mutabik descending sort kiya taaki naya trade hamesha sabse upar rahe
             df_master['Signal_Date_DT'] = pd.to_datetime(df_master['Signal_Date'])
             df_master = df_master.sort_values(by='Signal_Date_DT', ascending=False).drop(columns=['Signal_Date_DT'])
-            
             df_master = df_master.reindex(columns=master_headers).fillna("")
             df_master = df_master.astype(object)
             ws_active.update('A1', [master_headers] + df_master.values.tolist())
@@ -394,10 +408,10 @@ def main():
         else:
             ws_active.update('A1', [master_headers])
 
-        # 2. Daily Signals Dashboard Sync (NEW_SIGNALS_TODAY) - Sirf Aaj ke pure fresh signals
+        # 2. Daily Signals Dashboard Sync (NEW_SIGNALS_TODAY)
         ws_signals.clear()
         signal_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
-        
+
         if live_signals_pool:
             df_sig = pd.DataFrame(live_signals_pool)
             df_sig = df_sig.reindex(columns=signal_headers).fillna("")
@@ -411,8 +425,7 @@ def main():
     except Exception as e:
         print(f"❌ Sheet Sync Error: {str(e)}", flush=True)
 
-    print(f"\n=== V17.4 EXECUTION COMPLETE ===", flush=True)
+    print(f"\n=== V17.5 EXECUTION COMPLETE ===", flush=True)
 
 if __name__ == "__main__":
     main()
-    
