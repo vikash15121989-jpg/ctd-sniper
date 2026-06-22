@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V18.3: MAX/MIN BASED EXIT RULE ===", flush=True)
+print("=== V18.4: MAX/MIN + PCT FROM ENTRY ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -29,10 +29,10 @@ R = {
     'min_avg_volume': 500000,
     'min_daily_turnover': 30000000,
     'max_workers': 15,
-    'trailing_buffer_pct': 0.05 # 5% se upar hai to OPEN, neeche hai to TRAILING
+    'trailing_buffer_pct': 0.05
 }
 
-def get_or_create_ws(sh, title, rows=1000, cols=10):
+def get_or_create_ws(sh, title, rows=1000, cols=15):
     try:
         return sh.worksheet(title)
     except:
@@ -104,7 +104,7 @@ def main():
     except: pass
     print(f"🎯 VIP Stocks: {len(vip_stocks)}", flush=True)
 
-    # PHASE 2: LOAD + UPDATE STATUS WITH MAX/MIN LOGIC
+    # PHASE 2: LOAD + UPDATE STATUS
     print("\n[PHASE 2] Updating Trades with MAX/MIN Logic...", flush=True)
     try:
         master_rows = ws_active.get_all_records()
@@ -121,7 +121,7 @@ def main():
         if not stock or not sig_date:
             cleaned_trades.append(trade)
             continue
-        if status == 'OPEN':
+        if status in ['OPEN', 'TRAILING']:
             if stock not in stock_latest_open:
                 stock_latest_open[stock] = trade
             else:
@@ -141,7 +141,7 @@ def main():
     all_historical_trades = cleaned_trades
     open_stocks = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') in ['OPEN', 'TRAILING']}
 
-    # 🎯 MAX/MIN BASED STATUS UPDATE
+    # MAX/MIN BASED STATUS UPDATE + PCT_FROM_ENTRY
     for stock in list(open_stocks):
         trade = next((t for t in all_historical_trades if t.get('Stock_Name') == stock and t.get('Status') in ['OPEN', 'TRAILING']), None)
         if not trade: continue
@@ -149,7 +149,7 @@ def main():
             sig_date_str = trade.get('Signal_Date')
             entry_val = safe_float(trade.get('Entry_Price'))
             sl_val = safe_float(trade.get('StopLoss_Price'))
-            tgt_val = entry_val * (1 + R['target_pct']) # 12% target
+            tgt_val = entry_val * (1 + R['target_pct'])
             sig_date = datetime.strptime(sig_date_str, '%Y-%m-%d').date()
             entry_start_date = sig_date + timedelta(days=1)
             if entry_start_date > today: continue
@@ -159,15 +159,15 @@ def main():
             df_after_signal = df[df.index.date >= entry_start_date]
             if df_after_signal.empty: continue
 
-            # 🎯 CORE LOGIC: Entry ke baad se MAX aur MIN
             max_high = float(df_after_signal['High'].max())
             min_low = float(df_after_signal['Low'].min())
             current_close = float(df_after_signal['Close'].iloc[-1])
 
-            max_pct = ((max_high - entry_val) / entry_val) * 100
-            current_pct = ((current_close - entry_val) / entry_val) * 100
+            # 🎯 NEW: PCT_FROM_ENTRY
+            pct_from_entry = round(((current_close - entry_val) / entry_val) * 100, 2)
+            max_pct = round(((max_high - entry_val) / entry_val) * 100, 2)
 
-            print(f"{stock}: Entry={entry_val}, MAX={max_high} ({max_pct:.1f}%), MIN={min_low}, CMP={current_close} ({current_pct:.1f}%)", flush=True)
+            print(f"{stock}: Entry={entry_val}, MAX={max_high} ({max_pct}%), MIN={min_low}, CMP={current_close} ({pct_from_entry}%)", flush=True)
 
             trade_status = trade.get('Status')
             exit_date_str = ""
@@ -184,30 +184,26 @@ def main():
 
             # RULE 3: MAX < 12% aur MIN > SL
             else:
-                trailing_level = entry_val * (1 - R['trailing_buffer_pct']) # Entry se 5% neeche
+                trailing_level = entry_val * (1 - R['trailing_buffer_pct'])
                 if current_close >= trailing_level:
-                    trade_status = "OPEN" # 5% ke upar hai
+                    trade_status = "OPEN"
                 else:
-                    trade_status = "TRAILING" # 5% se neeche aa gaya par SL nahi toota
+                    trade_status = "TRAILING"
 
             # TIMEOUT check
             if trade_status in ["OPEN", "TRAILING"] and (today - sig_date).days >= R['max_hold_days']:
                 trade_status = "TIMEOUT"
                 exit_date_str = today.strftime('%Y-%m-%d')
 
-            if trade_status not in ["OPEN", "TRAILING"]:
-                for idx, item in enumerate(all_historical_trades):
-                    if item.get('Stock_Name') == stock and item.get('Status') in ['OPEN', 'TRAILING'] and item.get('Signal_Date') == sig_date_str:
-                        all_historical_trades[idx]['Status'] = trade_status
+            # Update trade dict
+            for idx, item in enumerate(all_historical_trades):
+                if item.get('Stock_Name') == stock and item.get('Signal_Date') == sig_date_str:
+                    all_historical_trades[idx]['Status'] = trade_status
+                    all_historical_trades[idx]['PCT_FROM_ENTRY'] = pct_from_entry
+                    if trade_status not in ["OPEN", "TRAILING"]:
                         all_historical_trades[idx]['Exit_Date'] = exit_date_str
                         print(f"🎯 {stock} closed: {trade_status} on {exit_date_str}", flush=True)
-                        break
-            else:
-                # Status update for OPEN/TRAILING
-                for idx, item in enumerate(all_historical_trades):
-                    if item.get('Stock_Name') == stock and item.get('Signal_Date') == sig_date_str:
-                        all_historical_trades[idx]['Status'] = trade_status
-                        break
+                    break
 
         except Exception as e:
             print(f"Error tracking {stock}: {e}", flush=True)
@@ -244,7 +240,7 @@ def main():
                 all_historical_trades.append({
                     'Stock_Name': stock, 'Signal_Date': sig_date_str,
                     'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
-                    'Exit_Date': '', 'Status': 'OPEN'
+                    'Exit_Date': '', 'Status': 'OPEN', 'PCT_FROM_ENTRY': 0.0
                 })
                 open_trade_stocks.add(stock)
         except: continue
@@ -252,11 +248,15 @@ def main():
     # PHASE 4: SYNC
     try:
         ws_active.clear()
-        master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status']
+        # 🎯 NEW COLUMN: PCT_FROM_ENTRY
+        master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status', 'PCT_FROM_ENTRY']
         if all_historical_trades:
             df_master = pd.DataFrame(all_historical_trades)
             df_master['Signal_Date_DT'] = pd.to_datetime(df_master['Signal_Date'])
             df_master = df_master.sort_values(by='Signal_Date_DT', ascending=False).drop(columns=['Signal_Date_DT'])
+            # Fill PCT_FROM_ENTRY for closed trades
+            if 'PCT_FROM_ENTRY' not in df_master.columns:
+                df_master['PCT_FROM_ENTRY'] = 0.0
             df_master = df_master.reindex(columns=master_headers).fillna("")
             ws_active.update('A1', [master_headers] + df_master.values.tolist())
 
@@ -271,7 +271,7 @@ def main():
     except Exception as e:
         print(f"❌ Sheet Error: {e}", flush=True)
 
-    print(f"\n=== V18.3 COMPLETE ===", flush=True)
+    print(f"\n=== V18.4 COMPLETE ===", flush=True)
 
 if __name__ == "__main__":
     main()
