@@ -1,9 +1,9 @@
-name: CTD Sniper Scanner
+Name: CTD Sniper Scanner
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 3 * * 1-5' # 9:00 AM IST Mon-Fri
+    - cron: '30 13 * * 1-5' # 7:00 PM IST Mon-Fri
 
 jobs:
   run-scanner:
@@ -25,3 +25,4 @@ jobs:
         env:
           GSHEET_KEY: ${{ secrets.GSHEET_KEY }} # YE LINE SABSE IMPORTANT HAI
         run: python main.py
+        
