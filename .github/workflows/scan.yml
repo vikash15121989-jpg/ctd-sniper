@@ -1,4 +1,4 @@
-Name: CTD Sniper Scanner
+name: CTD Sniper Scanner
 
 on:
   workflow_dispatch:
@@ -25,3 +25,4 @@ jobs:
         env:
           GSHEET_KEY: ${{ secrets.GSHEET_KEY }} # YE LINE SABSE IMPORTANT HAI
         run: python main.py
+        
