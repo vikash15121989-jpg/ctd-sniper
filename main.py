@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V17.8: DUPLICATE ENTRY KILLER ===", flush=True)
+print("=== V18.1: FIRST BREAKOUT ONLY ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -29,6 +29,7 @@ R = {
     'min_avg_volume': 500000,
     'min_daily_turnover': 30000000,
     'max_workers': 15
+    # tight entry hata di
 }
 
 def get_or_create_ws(sh, title, rows=1000, cols=10):
@@ -57,7 +58,6 @@ def build_indicators(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     if len(df) < 35: return df
-
     df['Breakout_High_20D'] = df['High'].shift(1).rolling(window=20).max()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
@@ -73,23 +73,33 @@ def check_liquidity(df, idx):
     if pd.isna(avg_vol) or pd.isna(avg_turnover): return False
     return avg_vol >= R['min_avg_volume'] and avg_turnover >= R['min_daily_turnover']
 
-def check_breakout_signal(df, idx):
-    if idx < 1: return False
-    row, row_prev = df.iloc[idx], df.iloc[idx-1]
-    if pd.isna(row['EMA_50']) or pd.isna(row['Breakout_High_20D']) or pd.isna(row['Vol_Multiple']): return False
-    if not check_liquidity(df, idx): return False
-    if row['Close'] < row['EMA_50']: return False
-    breakout_level = row['Breakout_High_20D']
-    fresh_breakout = (row['Close'] > breakout_level) and (row_prev['Close'] <= breakout_level or row['Open'] > breakout_level)
-    good_volume = row['Vol_Multiple'] > 1.2
-    is_green = row['Close'] > row['Open']
-    return fresh_breakout and good_volume and is_green
+# 🎯 FIRST BREAKOUT FINDER: 10 din me sabse pehla fresh breakout
+def find_first_breakout(df, start_idx, end_idx):
+    for idx in range(start_idx, end_idx):
+        if idx < 1: continue
+        row, row_prev = df.iloc[idx], df.iloc[idx-1]
+
+        if pd.isna(row['EMA_50']) or pd.isna(row['Breakout_High_20D']) or pd.isna(row['Vol_Multiple']):
+            continue
+        if not check_liquidity(df, idx): continue
+        if row['Close'] < row['EMA_50']: continue
+
+        breakout_level = row['Breakout_High_20D']
+        # Fresh breakout = aaj close > 20D high, kal close <= 20D high
+        fresh_breakout = (row['Close'] > breakout_level) and (row_prev['Close'] <= breakout_level)
+        good_volume = row['Vol_Multiple'] > 1.2
+        is_green = row['Close'] > row['Open']
+
+        if fresh_breakout and good_volume and is_green:
+            return idx, breakout_level
+
+    return None, None
 
 # ===== 3. MAIN =====
 def main():
     today = datetime.now().date()
 
-    # PHASE 1: VIP LOAD - same as before
+    # PHASE 1: VIP LOAD
     vip_stocks = []
     try:
         all_vip_data = ws_filter.get_all_values()
@@ -98,36 +108,55 @@ def main():
             if today <= lock_date:
                 vip_stocks = [row[0] for row in all_vip_data[2:] if row[0]]
     except: pass
-
     print(f"🎯 VIP Stocks: {len(vip_stocks)}", flush=True)
 
-    # PHASE 2: LOAD + CLEAN DUPLICATES FROM SHEET
-    print("\n[PHASE 2] Loading + Cleaning Duplicates...", flush=True)
+    # PHASE 2: LOAD + NUKE DUPLICATES
+    print("\n[PHASE 2] Cleaning Duplicate OPEN Trades...", flush=True)
     try:
         master_rows = ws_active.get_all_records()
     except:
         master_rows = []
 
-    # 🎯 LOCK 1: Sheet se duplicate OPEN hatao
-    seen_open = set()
-    all_historical_trades = []
-    dup_count = 0
+    stock_latest_open = {}
+    cleaned_trades = []
+    nuked_count = 0
+
     for trade in master_rows:
-        if trade.get('Status') == 'OPEN':
-            key = trade.get('Stock_Name')
-            if key in seen_open:
-                dup_count += 1
-                continue
-            seen_open.add(key)
-        all_historical_trades.append(trade)
+        stock = trade.get('Stock_Name')
+        status = trade.get('Status')
+        sig_date = trade.get('Signal_Date')
+        if not stock or not sig_date:
+            cleaned_trades.append(trade)
+            continue
 
-    if dup_count > 0:
-        print(f"🧹 Removed {dup_count} duplicate OPEN trades from sheet", flush=True)
+        if status == 'OPEN':
+            if stock not in stock_latest_open:
+                stock_latest_open[stock] = trade
+            else:
+                old_date = datetime.strptime(stock_latest_open[stock]['Signal_Date'], '%Y-%m-%d').date()
+                new_date = datetime.strptime(sig_date, '%Y-%m-%d').date()
+                if new_date > old_date:
+                    for idx, t in enumerate(cleaned_trades):
+                        if t.get('Stock_Name') == stock and t.get('Signal_Date') == stock_latest_open[stock]['Signal_Date']:
+                            cleaned_trades[idx]['Status'] = 'TIMEOUT'
+                            cleaned_trades[idx]['Exit_Date'] = today.strftime('%Y-%m-%d')
+                            nuked_count += 1
+                    stock_latest_open[stock] = trade
+                else:
+                    trade['Status'] = 'TIMEOUT'
+                    trade['Exit_Date'] = today.strftime('%Y-%m-%d')
+                    nuked_count += 1
+        cleaned_trades.append(trade)
 
-    # Update status of existing trades
-    open_stocks_before = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') == 'OPEN'}
+    if nuked_count > 0:
+        print(f"🧹 Nuked {nuked_count} duplicate OPEN trades", flush=True)
 
-    for stock in list(open_stocks_before):
+    all_historical_trades = cleaned_trades
+
+    # Update status of OPEN trades
+    open_stocks = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') == 'OPEN'}
+
+    for stock in list(open_stocks):
         trade = next((t for t in all_historical_trades if t.get('Stock_Name') == stock and t.get('Status') == 'OPEN'), None)
         if not trade: continue
         try:
@@ -151,12 +180,9 @@ def main():
                 hit_sl, hit_tgt = day_low <= sl_val, day_high >= tgt_val
 
                 if hit_sl and hit_tgt:
-                    if day_close <= sl_val:
-                        trade_status = "LOSS"
-                    elif day_close >= tgt_val:
-                        trade_status = "PROFIT"
-                    else:
-                        continue
+                    if day_close <= sl_val: trade_status = "LOSS"
+                    elif day_close >= tgt_val: trade_status = "PROFIT"
+                    else: continue
                     exit_date_str = date_str
                     break
                 elif hit_sl:
@@ -182,18 +208,14 @@ def main():
         except Exception as e:
             print(f"Error tracking {stock}: {e}", flush=True)
 
-    # PHASE 3: NEW SIGNAL SCAN
-    print(f"\n[PHASE 3] Scanning for new signals...", flush=True)
+    # PHASE 3: FIRST BREAKOUT SCAN
+    print(f"\n[PHASE 3] Scanning for FIRST breakout in last {R['lookback_trading_days']} days...", flush=True)
     live_signals_pool = []
-
-    # 🎯 LOCK 2: Updated OPEN list after status update
     open_trade_stocks = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') == 'OPEN'}
     print(f"🔒 Stocks with OPEN trade: {len(open_trade_stocks)}", flush=True)
 
     for stock in vip_stocks:
-        # 🎯 MAIN FIX: Agar OPEN hai to bilkul skip
-        if stock in open_trade_stocks:
-            continue
+        if stock in open_trade_stocks: continue
 
         try:
             df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=False)
@@ -203,37 +225,37 @@ def main():
             last_trading_date_str = df.index[-1].strftime('%Y-%m-%d')
             start_idx = max(21, total_rows - R['lookback_trading_days'])
 
-            for idx in range(start_idx, total_rows):
-                if df.iloc[idx]['Close'] < R['min_price']: continue
-                if check_breakout_signal(df, idx):
-                    row_sig = df.iloc[idx]
-                    sig_date_str = df.index[idx].strftime('%Y-%m-%d')
+            # 🎯 SIRF PEHLA BREAKOUT LO
+            breakout_idx, breakout_level = find_first_breakout(df, start_idx, total_rows)
 
-                    # Extra safety: same date check
-                    if any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades):
-                        continue
+            if breakout_idx is not None:
+                row_sig = df.iloc[breakout_idx]
+                sig_date_str = df.index[breakout_idx].strftime('%Y-%m-%d')
 
-                    ep = round(float(row_sig['Close']), 2)
-                    sl = round(ep * (1 - R['sl_loss_pct']), 2)
-                    tgt = round(ep * (1 + R['target_pct']), 2)
+                if any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades):
+                    continue
 
-                    if sig_date_str == last_trading_date_str:
-                        live_signals_pool.append({
-                            'Stock_Name': stock, 'Signal_Date': sig_date_str,
-                            'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
-                        })
+                ep = round(float(row_sig['Close']), 2)
+                sl = round(ep * (1 - R['sl_loss_pct']), 2)
+                tgt = round(ep * (1 + R['target_pct']), 2)
 
-                    all_historical_trades.append({
+                print(f"✅ {stock} FIRST breakout on {sig_date_str} @ {ep}, BreakLevel: {round(breakout_level,2)}", flush=True)
+
+                if sig_date_str == last_trading_date_str:
+                    live_signals_pool.append({
                         'Stock_Name': stock, 'Signal_Date': sig_date_str,
-                        'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
-                        'Exit_Date': '', 'Status': 'OPEN'
+                        'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
                     })
 
-                    # 🎯 LOCK 3: Abhi add kiya to turant OPEN list me daal de
-                    open_trade_stocks.add(stock)
-                    break
-        except:
-            continue
+                all_historical_trades.append({
+                    'Stock_Name': stock, 'Signal_Date': sig_date_str,
+                    'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
+                    'Exit_Date': '', 'Status': 'OPEN'
+                })
+                open_trade_stocks.add(stock)
+
+        except Exception as e:
+            print(f"Error scanning {stock}: {e}", flush=True)
 
     # PHASE 4: SYNC
     try:
@@ -257,7 +279,7 @@ def main():
     except Exception as e:
         print(f"❌ Sheet Error: {e}", flush=True)
 
-    print(f"\n=== V17.8 COMPLETE ===", flush=True)
+    print(f"\n=== V18.1 COMPLETE ===", flush=True)
 
 if __name__ == "__main__":
     main()
