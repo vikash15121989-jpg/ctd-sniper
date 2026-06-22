@@ -253,37 +253,70 @@ def main():
         master_rows = ws_active.get_all_records()
         open_trades = {r['Stock_Name']: r for r in master_rows if r.get('Stock_Name') and (not r.get('Status') or r.get('Status') == 'OPEN')}
         all_historical_trades = master_rows
-    except:
+    except Exception as e:
+        print(f"Error reading ACTIVE_TRADES sheet: {e}", flush=True)
         open_trades = {}
         all_historical_trades = []
 
     for stock, trade in list(open_trades.items()):
         try:
-            df = yf.download(f"{stock}.NS", period="5d", progress=False, auto_adjust=True)
-            if df.empty: continue
-            df = build_indicators(df)
-            
-            last_low = df['Low'].min()
-            last_high = df['High'].max()
+            sig_date_str = trade.get('Signal_Date')
             sl_val = safe_float(trade.get('StopLoss_Price'))
             tgt_val = safe_float(trade.get('Target_Price'))
-            last_candle_date = df.index[-1].date().strftime('%Y-%m-%d')
+            
+            if not sig_date_str or sl_val <= 0 or tgt_val <= 0:
+                continue
+                
+            sig_date = datetime.strptime(sig_date_str, '%Y-%m-%d').date()
+            entry_start_date = sig_date + timedelta(days=1)
+            
+            if entry_start_date > today:
+                continue
 
-            for idx, item in enumerate(all_historical_trades):
-                if item.get('Stock_Name') == stock and (not item.get('Status') or item.get('Status') == 'OPEN'):
-                    if last_low <= sl_val and sl_val > 0:
-                        print(f"❌ {stock} StopLoss Hit!", flush=True)
-                        all_historical_trades[idx]['Status'] = 'LOSS'
-                        all_historical_trades[idx]['Exit_Date'] = last_candle_date
-                        open_trades.pop(stock, None)
-                    elif last_high >= tgt_val and tgt_val > 0:
-                        print(f"🎉 {stock} Target Booked!", flush=True)
-                        all_historical_trades[idx]['Status'] = 'PROFIT'
-                        all_historical_trades[idx]['Exit_Date'] = last_candle_date
-                        open_trades.pop(stock, None)
+            df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=True)
+            if df.empty or len(df) < 2: 
+                continue
+            
+            df = build_indicators(df)
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+                
+            df_after_signal = df[df.index.date >= entry_start_date]
+            if df_after_signal.empty:
+                continue
+
+            trade_status = "OPEN"
+            exit_date_str = ""
+
+            for current_date, row in df_after_signal.iterrows():
+                day_low = float(row['Low'])
+                day_high = float(row['High'])
+                date_str = current_date.date().strftime('%Y-%m-%d')
+
+                if day_low <= sl_val and day_high >= tgt_val:
+                    trade_status = "LOSS"
+                    exit_date_str = date_str
                     break
+                elif day_low <= sl_val:
+                    trade_status = "LOSS"
+                    exit_date_str = date_str
+                    break
+                elif day_high >= tgt_val:
+                    trade_status = "PROFIT"
+                    exit_date_str = date_str
+                    break
+
+            if trade_status != "OPEN":
+                for idx, item in enumerate(all_historical_trades):
+                    if item.get('Stock_Name') == stock and (not item.get('Status') or item.get('Status') == 'OPEN') and item.get('Signal_Date') == sig_date_str:
+                        all_historical_trades[idx]['Status'] = trade_status
+                        all_historical_trades[idx]['Exit_Date'] = exit_date_str
+                        print(f"🎯 {stock} status updated to {trade_status} on {exit_date_str}", flush=True)
+                        open_trades.pop(stock, None)
+                        break
+                        
         except Exception as e:
-            print(f"Error checking active stock {stock}: {e}", flush=True)
+            print(f"Error tracking active stock {stock}: {e}", flush=True)
 
     # --- PHASE 3: FRESH BREAKOUT SCANNING ---
     print(f"\n[PHASE 3] Scanning {R['lookback_trading_days']}-day window with active Liquidity Checks...", flush=True)
@@ -308,7 +341,6 @@ def main():
                     row_sig = df.iloc[idx]
                     sig_date_str = df.index[idx].strftime('%Y-%m-%d')
                     
-                    # डुप्लिकेट चेक
                     already_exists = any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades)
                     if already_exists: continue
 
@@ -358,10 +390,7 @@ def main():
         
         if live_signals_pool:
             df_sig = pd.DataFrame(live_signals_pool)
-            
-            # 🎯 क्रोनोलॉजिकल सॉर्टिंग गार्ड: सबसे ताज़ा तारीख के सिग्नल्स सबसे ऊपर आएंगे!
             df_sig = df_sig.sort_values(by='Signal_Date', ascending=False)
-            
             df_sig = df_sig.reindex(columns=signal_headers).fillna("")
             df_sig = df_sig.astype(object)
             ws_signals.update('A1', [signal_headers] + df_sig.values.tolist())
@@ -377,4 +406,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+            
