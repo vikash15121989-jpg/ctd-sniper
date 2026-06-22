@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== STATEFUL TRADING ENGINE V17.2: CHRONOLOGICAL SIGNAL SORTING ===", flush=True)
+print("=== STATEFUL TRADING ENGINE V17.4: DUAL-SHEET SEPARATION ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -25,10 +25,10 @@ R = {
     'target_pct': 0.12,
     'sl_loss_pct': 0.05,
     'lookback_trading_days': 10,
-    'min_wr_for_vip': 0.50,       # 50% Win Rate (4 में से 2 बार विन)
-    'vip_min_trades': 4,          # मिनिमम 4 बार एंट्री मिलना ज़रूरी है
-    'min_avg_volume': 500000,     # 20-डे एवरेज वॉल्यूम कम से कम 5 लाख शेयर्स
-    'min_daily_turnover': 30000000, # 20-डे एवरेज टर्नओवर कम से कम ₹3 करोड़
+    'min_wr_for_vip': 0.50,       
+    'vip_min_trades': 4,          
+    'min_avg_volume': 500000,     
+    'min_daily_turnover': 30000000, 
     'max_workers': 15
 }
 
@@ -318,18 +318,19 @@ def main():
         except Exception as e:
             print(f"Error tracking active stock {stock}: {e}", flush=True)
 
-    # --- PHASE 3: FRESH BREAKOUT SCANNING ---
-    print(f"\n[PHASE 3] Scanning {R['lookback_trading_days']}-day window with active Liquidity Checks...", flush=True)
+    # --- PHASE 3: FRESH BREAKOUT SCANNING (10 DAYS LOOKBACK) ---
+    print(f"\n[PHASE 3] Scanning {R['lookback_trading_days']}-day window...", flush=True)
     live_signals_pool = []
 
     for stock in vip_stocks:
-        if stock in open_trades: continue
-
         try:
             df = yf.download(f"{stock}.NS", period="1y", progress=False, auto_adjust=True)
             if df.empty or len(df) < 35: continue
             df = build_indicators(df)
             total_rows = len(df)
+            
+            # Aaj yaani sabse aakhiri trading day ki date nikal lo
+            last_trading_date_str = df.index[-1].strftime('%Y-%m-%d')
             start_idx = max(21, total_rows - R['lookback_trading_days'])
 
             for idx in range(start_idx, total_rows):
@@ -341,6 +342,7 @@ def main():
                     row_sig = df.iloc[idx]
                     sig_date_str = df.index[idx].strftime('%Y-%m-%d')
                     
+                    # Duplicate Guard: Agar yeh exact stock + signal_date pehle se saved hai toh aage badho
                     already_exists = any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades)
                     if already_exists: continue
 
@@ -348,11 +350,14 @@ def main():
                     sl = round(ep * (1 - R['sl_loss_pct']), 2)
                     tgt = round(ep * (1 + R['target_pct']), 2)
 
-                    live_signals_pool.append({
-                        'Stock_Name': stock, 'Signal_Date': sig_date_str,
-                        'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
-                    })
+                    # 🎯 RULE 1: NEW_SIGNALS_TODAY mein sirf AAJ (Last Trading Day) ka taza signal jayega
+                    if sig_date_str == last_trading_date_str:
+                        live_signals_pool.append({
+                            'Stock_Name': stock, 'Signal_Date': sig_date_str,
+                            'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
+                        })
 
+                    # 🎯 RULE 2: ACTIVE_TRADES mein pichle saare 10 din ka master data safe rahega
                     all_historical_trades.append({
                         'Stock_Name': stock, 'Signal_Date': sig_date_str,
                         'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
@@ -364,46 +369,50 @@ def main():
 
     # DEBUG SUMMARY PRINT
     print("\n" + "="*60, flush=True)
-    print("DEBUG SUMMARY V17.2", flush=True)
+    print("DEBUG SUMMARY V17.4", flush=True)
     print("="*60, flush=True)
     for k, v in DEBUG.items():
         print(f"{k}: {v}", flush=True)
     print("="*60, flush=True)
 
-    # --- PHASE 4: GLOBAL SYNC ---
+    # --- PHASE 4: GLOBAL SYNC WITH CHRONOLOGICAL SORTING ---
     try:
-        # 1. Master Tracker Sync (ACTIVE_TRADES)
+        # 1. Master Tracker Sync (ACTIVE_TRADES) - Pichle 10 dino ka poora sorted data
         ws_active.clear()
         master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status']
         if all_historical_trades:
             df_master = pd.DataFrame(all_historical_trades)
+            
+            # 🎯 RECENT DATE UPAR: Isko date ke mutabik descending sort kiya taaki naya trade hamesha sabse upar rahe
+            df_master['Signal_Date_DT'] = pd.to_datetime(df_master['Signal_Date'])
+            df_master = df_master.sort_values(by='Signal_Date_DT', ascending=False).drop(columns=['Signal_Date_DT'])
+            
             df_master = df_master.reindex(columns=master_headers).fillna("")
             df_master = df_master.astype(object)
             ws_active.update('A1', [master_headers] + df_master.values.tolist())
+            print("📊 Unified Active Sheet Synced (Recent Dates on Top).", flush=True)
         else:
             ws_active.update('A1', [master_headers])
-        print("📊 Unified Active Sheet Synced.", flush=True)
 
-        # 2. Daily Signals Dashboard Sync (NEW_SIGNALS_TODAY)
+        # 2. Daily Signals Dashboard Sync (NEW_SIGNALS_TODAY) - Sirf Aaj ke pure fresh signals
         ws_signals.clear()
         signal_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
         
         if live_signals_pool:
             df_sig = pd.DataFrame(live_signals_pool)
-            df_sig = df_sig.sort_values(by='Signal_Date', ascending=False)
             df_sig = df_sig.reindex(columns=signal_headers).fillna("")
             df_sig = df_sig.astype(object)
             ws_signals.update('A1', [signal_headers] + df_sig.values.tolist())
-            print(f"🚀 SUCCESS! {len(df_sig)} High-Liquidity Signals uploaded in perfect chronological order.", flush=True)
+            print(f"🚀 SUCCESS! {len(df_sig)} Pure Fresh Signals uploaded to NEW_SIGNALS_TODAY.", flush=True)
         else:
-            ws_signals.update('A1', [signal_headers] + [["No new signals", "", "", "", ""]])
-            print("⚠️ No high-liquidity signals found today.", flush=True)
+            ws_signals.update('A1', [signal_headers] + [["No new signals today", "", "", "", ""]])
+            print("⚠️ No fresh signals found for the last trading day.", flush=True)
 
     except Exception as e:
         print(f"❌ Sheet Sync Error: {str(e)}", flush=True)
 
-    print(f"\n=== V17.2 EXECUTION COMPLETE ===", flush=True)
+    print(f"\n=== V17.4 EXECUTION COMPLETE ===", flush=True)
 
 if __name__ == "__main__":
     main()
-            
+    
