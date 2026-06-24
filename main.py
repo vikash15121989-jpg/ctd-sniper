@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V18.6: MAX-BASED STATUS + PCT ===", flush=True)
+print("=== V18.7: MAX-BASED + NO LOCK ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -91,16 +91,18 @@ def find_first_breakout(df, start_idx, end_idx):
 def main():
     today = datetime.now().date()
 
-    # PHASE 1: VIP LOAD
+    # PHASE 1: VIP LOAD - 🎯 AB HAR RUN PE LOAD HOGA, LOCK KHATAM
     vip_stocks = []
     try:
         all_vip_data = ws_filter.get_all_values()
-        if len(all_vip_data) > 1 and all_vip_data[0][0].startswith("LOCK_UNTIL:"):
-            lock_date = datetime.strptime(all_vip_data[0][0].split(":")[1].strip(), '%Y-%m-%d').date()
-            if today <= lock_date:
-                vip_stocks = [row[0] for row in all_vip_data[2:] if row[0]]
-    except: pass
-    print(f"🎯 VIP Stocks: {len(vip_stocks)}", flush=True)
+        # Lock check hata diya. Direct stocks uthao
+        if len(all_vip_data) > 1:
+            # Row 1 me "LOCK_UNTIL" ho ya na ho, ignore karo
+            start_row = 2 if all_vip_data[0][0].startswith("LOCK_UNTIL:") else 1
+            vip_stocks = [row[0] for row in all_vip_data[start_row:] if row[0]]
+    except Exception as e:
+        print(f"VIP Load Error: {e}", flush=True)
+    print(f"🎯 VIP Stocks: {len(vip_stocks)} - Loaded Fresh Every Run", flush=True)
 
     # PHASE 2: FULL REBUILD WITH MAX/MIN LOGIC
     print("\n[PHASE 2] Rebuilding with MAX-based PCT...", flush=True)
@@ -125,13 +127,13 @@ def main():
 
     all_historical_trades = []
 
-    # 🎯 CORE LOGIC: MAX/MIN BASED
+    # CORE LOGIC: MAX/MIN BASED
     for stock, trade in temp_trades.items():
         try:
             sig_date_str = trade.get('Signal_Date')
             entry_val = safe_float(trade.get('Entry_Price'))
             sl_val = safe_float(trade.get('StopLoss_Price'))
-            tgt_val = entry_val * (1 + R['target_pct']) # 12%
+            tgt_val = entry_val * (1 + R['target_pct'])
             sig_date = datetime.strptime(sig_date_str, '%Y-%m-%d').date()
             entry_start_date = sig_date + timedelta(days=1)
 
@@ -157,14 +159,12 @@ def main():
 
             max_high = float(df_after_signal['High'].max())
             min_low = float(df_after_signal['Low'].min())
-
-            # 🎯 PCT_FROM_ENTRY = MAX se % change, na ki current close se
             max_pct_from_entry = round(((max_high - entry_val) / entry_val) * 100, 2)
             trade['PCT_FROM_ENTRY'] = max_pct_from_entry
 
             print(f"{stock}: Entry={entry_val}, MAX={max_high} ({max_pct_from_entry}%), MIN={min_low}", flush=True)
 
-            # 🎯 STATUS LOGIC - MAX aur MIN se
+            # STATUS LOGIC
             if max_high >= tgt_val:
                 trade['Status'] = "PROFIT"
                 trade['Exit_Date'] = df_after_signal[df_after_signal['High'] >= tgt_val].index[0].date().strftime('%Y-%m-%d')
@@ -174,15 +174,13 @@ def main():
                 trade['Exit_Date'] = df_after_signal[df_after_signal['Low'] <= sl_val].index[0].date().strftime('%Y-%m-%d')
 
             else:
-                # Na profit, na loss - ab MAX ka % dekho
-                if max_pct_from_entry < (R['trailing_min_pct'] * 100): # < 5%
+                if max_pct_from_entry < (R['trailing_min_pct'] * 100):
                     trade['Status'] = "OPEN"
-                elif max_pct_from_entry < (R['target_pct'] * 100): # 5% to 12%
+                elif max_pct_from_entry < (R['target_pct'] * 100):
                     trade['Status'] = "TRAILING"
                 else:
-                    trade['Status'] = "PROFIT" # Safety - 12% cross ho gaya
+                    trade['Status'] = "PROFIT"
 
-                # Timeout check
                 if (today - sig_date).days >= R['max_hold_days']:
                     trade['Status'] = "TIMEOUT"
                     trade['Exit_Date'] = today.strftime('%Y-%m-%d')
@@ -255,7 +253,7 @@ def main():
     except Exception as e:
         print(f"❌ Sheet Error: {e}", flush=True)
 
-    print(f"\n=== V18.6 COMPLETE ===", flush=True)
+    print(f"\n=== V18.7 COMPLETE ===", flush=True)
 
 if __name__ == "__main__":
     main()
