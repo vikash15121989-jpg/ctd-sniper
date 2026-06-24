@@ -4,11 +4,12 @@ import numpy as np
 import gspread
 import json
 import os
+import time  # <-- FIX 1: time module import kiya
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V18.6: MAX-BASED STATUS + PCT ===", flush=True)
+print("=== V21: Watchlist + 10D PA + 2Y Backtest + Tradable Filter ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -17,245 +18,280 @@ gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 
 R = {
+    'lookback_days': 10,
     'min_price': 60,
-    'max_hold_days': 30,
-    'target_pct': 0.12, # 12%
-    'sl_loss_pct': 0.05, # 5%
-    'lookback_trading_days': 10,
-    'min_wr_for_vip': 0.50,
-    'vip_min_trades': 4,
     'min_avg_volume': 500000,
-    'min_daily_turnover': 30000000,
-    'trailing_min_pct': 0.05, # 5%
-    'trailing_max_pct': 0.12 # 12%
+    'min_daily_turnover': 3e7,
+    'swing_window': 5,
+    'base_range_max': 7.0,
+    'volume_multiplier': 1.8,
+    'candle_close_pos': 0.7,
+    'candle_body_pct': 0.6,
+    'min_winrate': 50.0,
+    'min_trades_bt': 5,
+    'rr_ratio': 2.0,
+    'max_hold_days': 15,
+    'sl_loss_pct': 0.05,
+    'target_pct': 0.12
 }
 
-def get_or_create_ws(sh, title, rows=1000, cols=15):
+def get_or_create_ws(sh, title, rows=2000, cols=20):
     try:
         return sh.worksheet(title)
     except:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
-ws_filter = get_or_create_ws(sh, "HIGH_WINRATE_STOCKS")
-ws_signals = get_or_create_ws(sh, "NEW_SIGNALS_TODAY")
-ws_active = get_or_create_ws(sh, "ACTIVE_TRADES")
+ws_watchlist = get_or_create_ws(sh, "Watchlist")
+ws_candidates = get_or_create_ws(sh, "PA_10D_CANDIDATES")
+ws_backtest = get_or_create_ws(sh, "PA_HIST_BACKTEST")
+ws_tradable = get_or_create_ws(sh, "TRADABLE_STOCKS")
 
-def safe_float(val, default=0.0):
+# ===== 2. WATCHLIST SE STOCK UTHAO =====
+def get_watchlist_stocks():
     try:
-        if val == '' or val is None: return default
-        return float(str(val).replace(',', '').strip())
-    except:
-        return default
+        stocks = ws_watchlist.col_values(1)
+        stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ['STOCK', 'SYMBOL', 'NAME']]
+        stocks = [s + '.NS' if not s.endswith('.NS') else s for s in stocks]
 
-# ===== 2. INDICATORS =====
-def build_indicators(df):
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if len(df) < 35: return df
-    df['Breakout_High_20D'] = df['High'].shift(1).rolling(window=20).max()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        if not stocks:
+            print("Watchlist khali hai. Default 10 stocks le raha hu", flush=True)
+            return ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+                    "SBIN.NS", "BHARTIARTL.NS", "BAJFINANCE.NS", "KOTAKBANK.NS", "LT.NS"]
+
+        print(f"Watchlist se {len(stocks)} stocks mile", flush=True)
+        return stocks
+    except Exception as e:
+        print(f"Watchlist error: {e}. Default list use kar raha hu", flush=True)
+        return ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS"]
+
+# ===== 3. PRICE ACTION CORE =====
+def download_stock_data(ticker, start_date, end_date):
+    try:
+        df = yf.download(ticker, start=start_date, end=end_date + timedelta(days=1),
+                         progress=False, auto_adjust=False, timeout=10)
+        if df.empty or len(df) < 60: return None
+        
+        # FIX 3: MultiIndex and Column Flattening safety
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # Ensure 1D structure for columns
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+                
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
+        return df
+    except:
+        return None
+
+def find_swing_points(df):
+    w = R['swing_window']
+    # shift(-w) की वजह से आखिरी w कैंडल का स्विंग हाई कभी कैलकुलेट नहीं होगा (यह नॉर्मल बिहेवियर है)
+    df['Swing_High'] = df['High'][(df['High'].shift(w) < df['High']) &
+                                  (df['High'].shift(-w) < df['High'])]
     df['Vol_20MA'] = df['Volume'].shift(1).rolling(window=20).mean()
-    df['Vol_Multiple'] = df['Volume'] / (df['Vol_20MA'] + 1e-5)
-    df['Turnover'] = df['Close'] * df['Volume']
-    df['Turnover_20MA'] = df['Turnover'].shift(1).rolling(window=20).mean()
     return df
 
-def check_liquidity(df, idx):
-    if idx < 20 or len(df) <= idx: return False
+def is_pure_price_action_signal(df, idx):
+    if idx < 50: return False, "Not enough data", None
     row = df.iloc[idx]
-    avg_vol, avg_turnover = row['Vol_20MA'], row['Turnover_20MA']
-    if pd.isna(avg_vol) or pd.isna(avg_turnover): return False
-    return avg_vol >= R['min_avg_volume'] and avg_turnover >= R['min_daily_turnover']
+    prev_row = df.iloc[idx-1]
 
-def find_first_breakout(df, start_idx, end_idx):
-    for idx in range(start_idx, end_idx):
-        if idx < 1: continue
-        row, row_prev = df.iloc[idx], df.iloc[idx-1]
-        if pd.isna(row['EMA_50']) or pd.isna(row['Breakout_High_20D']) or pd.isna(row['Vol_Multiple']):
-            continue
-        if not check_liquidity(df, idx): continue
-        if row['Close'] < row['EMA_50']: continue
-        breakout_level = row['Breakout_High_20D']
-        fresh_breakout = (row['Close'] > breakout_level) and (row_prev['Close'] <= breakout_level)
-        good_volume = row['Vol_Multiple'] > 1.2
-        is_green = row['Close'] > row['Open']
-        if fresh_breakout and good_volume and is_green:
-            return idx, breakout_level
-    return None, None
+    # RULE 1: MARKET STRUCTURE - Higher High
+    # स्विंग हाई देखने के लिए हमें ब्रेकआउट वाले दिन (idx) से पहले का डेटा देखना चाहिए
+    historical_swings = df['Swing_High'].iloc[:idx].dropna().tail(3)
+    if len(historical_swings) < 2: return False, "No HH", None
+    if historical_swings.iloc[-1] <= historical_swings.iloc[-2]: return False, "Not HH", None
 
-# ===== 3. MAIN =====
+    # RULE 2: CONSOLIDATION - 10 din tight base
+    base_df = df.iloc[idx-10:idx]
+    base_high = base_df['High'].max()
+    base_low = base_df['Low'].min()
+    base_range_pct = (base_high - base_low) / base_low * 100
+    if base_range_pct > R['base_range_max']: return False, f"Range {base_range_pct:.1f}%", None
+
+    # RULE 3: BREAKOUT QUALITY
+    vol_20ma = row['Vol_20MA']
+    if pd.isna(vol_20ma): return False, "No Vol MA", None
+    cond_breakout = row['Close'] > base_high and prev_row['Close'] <= base_high
+    cond_volume = row['Volume'] > vol_20ma * R['volume_multiplier']
+
+    candle_range = row['High'] - row['Low']
+    if candle_range == 0: return False, "Doji", None
+    close_pos = (row['Close'] - row['Low']) / candle_range
+    body_pct = abs(row['Close'] - row['Open']) / candle_range
+    cond_candle = close_pos > R['candle_close_pos'] and body_pct > R['candle_body_pct']
+
+    if not cond_breakout: return False, "No breakout", None
+    if not cond_volume: return False, "Low volume", None
+    if not cond_candle: return False, "Weak candle", None
+
+    entry = row['Close']
+    sl = base_low
+    target = entry + R['rr_ratio'] * (entry - sl)
+    signal_data = {'Entry': round(entry, 2), 'SL': round(sl, 2), 'Target': round(target, 2)}
+
+    return True, f"HH+{base_range_pct:.1f}%Base", signal_data
+
+# ===== 4. PHASE 1: 10D CANDIDATES =====
+def scan_10d_pa_candidates(universe, end_date):
+    candidates = []
+    start_date = end_date - timedelta(days=R['lookback_days'] + 100)
+
+    for i, stock in enumerate(universe):
+        print(f"Scanning {i+1}/{len(universe)}: {stock}", flush=True)
+        df = download_stock_data(stock, start_date, end_date)
+        if df is None: continue
+
+        avg_vol = df['Volume'].tail(20).mean()
+        avg_turnover = (df['Close'] * df['Volume']).tail(20).mean()
+        if avg_vol < R['min_avg_volume'] or avg_turnover < R['min_daily_turnover']: continue
+        if df['Close'].iloc[-1] < R['min_price']: continue
+
+        df = find_swing_points(df)
+        scan_start = max(50, len(df) - R['lookback_days'])
+
+        for idx in range(scan_start, len(df)):
+            is_signal, reason, signal_data = is_pure_price_action_signal(df, idx)
+            if is_signal:
+                candidates.append({
+                    'Stock': stock.replace('.NS', ''),
+                    'Signal_Date': df.index[idx].date().strftime('%Y-%m-%d'),
+                    'Close': signal_data['Entry'],
+                    'SL': signal_data['SL'],          # <-- FIX 2: SL/Target यहीं सेव कर लिया
+                    'Target': signal_data['Target'],  # ताकि Phase 3 में री-कैलकुलेट न करना पड़े
+                    'Volume': int(df['Volume'].iloc[idx]),
+                    'Reason': reason
+                })
+                break
+        time.sleep(0.1)
+
+    return pd.DataFrame(candidates)
+
+# ===== 5. PHASE 2: 2 YEAR BACKTEST =====
+def backtest_pa_stock(stock, end_date):
+    df = download_stock_data(f"{stock}.NS", end_date - timedelta(days=730), end_date)
+    if df is None: return None
+
+    df = find_swing_points(df)
+    trades = []
+    in_trade = False
+    entry = sl = tp = 0
+    entry_idx = 0
+
+    # Backtest loop avoids running into last few days improperly
+    for i in range(50, len(df) - R['max_hold_days']):
+        if not in_trade:
+            is_signal, _, signal_data = is_pure_price_action_signal(df, i)
+            if is_signal:
+                entry = signal_data['Entry']
+                sl = signal_data['SL']
+                tp = signal_data['Target']
+                if entry <= sl: continue
+                in_trade = True
+                entry_idx = i
+        else:
+            row = df.iloc[i]
+            if row['Low'] <= sl:
+                trades.append(-1); in_trade = False
+            elif row['High'] >= tp:
+                trades.append(1); in_trade = False
+            elif i - entry_idx >= R['max_hold_days']:
+                pnl = (row['Close'] - entry) / entry * 100
+                trades.append(1 if pnl > 0 else -1); in_trade = False
+
+    if len(trades) < R['min_trades_bt']: return None
+
+    wins = sum(1 for t in trades if t > 0)
+    winrate = wins / len(trades) * 100
+    pf = wins / (len(trades) - wins) if len(trades) - wins > 0 else 99
+
+    return {
+        'Stock': stock,
+        'Total_Trades': len(trades),
+        'Wins': wins,
+        'Losses': len(trades) - wins,
+        'WinRate': round(winrate, 2),
+        'Profit_Factor': round(pf, 2)
+    }
+
+# ===== 6. MAIN V21 =====
 def main():
     today = datetime.now().date()
+    print(f"\n=== V21 PA Scanner {today} ===", flush=True)
 
-    # PHASE 1: VIP LOAD
-    vip_stocks = []
-    try:
-        all_vip_data = ws_filter.get_all_values()
-        if len(all_vip_data) > 1 and all_vip_data[0][0].startswith("LOCK_UNTIL:"):
-            lock_date = datetime.strptime(all_vip_data[0][0].split(":")[1].strip(), '%Y-%m-%d').date()
-            if today <= lock_date:
-                vip_stocks = [row[0] for row in all_vip_data[2:] if row[0]]
-    except: pass
-    print(f"🎯 VIP Stocks: {len(vip_stocks)}", flush=True)
+    stock_universe = get_watchlist_stocks()
 
-    # PHASE 2: FULL REBUILD WITH MAX/MIN LOGIC
-    print("\n[PHASE 2] Rebuilding with MAX-based PCT...", flush=True)
-    try:
-        master_rows = ws_active.get_all_records()
-    except:
-        master_rows = []
+    # PHASE 1
+    print("\nPHASE 1: Scanning last 10 days PA...", flush=True)
+    candidates_df = scan_10d_pa_candidates(stock_universe, today)
+    if candidates_df.empty:
+        print("No PA candidates found in last 10 days")
+        ws_candidates.clear()
+        ws_candidates.update('A1', [['Stock', 'Signal_Date', 'Close', 'Reason'], ['No signals', '', '', '']])
+        ws_backtest.clear()
+        ws_tradable.clear()
+        return
+    
+    # Save clean copy for Sheet
+    sheet_candidates = candidates_df[['Stock', 'Signal_Date', 'Close', 'Volume', 'Reason']]
+    ws_candidates.clear()
+    ws_candidates.update('A1', [sheet_candidates.columns.tolist()] + sheet_candidates.values.tolist())
 
-    # Latest signal per stock
-    temp_trades = {}
-    for trade in master_rows:
-        stock = trade.get('Stock_Name')
-        sig_date = trade.get('Signal_Date')
-        if not stock or not sig_date: continue
-        if stock not in temp_trades:
-            temp_trades[stock] = trade
-        else:
-            old_date = datetime.strptime(temp_trades[stock]['Signal_Date'], '%Y-%m-%d').date()
-            new_date = datetime.strptime(sig_date, '%Y-%m-%d').date()
-            if new_date > old_date:
-                temp_trades[stock] = trade
+    # PHASE 2
+    print(f"\nPHASE 2: Backtesting {len(candidates_df)} candidates for 2 years...", flush=True)
+    backtest_results = []
+    for idx, stock in enumerate(candidates_df['Stock'].unique()):
+        print(f"Backtesting {idx+1}/{len(candidates_df['Stock'].unique())}: {stock}", flush=True)
+        result = backtest_pa_stock(stock, today)
+        if result: backtest_results.append(result)
+        time.sleep(0.2)
 
-    all_historical_trades = []
+    if not backtest_results:
+        print("No backtest results")
+        ws_backtest.clear()
+        ws_tradable.clear()
+        return
 
-    # 🎯 CORE LOGIC: MAX/MIN BASED
-    for stock, trade in temp_trades.items():
-        try:
-            sig_date_str = trade.get('Signal_Date')
-            entry_val = safe_float(trade.get('Entry_Price'))
-            sl_val = safe_float(trade.get('StopLoss_Price'))
-            tgt_val = entry_val * (1 + R['target_pct']) # 12%
-            sig_date = datetime.strptime(sig_date_str, '%Y-%m-%d').date()
-            entry_start_date = sig_date + timedelta(days=1)
+    backtest_df = pd.DataFrame(backtest_results)
+    ws_backtest.clear()
+    ws_backtest.update('A1', [backtest_df.columns.tolist()] + backtest_df.values.tolist())
 
-            if entry_start_date > today:
-                trade['Status'] = 'OPEN'
-                trade['PCT_FROM_ENTRY'] = 0.0
-                all_historical_trades.append(trade)
-                continue
+    # PHASE 3: FIX 2 - Re-scanning hata kar seedhe candidates_df se merge kiya
+    tradable = backtest_df[backtest_df['WinRate'] >= R['min_winrate']].copy()
+    print(f"\nPHASE 3: {len(tradable)} stocks with WR >= {R['min_winrate']}%", flush=True)
 
-            df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=False, end=today + timedelta(days=1))
-            if df.empty:
-                trade['Status'] = 'OPEN'
-                trade['PCT_FROM_ENTRY'] = 0.0
-                all_historical_trades.append(trade)
-                continue
+    tradable_final = []
+    for _, row in tradable.iterrows():
+        stock_name = row['Stock']
+        # Find entry/SL details from Phase 1 data directly
+        match = candidates_df[candidates_df['Stock'] == stock_name].iloc[-1]
+        
+        tradable_final.append({
+            'Breakout_Date': match['Signal_Date'],
+            'Stock': stock_name,
+            'Entry_Price': match['Close'],
+            'StopLoss_Price': match['SL'],
+            'Target_Price': match['Target'],
+            'Backtest_WR': row['WinRate'],
+            'Total_Trades': row['Total_Trades']
+        })
 
-            df_after_signal = df[df.index.date >= entry_start_date]
-            if df_after_signal.empty:
-                trade['Status'] = 'OPEN'
-                trade['PCT_FROM_ENTRY'] = 0.0
-                all_historical_trades.append(trade)
-                continue
+    tradable_df = pd.DataFrame(tradable_final)
+    ws_tradable.clear()
+    if tradable_df.empty:
+        ws_tradable.update('A1', [['Breakout_Date', 'Stock', 'Entry_Price', 'StopLoss_Price', 'Target_Price', 'Backtest_WR', 'Total_Trades'],
+                                  ['No tradable', '', '', '', '', '', '']])
+    else:
+        ws_tradable.update('A1', [tradable_df.columns.tolist()] + tradable_df.values.tolist())
 
-            max_high = float(df_after_signal['High'].max())
-            min_low = float(df_after_signal['Low'].min())
-
-            # 🎯 PCT_FROM_ENTRY = MAX se % change, na ki current close se
-            max_pct_from_entry = round(((max_high - entry_val) / entry_val) * 100, 2)
-            trade['PCT_FROM_ENTRY'] = max_pct_from_entry
-
-            print(f"{stock}: Entry={entry_val}, MAX={max_high} ({max_pct_from_entry}%), MIN={min_low}", flush=True)
-
-            # 🎯 STATUS LOGIC - MAX aur MIN se
-            if max_high >= tgt_val:
-                trade['Status'] = "PROFIT"
-                trade['Exit_Date'] = df_after_signal[df_after_signal['High'] >= tgt_val].index[0].date().strftime('%Y-%m-%d')
-
-            elif min_low <= sl_val:
-                trade['Status'] = "LOSS"
-                trade['Exit_Date'] = df_after_signal[df_after_signal['Low'] <= sl_val].index[0].date().strftime('%Y-%m-%d')
-
-            else:
-                # Na profit, na loss - ab MAX ka % dekho
-                if max_pct_from_entry < (R['trailing_min_pct'] * 100): # < 5%
-                    trade['Status'] = "OPEN"
-                elif max_pct_from_entry < (R['target_pct'] * 100): # 5% to 12%
-                    trade['Status'] = "TRAILING"
-                else:
-                    trade['Status'] = "PROFIT" # Safety - 12% cross ho gaya
-
-                # Timeout check
-                if (today - sig_date).days >= R['max_hold_days']:
-                    trade['Status'] = "TIMEOUT"
-                    trade['Exit_Date'] = today.strftime('%Y-%m-%d')
-                else:
-                    trade['Exit_Date'] = ''
-
-            all_historical_trades.append(trade)
-
-        except Exception as e:
-            print(f"Error processing {stock}: {e}", flush=True)
-            trade['Status'] = 'OPEN'
-            trade['PCT_FROM_ENTRY'] = 0.0
-            all_historical_trades.append(trade)
-
-    # PHASE 3: FIRST BREAKOUT SCAN
-    print(f"\n[PHASE 3] Scanning for FIRST breakout...", flush=True)
-    live_signals_pool = []
-    open_trade_stocks = {r['Stock_Name'] for r in all_historical_trades if r.get('Status') in ['OPEN', 'TRAILING']}
-
-    for stock in vip_stocks:
-        if stock in open_trade_stocks: continue
-        try:
-            df = yf.download(f"{stock}.NS", period="2y", progress=False, auto_adjust=False)
-            if df.empty or len(df) < 35: continue
-            df = build_indicators(df)
-            total_rows = len(df)
-            last_trading_date_str = df.index[-1].strftime('%Y-%m-%d')
-            start_idx = max(21, total_rows - R['lookback_trading_days'])
-            breakout_idx, breakout_level = find_first_breakout(df, start_idx, total_rows)
-
-            if breakout_idx is not None:
-                row_sig = df.iloc[breakout_idx]
-                sig_date_str = df.index[breakout_idx].strftime('%Y-%m-%d')
-                if any(h.get('Stock_Name') == stock and h.get('Signal_Date') == sig_date_str for h in all_historical_trades):
-                    continue
-                ep = round(float(row_sig['Close']), 2)
-                sl = round(ep * (1 - R['sl_loss_pct']), 2)
-                tgt = round(ep * (1 + R['target_pct']), 2)
-                if sig_date_str == last_trading_date_str:
-                    live_signals_pool.append({
-                        'Stock_Name': stock, 'Signal_Date': sig_date_str,
-                        'Entry_Price': ep, 'StopLoss_Price': sl, 'Target_Price': tgt
-                    })
-                all_historical_trades.append({
-                    'Stock_Name': stock, 'Signal_Date': sig_date_str,
-                    'Entry_Price': ep, 'Target_Price': tgt, 'StopLoss_Price': sl,
-                    'Exit_Date': '', 'Status': 'OPEN', 'PCT_FROM_ENTRY': 0.0
-                })
-        except: continue
-
-    # PHASE 4: SYNC
-    try:
-        ws_active.clear()
-        master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status', 'PCT_FROM_ENTRY']
-        if all_historical_trades:
-            df_master = pd.DataFrame(all_historical_trades)
-            df_master['Signal_Date_DT'] = pd.to_datetime(df_master['Signal_Date'])
-            df_master = df_master.sort_values(by='Signal_Date_DT', ascending=False).drop(columns=['Signal_Date_DT'])
-            df_master = df_master.reindex(columns=master_headers).fillna("")
-            ws_active.update('A1', [master_headers] + df_master.values.tolist())
-
-        ws_signals.clear()
-        signal_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
-        if live_signals_pool:
-            df_sig = pd.DataFrame(live_signals_pool)
-            ws_signals.update('A1', [signal_headers] + df_sig.values.tolist())
-            print(f"🚀 {len(df_sig)} Fresh Signals", flush=True)
-        else:
-            ws_signals.update('A1', [signal_headers] + [["No new signals today", "", "", "", ""]])
-    except Exception as e:
-        print(f"❌ Sheet Error: {e}", flush=True)
-
-    print(f"\n=== V18.6 COMPLETE ===", flush=True)
+    print(f"\n=== V21 COMPLETE: {len(tradable_df)} Tradable Stocks ===", flush=True)
 
 if __name__ == "__main__":
     main()
+    
