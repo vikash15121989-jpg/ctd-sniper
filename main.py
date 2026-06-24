@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V19.3: CASE-INSENSITIVE BATCH-BASED SCANNER ===", flush=True)
+print("=== V19.4: FIXED SYNTAX ERROR SCANNER ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== 1. CONFIG =====
@@ -17,7 +17,6 @@ gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 
-# ⚠️ Aapki sheet me agar "Watchlist" ya "watchlist" kuch bhi likha ho, yeh handle kar lega
 WATCHLIST_SHEET_NAME = "watchlist" 
 
 R = {
@@ -34,18 +33,14 @@ R = {
     'trailing_max_pct': 0.12
 }
 
-# 🛠️ FIXED: Case-Insensitive Worksheet Matcher
 def get_or_create_ws(sh, title, rows=1000, cols=15):
     try:
-        # Saari available sheets check karein bina choti-badi abc ke bhedbhav ke
         for ws in sh.worksheets():
             if ws.title.strip().lower() == title.strip().lower():
                 return ws
-        # Agar bilkul nahi milti tabhi nayi sheet banayein
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
     except Exception as e:
         print(f"⚠️ Error in get_or_create_ws for {title}: {e}", flush=True)
-        # Fallback to standard approach
         try:
             return sh.worksheet(title)
         except:
@@ -156,7 +151,6 @@ def main():
     active_trades_pool = []
     live_signals_today = []
     
-    # 50-50 Ke Batches
     batch_size = 50
     ticker_batches = [all_tickers[i:i + batch_size] for i in range(0, len(all_tickers), batch_size)]
     
@@ -184,7 +178,6 @@ def main():
                 df = build_indicators(df)
                 win_rate, total_trades, breakout_indices = backtest_stock_winrate(df)
                 
-                # Filter: Win Rate > 50%
                 if total_trades >= R['vip_min_trades'] and win_rate >= R['min_wr_for_vip']:
                     vip_stocks_data.append([ticker, f"{round(win_rate * 100, 2)}%", total_trades])
                     
@@ -202,14 +195,12 @@ def main():
                     
                     df_after_signal = df.iloc[last_breakout_idx + 1:]
                     
-                    # 1. LIVE SIGNAL TODAY (Aaj action, kal entry)
                     if last_breakout_idx == last_trading_idx:
                         live_signals_today.append({
                             'Stock_Name': ticker, 'Signal_Date': sig_date.strftime('%Y-%m-%d'),
                             'Entry_Price': entry_price, 'StopLoss_Price': sl_price, 'Target_Price': tgt_price
                         })
                     
-                    # 2. ACTIVE TRADES (Pichle 10 trading dino ke andar price action hua hai)
                     if trading_days_since_breakout <= R['lookback_trading_days'] and last_breakout_idx != last_trading_idx:
                         if df_after_signal.empty: continue
                         
@@ -253,7 +244,6 @@ def main():
     # ===== PHASE 4: GOOGLE SHEETS SYNC =====
     print("\n[PHASE 2] Syncing data back to Google Sheets...", flush=True)
     
-    # 1. HIGH_WINRATE_STOCKS Update
     try:
         ws_filter.clear()
         vip_headers = ['Stock_Name', 'Win_Rate', 'Total_Historical_Trades']
@@ -262,7 +252,6 @@ def main():
         print(f"🎯 VIP Sheet Updated: {len(vip_stocks_data)} Stocks", flush=True)
     except Exception as e: print(f"❌ Error updating VIP Sheet: {e}")
 
-    # 2. ACTIVE_TRADES Update
     try:
         ws_active.clear()
         master_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'Target_Price', 'StopLoss_Price', 'Exit_Date', 'Status', 'PCT_FROM_ENTRY']
@@ -272,11 +261,19 @@ def main():
         print(f"📈 Active Trades Sheet Updated: {len(active_trades_pool)} Stocks", flush=True)
     except Exception as e: print(f"❌ Error updating Active Sheet: {e}")
 
-    # 3. NEW_SIGNALS_TODAY Update
     try:
         ws_signals.clear()
         signal_headers = ['Stock_Name', 'Signal_Date', 'Entry_Price', 'StopLoss_Price', 'Target_Price']
         if live_signals_today:
             df_sig = pd.DataFrame(live_signals_today)
-            ws_signals.update
-            
+            ws_signals.update(values=[signal_headers] + df_sig.values.tolist(), range_name='A1')
+            print(f"🚀 {len(df_sig)} Fresh Signals Found for Tomorrow!", flush=True)
+        else:
+            ws_signals.update(values=[signal_headers] + [["No new signals today", "", "", "", ""]], range_name='A1')
+    except Exception as e: print(f"❌ Error updating Signals Sheet: {e}")
+
+    print(f"\n=== V19.4 COMPLETE ===", flush=True)
+
+if __name__ == "__main__":
+    main()
+        
