@@ -91,18 +91,16 @@ def find_first_breakout(df, start_idx, end_idx):
 def main():
     today = datetime.now().date()
 
-    # PHASE 1: VIP LOAD - 🎯 AB HAR RUN PE LOAD HOGA, LOCK KHATAM
+    # PHASE 1: VIP LOAD - 🎯 LOCK HATA DIYA
     vip_stocks = []
     try:
         all_vip_data = ws_filter.get_all_values()
-        # Lock check hata diya. Direct stocks uthao
         if len(all_vip_data) > 1:
-            # Row 1 me "LOCK_UNTIL" ho ya na ho, ignore karo
             start_row = 2 if all_vip_data[0][0].startswith("LOCK_UNTIL:") else 1
             vip_stocks = [row[0] for row in all_vip_data[start_row:] if row[0]]
     except Exception as e:
         print(f"VIP Load Error: {e}", flush=True)
-    print(f"🎯 VIP Stocks: {len(vip_stocks)} - Loaded Fresh Every Run", flush=True)
+    print(f"🎯 VIP Stocks: {len(vip_stocks)} - Fresh Load Every Run", flush=True)
 
     # PHASE 2: FULL REBUILD WITH MAX/MIN LOGIC
     print("\n[PHASE 2] Rebuilding with MAX-based PCT...", flush=True)
