@@ -9,184 +9,146 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V23.0 GHOST: WATCHLIST CHoCH SQUEEZE ===", flush=True)
+print("=== V29.0: 1 YEAR SCAN FROM 25/06/2026 ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
-# ===== CONFIG =====
+# ===== CONFIG - AAJ SE 1 SAAL PEECHE =====
+END_DATE = datetime(2026, 6, 25).date() # Aaj
+START_DATE = datetime(2025, 6, 25).date() # 1 saal peeche
+
 R = {
-    'backtest_start': '2025-01-01',
-    'backtest_end': '2026-06-24',
-    'batch_size': 20, # Rate limit se bachne ke liye
-    'ema_zone_pct': 0.03, # 20 EMA se ±3% me
-    'lookback_days': 10, # 10D High/Vol ke liye
-    'hold_days': 10, # Entry ke baad kitna move dekhe
-    'choch_window': 50, # CHoCH check karne ke liye 50D
+    'backtest_start': START_DATE,
+    'backtest_end': END_DATE,
+    'ema_zone_pct': 0.05,
+    'lookback_days': 10,
+    'hhhl_days': 20,
 }
 
-def get_or_create_ws(sh, title, rows=5000, cols=20):
-    try:
-        return sh.worksheet(title)
-    except:
-        return sh.add_worksheet(title=title, rows=rows, cols=cols)
-
-# ===== GSHEET SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
-ws_watchlist = get_or_create_ws(sh, "Watchlist")
-ws_output = get_or_create_ws(sh, "CHoCH_SQUEEZE_SIGNALS")
+ws_watchlist = sh.worksheet("Watchlist")
+ws_output = sh.worksheet("CHoCH_SQUEEZE_SIGNALS")
 
 def get_watchlist_stocks():
-    """Watchlist sheet se stock uthao"""
-    try:
-        stocks = ws_watchlist.col_values(1)
-        # Header aur khali hatao
-        stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ['STOCK', 'SYMBOL', 'NAME', 'TICKER']]
-        #.NS lagao agar nahi hai
-        stocks = [s + '.NS' if not s.endswith('.NS') and not s.startswith('^') else s for s in stocks]
-        print(f"Watchlist Loaded: {len(stocks)} stocks", flush=True)
-        if stocks:
-            print(f"First 5: {stocks[:5]}", flush=True)
-        return stocks if stocks else ["RELIANCE.NS", "TCS.NS"]
-    except Exception as e:
-        print(f"Watchlist error: {e}", flush=True)
-        return ["RELIANCE.NS", "TCS.NS"]
+    stocks = ws_watchlist.col_values(1)
+    stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ['STOCK', 'SYMBOL', 'NAME']]
+    stocks = [s + '.NS' if not s.endswith('.NS') and not s.startswith('^') else s for s in stocks]
+    print(f"Watchlist Loaded: {len(stocks)} stocks", flush=True)
+    return stocks
 
-def detect_choch_and_trend(df, idx):
+def check_valid_choch(df, idx):
     """
-    Check: 1. CHoCH hua hai 2. Ab HH-HL me hai
+    CHoCH Valid = Major Bottom ke baad Higher Low bana AUR CHoCH ke baad Major Bottom kabhi nahi toota
     """
-    if idx < R['choch_window']: return False
+    if idx < 100: return False, None
 
-    # PART 1: CHoCH - Downtrend se Uptrend flip
-    window = df.iloc[idx-R['choch_window']:idx+1]
-    mid = len(window) // 2
+    hist = df.iloc[:idx+1]
+    major_bottom_idx = hist['Low'].idxmin()
+    major_bottom_price = hist.loc[major_bottom_idx, 'Low']
 
-    # Pehle half: Downtrend tha?
-    first_lows = window['Low'].iloc[:mid]
-    first_highs = window['High'].iloc[:mid]
-    downtrend = first_lows.iloc[-1] < first_lows.iloc[0] and first_highs.iloc[-1] < first_highs.iloc[0]
+    if major_bottom_idx == hist.index[-1]: return False, None
 
-    # Second half: Uptrend bana?
-    second_lows = window['Low'].iloc[mid:]
-    second_highs = window['High'].iloc[mid:]
-    uptrend = second_lows.iloc[-1] > second_lows.iloc[0] and second_highs.iloc[-1] > second_highs.iloc[0]
+    # Major Lower High
+    pre_bottom = hist.loc[:major_bottom_idx]
+    if len(pre_bottom) < 10: return False, None
+    major_lower_high = pre_bottom['High'].max()
+    major_lower_high_idx = pre_bottom['High'].idxmax()
 
-    choch_done = downtrend and uptrend
-    if not choch_done: return False
+    # CHoCH hua?
+    post_lh = hist.loc[hist.index > major_lower_high_idx]
+    choch_candle = post_lh[post_lh['Close'] > major_lower_high]
+    if choch_candle.empty: return False, None
 
-    # PART 2: Abhi HH-HL hai? Last 10D
-    last_10 = df.iloc[idx-9:idx+1]
-    hh = last_10['High'].iloc[-1] > last_10['High'].iloc[0]
-    hl = last_10['Low'].iloc[-1] > last_10['Low'].iloc[0]
+    choch_date = choch_candle.index[0]
 
-    return hh and hl
+    # CHoCH ke baad Major Bottom toota? Agar toota to CHoCH fail
+    post_choch = hist.loc[hist.index > choch_date]
+    if post_choch.empty: return False, None
+    if post_choch['Low'].min() < major_bottom_price * 0.99:
+        return False, None # Naya LL ban gaya, structure fail
+
+    # Higher Low bana?
+    higher_low_made = post_choch['Low'].min() > major_bottom_price * 1.01
+    return higher_low_made, major_bottom_price
+
+def check_hhhl_now(df, idx):
+    if idx < R['hhhl_days']: return False
+    recent = df.iloc[idx-R['hhhl_days']+1:idx+1]
+    return recent['High'].iloc[-1] >= recent['High'].iloc[0] and recent['Low'].iloc[-1] >= recent['Low'].iloc[0]
 
 def scan_stock(stock, start_date, end_date):
     try:
-        time.sleep(1.2) # Rate limit: 1.2 sec per stock
-        df = yf.download(stock, start=start_date - timedelta(days=200), end=end_date + timedelta(days=1), progress=False, timeout=20)
-        if df.empty or len(df) < 100:
-            return []
+        time.sleep(1.5)
+        # CHoCH ke liye 3 saal purana data chahiye
+        df = yf.download(stock, start=start_date - timedelta(days=1100), end=end_date + timedelta(days=1), progress=False, auto_adjust=False)
+        if df.empty or len(df) < 150: return []
 
-        df['EMA20'] = df['Close'].ewm(span=20).mean()
-        df['10D_High'] = df['High'].rolling(R['lookback_days']).max().shift(1)
-        df['10D_Vol'] = df['Volume'].rolling(R['lookback_days']).max().shift(1)
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['10D_High'] = df['High'].rolling(R['lookback_days']).max()
+        df['10D_Vol'] = df['Volume'].rolling(R['lookback_days']).max()
 
-        df_scan = df[(df.index >= start_date) & (df.index <= end_date)]
+        df_scan = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
         signals = []
 
         for i in range(len(df_scan)):
             idx = df.index.get_loc(df_scan.index[i])
-            if idx < 50: continue
+            if idx < 100: continue
             row = df.iloc[idx]
 
-            # FILTER 1: 20 EMA ke paas
-            if row['Close'] < row['EMA20'] * (1 - R['ema_zone_pct']):
-                continue
+            # FILTER 1: 20 EMA
+            if row['Close'] < row['EMA20'] * (1 - R['ema_zone_pct']): continue
 
-            # FILTER 2: CHoCH + HH-HL
-            if not detect_choch_and_trend(df, idx):
-                continue
+            # FILTER 2: VALID CHoCH - No new low after CHoCH
+            choch_valid, major_bottom = check_valid_choch(df, idx)
+            if not choch_valid: continue
 
-            # FILTER 3: SQUEEZE - Last 3 din me volume blast + Aaj high daba
-            vol_blast = False
-            for j in range(max(10, idx-2), idx+1):
-                if df.iloc[j]['Volume'] > df.iloc[j]['10D_Vol']:
-                    vol_blast = True
-                    break
-            if not vol_blast: continue
-            if row['High'] >= row['10D_High']: continue
+            # FILTER 3: ABHI HH-HL
+            if not check_hhhl_now(df, idx): continue
 
-            # SIGNAL MILA - Breakout check
-            resistance = row['10D_High']
+            # FILTER 4: SQUEEZE
+            vol_condition = row['Volume'] >= row['10D_Vol']
+            price_condition = row['High'] < row['10D_High']
+            if not (vol_condition and price_condition): continue
+
             signal_date = df.index[idx].date()
-
-            future = df.iloc[idx+1:idx+1+R['hold_days']]
-            breakout = future[future['High'] >= resistance]
-
-            if not breakout.empty:
-                entry_date = breakout.index[0]
-                entry_price = resistance
-                post_entry = df.loc[entry_date:entry_date + timedelta(days=R['hold_days'])]
-
-                max_up = round((post_entry['High'].max() / entry_price - 1) * 100, 2)
-                max_down = round((post_entry['Low'].min() / entry_price - 1) * 100, 2)
-                days_to_bo = (entry_date.date() - signal_date).days
-
-                signals.append({
-                    'Signal_Date': str(signal_date),
-                    'Stock': stock.replace('.NS', ''),
-                    'EMA20': round(row['EMA20'], 2),
-                    'Close': round(row['Close'], 2),
-                    'Resistance': round(resistance, 2),
-                    'Entry_Date': str(entry_date.date()),
-                    'Entry_Price': round(entry_price, 2),
-                    'Max_Up_%': max_up,
-                    'Max_Down_%': max_down,
-                    'Days_to_BO': days_to_bo
-                })
-                print(f"SIGNAL: {stock.replace('.NS','')} {signal_date} Entry:{entry_price:.0f} Up:{max_up}% Down:{max_down}%", flush=True)
+            signals.append({
+                'Signal_Date': str(signal_date),
+                'Stock': stock.replace('.NS', ''),
+                'Close': round(row['Close'], 2),
+                'EMA20': round(row['EMA20'], 2),
+                'Major_Bottom': round(major_bottom, 2),
+                'Volume': int(row['Volume']),
+                '10D_Max_Vol': int(row['10D_Vol']),
+                'High': round(row['High'], 2),
+                '10D_Max_High': round(row['10D_High'], 2)
+            })
+            print(f"SIGNAL: {stock} {signal_date} Bottom:{major_bottom:.0f}", flush=True)
 
         return signals
     except Exception as e:
-        print(f"{stock}: Error - {e}", flush=True)
+        print(f"{stock}: {e}", flush=True)
         return []
 
-def main():
-    start_date = pd.to_datetime(R['backtest_start']).date()
-    end_date = pd.to_datetime(R['backtest_end']).date()
-    print(f"\n=== SCANNING {start_date} to {end_date} ===", flush=True)
-    print(f"Logic: CHoCH + HH-HL + 20EMA + Volume Squeeze", flush=True)
+# MAIN
+stocks = get_watchlist_stocks()
+all_signals = []
 
-    stock_universe = get_watchlist_stocks()
-    all_signals = []
+print(f"\n=== SCANNING {len(stocks)} STOCKS FROM {START_DATE} TO {END_DATE} ===", flush=True)
+print("Logic: Valid CHoCH Ever + No New Low + HH-HL Now + 20EMA + Squeeze", flush=True)
 
-    # Batch me chala - Rate limit se bachne ke liye
-    for i in range(0, len(stock_universe), R['batch_size']):
-        batch = stock_universe[i:i+R['batch_size']]
-        print(f"\nBatch {i//R['batch_size']+1}/{(len(stock_universe)-1)//R['batch_size']+1}: {len(batch)} stocks...", flush=True)
+for i, stock in enumerate(stocks):
+    print(f"[{i+1}/{len(stocks)}] {stock}...", flush=True)
+    result = scan_stock(stock, START_DATE, END_DATE)
+    all_signals.extend(result)
+    time.sleep(2)
 
-        for stock in batch:
-            result = scan_stock(stock, start_date, end_date)
-            if result:
-                all_signals.extend(result)
-
-        time.sleep(5) # Batch ke baad 5 sec break
-
-    # SHEET ME LIKHO
-    ws_output.clear()
-    if all_signals:
-        df_final = pd.DataFrame(all_signals)
-        df_final = df_final.sort_values('Max_Up_%', ascending=False)
-        ws_output.update('A1', [df_final.columns.tolist()] + df_final.values.tolist())
-        print(f"\n=== TOTAL SIGNALS: {len(df_final)} ===", flush=True)
-        print(f"Avg Max Up: {df_final['Max_Up_%'].mean():.2f}%", flush=True)
-        print(f"Win Rate >5%: {(df_final['Max_Up_%'] > 5).sum() / len(df_final) * 100:.1f}%", flush=True)
-        print(f"Sheet Updated: CHoCH_SQUEEZE_SIGNALS", flush=True)
-    else:
-        ws_output.update('A1', [['No Signals Found', f'{start_date} to {end_date}']])
-        print(f"\n=== 0 SIGNAL - Is period me CHoCH + Squeeze nahi bana ===", flush=True)
-
-if __name__ == "__main__":
-    main()
+ws_output.clear()
+if all_signals:
+    df_final = pd.DataFrame(all_signals).drop_duplicates(subset=['Signal_Date', 'Stock']).sort_values('Signal_Date', ascending=False)
+    ws_output.update('A1', [df_final.columns.tolist()] + df_final.values.tolist())
+    print(f"\n=== FOUND {len(df_final)} SIGNALS IN LAST 1 YEAR ===", flush=True)
+    print(f"Latest 5: \n{df_final.head()}", flush=True)
+else:
+    ws_output.update('A1', [['No Signals in Last 1 Year']])
+    print(f"\n=== 0 SIGNALS ===", flush=True)
