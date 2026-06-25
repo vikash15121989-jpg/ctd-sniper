@@ -10,33 +10,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V21.8 GHOST: PLAY ZONE EDITION ===", flush=True)
+print("=== V22.0 GHOST: 20 EMA SQUEEZE EDITION ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
-# ===== GHOST FINAL CONFIG - PLAY ZONE =====
+# ===== CONFIG - 20 EMA SQUEEZE =====
 R = {
-    'backtest_start': '2026-01-01',
-    'backtest_end': '2026-06-30',
+    'backtest_start': '2023-01-01', # 2026 dead hai. 2023 pe test kar
+    'backtest_end': '2023-12-31',
     'batch_size': 50,
     'max_workers': 10,
 
-    # FILTER RELAXED
-    'min_price': 30, # 50 se 30
-    'min_avg_volume': 30000, # 50k se 30k
-    'min_daily_turnover': 1e6, # 20L se 10L
+    # FILTER
+    'min_price': 30,
+    'min_avg_volume': 30000,
+    'min_daily_turnover': 1e6,
 
-    # GHOST LOGIC - PLAY ZONE BUFFER
-    'shelf_days': 30,
-    'shelf_range_max': 0.30, # 22% se 30% - 8% ka buffer
-    'shelf_vol_dry_pct': 0.60,
-    'pivot_vol_multiple': 1.2, # 1.3 se 1.2 - thora easy
-    'pivot_high_pct': 0.95, # 97% se 95% - 2% ka buffer, RELAXO pass
-    'down_vol_dry': 0.80, # 75% se 80% - thora easy
-    'rs_lookback': 50,
-    'rs_buffer_pct': 0.95, # RS 50D high ke 95% pe bhi chalega
-    'min_ghost_score': 1, # 2 se 1 - 4 me se 1 shart = signal
-    'rr_ratio': 2.5, # 3 se 2.5 - practical target
-    'max_hold_days': 60,
+    # 20 EMA SQUEEZE LOGIC
+    'ema_period': 20,
+    'ema_zone_pct': 0.03, # 20 EMA se ±3% me ho to bhi chalega
+    'lookback': 10, # 10 days squeeze
+    'hold_days': 10, # Entry ke baad 10 din ka move
+    'choch_lookback': 20, # CHoCH ke liye 20 din
 }
 
 def get_or_create_ws(sh, title, rows=5000, cols=20):
@@ -49,7 +43,7 @@ gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = get_or_create_ws(sh, "Watchlist")
-ws_bt_signals = get_or_create_ws(sh, "GHOST_PLAYZONE_2026")
+ws_bt_signals = get_or_create_ws(sh, "GHOST_20EMA_SQUEEZE_2023")
 
 def get_watchlist_stocks():
     try:
@@ -79,70 +73,21 @@ def download_stock_data(ticker, start_date, end_date):
     except:
         return None
 
-def get_nifty_data(start_date, end_date):
-    try:
-        nifty = yf.download("^NSEI", start=start_date - timedelta(days=400), end=end_date + timedelta(days=1),
-                            progress=False, auto_adjust=False, group_by='column')
-        if isinstance(nifty.columns, pd.MultiIndex):
-            nifty.columns = nifty.columns.droplevel(1)
-        return nifty['Close'] if not nifty.empty else None
-    except:
-        return None
+def is_choch_uptrend(df, lookback=20):
+    """Simple CHoCH: Recent 20D me Higher High + Higher Low"""
+    if len(df) < lookback: return False
+    recent = df.tail(lookback)
+    highs = recent['High'].rolling(5).max().dropna()
+    lows = recent['Low'].rolling(5).min().dropna()
+    if len(highs) < 2 or len(lows) < 2: return False
+    hh = highs.iloc[-1] > highs.iloc[-2]
+    hl = lows.iloc[-1] > lows.iloc[-2]
+    return hh and hl
 
-def build_ghost_indicators(df, nifty_close):
-    df['Vol_50MA'] = df['Volume'].rolling(window=50).mean()
-    df['High_40D'] = df['High'].rolling(window=40).max()
-    df['Low_40D'] = df['Low'].rolling(window=40).min()
-    df['NIFTY'] = nifty_close
-    df['RS_Line'] = df['Close'] / df['NIFTY']
-    df['RS_High_50D'] = df['RS_Line'].rolling(window=R['rs_lookback']).max()
-    return df
-
-def is_ghost_protocol_signal(df, idx):
-    if idx < 60: return False, 0, None
-    row = df.iloc[idx]
-    shelf_df = df.iloc[idx-R['shelf_days']:idx]
-    score = 0
-    reasons = []
-
-    # Shart 1: Shelf + Dry Volume - PLAY ZONE
-    dry_vol_days = (shelf_df['Volume'] < shelf_df['Vol_50MA'] * 0.7).sum()
-    shelf_range = (shelf_df['High'].max() - shelf_df['Low'].min()) / shelf_df['Low'].min()
-    if dry_vol_days >= R['shelf_days'] * R['shelf_vol_dry_pct'] and shelf_range <= R['shelf_range_max']:
-        score += 2; reasons.append(f"Shelf_{shelf_range*100:.0f}%")
-
-    # Shart 2: Down Days Dry - PLAY ZONE
-    down_days = shelf_df[shelf_df['Close'] < shelf_df['Open']]
-    if len(down_days) > 3:
-        avg_down_vol = down_days['Volume'].mean()
-        if avg_down_vol < row['Vol_50MA'] * R['down_vol_dry']:
-            score += 1; reasons.append("Dry")
-
-    # Shart 3: Pivot Day - PLAY ZONE
-    is_green = row['Close'] > row['Open'] * 1.002 # 0.5% se 0.2%
-    near_high = row['Close'] >= row['High_40D'] * R['pivot_high_pct'] # 95% buffer
-    vol_explosion = row['Volume'] > row['Vol_50MA'] * R['pivot_vol_multiple'] # 1.2x
-    if is_green and near_high and vol_explosion:
-        score += 2; reasons.append(f"Pivot_{row['Volume']/row['Vol_50MA']:.1f}x")
-
-    # Shart 4: RS New High - PLAY ZONE
-    if not pd.isna(row['RS_Line']) and not pd.isna(row['RS_High_50D']):
-        if row['RS_Line'] >= row['RS_High_50D'] * R['rs_buffer_pct']: # 95% buffer
-            score += 1; reasons.append("RS")
-
-    # PLAY ZONE: 1 bhi chalega
-    if score >= R['min_ghost_score']:
-        entry = row['Close']
-        sl = row['Low_40D'] * 0.98
-        target = entry + R['rr_ratio'] * (entry - sl)
-        return True, score, {'Entry': round(entry, 2), 'SL': round(sl, 2), 'Target': round(target, 2), 'Reason': "+".join(reasons)}
-
-    return False, score, None
-
-def backtest_stock_full_year(stock, start_date, end_date, nifty_close):
+def backtest_20ema_squeeze(stock, start_date, end_date):
     try:
         df = download_stock_data(stock, start_date, end_date)
-        if df is None: return []
+        if df is None or len(df) < 100: return []
 
         avg_price = df['Close'].tail(20).mean()
         avg_vol = df['Volume'].tail(20).mean()
@@ -152,69 +97,107 @@ def backtest_stock_full_year(stock, start_date, end_date, nifty_close):
         if avg_vol < R['min_avg_volume']: return []
         if avg_turnover < R['min_daily_turnover']: return []
 
-        df = build_ghost_indicators(df, nifty_close)
-        signals = []
+        # INDICATORS
+        df['EMA20'] = df['Close'].ewm(span=R['ema_period'], adjust=False).mean()
+        df['10D_Max_High'] = df['High'].rolling(R['lookback']).max().shift(1)
+        df['10D_Max_Vol'] = df['Volume'].rolling(R['lookback']).max().shift(1)
 
+        trades = []
         df_scan = df[(df.index >= start_date) & (df.index <= end_date)]
         if df_scan.empty: return []
         start_idx = df.index.get_loc(df_scan.index[0])
 
-        for idx in range(start_idx, len(df)):
-            is_signal, score, signal_data = is_ghost_protocol_signal(df, idx)
-            if is_signal:
-                sig_date = df.index[idx].date().strftime('%Y-%m-%d')
-                signals.append({
-                    'Date': sig_date,
-                    'Stock': stock.replace('.NS', ''),
-                    'Entry': signal_data['Entry'],
-                    'SL': signal_data['SL'],
-                    'Target': signal_data['Target'],
-                    'Score': score,
-                    'Reason': signal_data['Reason']
-                })
-                print(f"GHOST PLAYZONE: {stock.replace('.NS','')} {sig_date} @ {signal_data['Entry']} Score:{score}/6 {signal_data['Reason']}", flush=True)
-        return signals
-    except:
+        for i in range(start_idx, len(df) - R['hold_days']):
+            row = df.iloc[i]
+
+            # 1. 20 EMA FILTER: Upar ho ya paas me ho
+            ema = row['EMA20']
+            close = row['Close']
+            in_ema_zone = close >= ema * (1 - R['ema_zone_pct']) # 3% neeche tak chalega
+            if not in_ema_zone:
+                continue
+
+            # 2. CHoCH FILTER
+            if not is_choch_uptrend(df.iloc[:i+1], R['choch_lookback']):
+                continue
+
+            # 3. SQUEEZE CONDITION
+            vol_condition = row['Volume'] > df.iloc[i]['10D_Max_Vol']
+            price_condition = row['High'] < df.iloc[i]['10D_Max_High']
+
+            if vol_condition and price_condition:
+                resistance = df.iloc[i]['10D_Max_High']
+                signal_date = df.index[i]
+
+                # 4. AGLE 10 DIN ME BREAKOUT DHUNDO
+                future = df.iloc[i+1 : i+1+R['hold_days']]
+                breakout = future[future['High'] >= resistance]
+
+                if not breakout.empty:
+                    entry_date = breakout.index[0]
+                    entry_price = resistance # Conservative entry
+
+                    # 5. ENTRY KE BAAD MAX UP/DOWN
+                    post_entry = df.loc[entry_date : entry_date + timedelta(days=R['hold_days'])]
+                    if len(post_entry) == 0: continue
+
+                    max_up = round((post_entry['High'].max() / entry_price - 1) * 100, 2)
+                    max_down = round((post_entry['Low'].min() / entry_price - 1) * 100, 2)
+                    days_to_bo = (entry_date - signal_date).days
+
+                    trades.append({
+                        'Signal_Date': signal_date.date().strftime('%Y-%m-%d'),
+                        'Stock': stock.replace('.NS', ''),
+                        'EMA20': round(ema, 2),
+                        'Close': round(close, 2),
+                        'Resistance': round(resistance, 2),
+                        'Entry_Date': entry_date.date().strftime('%Y-%m-%d'),
+                        'Entry_Price': round(entry_price, 2),
+                        'Max_Up_%': max_up,
+                        'Max_Down_%': max_down,
+                        'Days_to_BO': days_to_bo
+                    })
+                    print(f"SQUEEZE: {stock.replace('.NS','')} {signal_date.date()} EMA:{ema:.0f} Resist:{resistance:.0f} BO:{days_to_bo}D Up:{max_up}%", flush=True)
+
+        return trades
+    except Exception as e:
         return []
 
 def main():
     start_date = pd.to_datetime(R['backtest_start']).date()
     end_date = pd.to_datetime(R['backtest_end']).date()
-    print(f"\n=== SCANNING {start_date} to {end_date} - PLAY ZONE MODE ===", flush=True)
-    print(f"Rules: Range<30% High>95% Vol>1.2x Score>=1/6", flush=True)
+    print(f"\n=== SCANNING {start_date} to {end_date} - 20 EMA SQUEEZE ===", flush=True)
+    print(f"Rules: 20EMA Zone + CHoCH + Vol>10D Max + High<10D Max", flush=True)
 
     stock_universe = get_watchlist_stocks()
-    nifty_close = get_nifty_data(start_date, end_date)
-    if nifty_close is None:
-        print("NIFTY data failed. Exit.", flush=True)
-        return
-
-    all_signals = []
+    all_trades = []
 
     for i in range(0, len(stock_universe), R['batch_size']):
         batch = stock_universe[i:i+R['batch_size']]
         print(f"\nBatch {i//R['batch_size']+1}: Scanning {len(batch)} stocks...", flush=True)
 
         with ThreadPoolExecutor(max_workers=R['max_workers']) as executor:
-            futures = {executor.submit(backtest_stock_full_year, stock, start_date, end_date, nifty_close): stock for stock in batch}
+            futures = {executor.submit(backtest_20ema_squeeze, stock, start_date, end_date): stock for stock in batch}
             for future in as_completed(futures):
                 result = future.result()
                 if result:
-                    all_signals.extend(result)
+                    all_trades.extend(result)
         time.sleep(1)
 
-    signals_df = pd.DataFrame(all_signals)
+    results_df = pd.DataFrame(all_trades)
     ws_bt_signals.clear()
 
-    if signals_df.empty:
-        ws_bt_signals.update('A1', [['Date', 'Stock', 'Entry', 'SL', 'Target', 'Score', 'Reason'],
-                                    ['No Ghost even with Play Zone', '', '', '', '', '', 'Market Dead']])
-        print(f"\n=== RESULT: 0 Ghost - Market me setup hi nahi hai ===", flush=True)
+    if results_df.empty:
+        ws_bt_signals.update('A1', [['No Squeeze Found in this period', '', '', '', '', '']])
+        print(f"\n=== RESULT: 0 Signal - Market me setup hi nahi bana ===", flush=True)
     else:
-        ws_bt_signals.update('A1', [signals_df.columns.tolist()] + signals_df.values.tolist())
-        print(f"\n=== RESULT: {len(signals_df)} Ghost setups - PLAY ZONE ===", flush=True)
-        print(f"Stocks: {signals_df['Stock'].nunique()} unique", flush=True)
-        print(f"RELAXO 9 JUNE AB PAKAD JAYEGA GUARANTEE", flush=True)
+        results_df = results_df.sort_values('Max_Up_%', ascending=False)
+        ws_bt_signals.update('A1', [results_df.columns.tolist()] + results_df.values.tolist())
+        print(f"\n=== RESULT: {len(results_df)} Squeeze setups ===", flush=True)
+        print(f"Avg Max Up: {results_df['Max_Up_%'].mean():.2f}%")
+        print(f"Avg Max Down: {results_df['Max_Down_%'].mean():.2f}%")
+        print(f"Win Rate >5%: {(results_df['Max_Up_%'] > 5).sum() / len(results_df) * 100:.1f}%")
+        print(f"Avg Days to Breakout: {results_df['Days_to_BO'].mean():.1f} days")
 
 if __name__ == "__main__":
     main()
