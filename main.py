@@ -7,28 +7,34 @@ TEST_DATE = "2026-06-09"
 
 print(f"=== TESTING GHOST ON {STOCK} FOR {TEST_DATE} ===")
 
-df = yf.download(STOCK, start="2025-01-01", end="2026-06-15", progress=False, auto_adjust=False)
-nifty = yf.download("^NSEI", start="2025-01-01", end="2026-06-15", progress=False, auto_adjust=False)
+# FIX: group_by='column' se MultiIndex hat jayega
+df = yf.download(STOCK, start="2025-01-01", end="2026-06-15", progress=False, auto_adjust=False, group_by='column')
+nifty = yf.download("^NSEI", start="2025-01-01", end="2026-06-15", progress=False, auto_adjust=False, group_by='column')
 
 if df.empty:
     print("BUG MIL GAYA: RELAXO ka data hi nahi aa raha Yahoo se.")
     exit()
 
-# FIX 1: Nifty ko Series bana aur naam de
+# FIX: Agar MultiIndex hai to hata do
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.droplevel(1)
+if isinstance(nifty.columns, pd.MultiIndex):
+    nifty.columns = nifty.columns.droplevel(1)
+
 nifty_close = nifty['Close']
 nifty_close.name = 'NIFTY'
 
-# FIX 2: Join sahi tarike se
 df['Vol_50MA'] = df['Volume'].rolling(window=50).mean()
 df['High_40D'] = df['High'].rolling(window=40).max()
 df['Low_40D'] = df['Low'].rolling(window=40).min()
-df = df.join(nifty_close, how='left') # rename hata diya
+df['NIFTY'] = nifty_close # Join ki jagah direct assign
 df['RS_Line'] = df['Close'] / df['NIFTY']
 df['RS_High_50D'] = df['RS_Line'].rolling(window=50).max()
 
 if pd.to_datetime(TEST_DATE) not in df.index:
     print(f"9 JUNE KA DATA HI NAHI HAI RELAXO ME. Holiday tha ya data missing.")
     print(f"Last available: {df.index[-1].date()}")
+    print(f"Aas paas ke din: {df.index[-5:].date}")
     exit()
 
 test_idx = df.index.get_loc(pd.to_datetime(TEST_DATE))
@@ -73,7 +79,7 @@ if score >= 2:
     sl = row['Low_40D'] * 0.98
     target = entry + 3 * (entry - sl)
     print(f"GHOST SIGNAL BANTA HAI! Entry:{entry:.2f} SL:{sl:.2f} Target:{target:.2f}")
-    print("MATLAB FULL SCANNER CODE ME BUG HAI. SINGLE STOCK PE CHAL RAHA.")
+    print("MATLAB FULL SCANNER CODE ME BUG HAI. RELAXO LIST ME HAI LEKIN PICK NAHI HUA.")
 else:
     print("SIGNAL NAHI BANTA RELAXO ME 9 JUNE KO.")
-    print("MATLAB TERA WALA EXAMPLE YA TO GALAT DATE KA THA YA LOGIC BAKWAS HAI.")
+    print("MATLAB 9 JUNE WALA TERA CHART GALAT THA YA MERA LOGIC BAKWAS HAI.")
