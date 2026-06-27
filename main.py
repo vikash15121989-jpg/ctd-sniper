@@ -9,13 +9,13 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V33.0: 100% PURE PRICE ACTION STRENGTH SCANNER ===", flush=True)
+print("=== V34.0: AUTO-HEALING PURE PRICE ACTION SCANNER ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
 END_DATE = datetime(2026, 6, 25).date() 
 START_DATE = datetime(2025, 6, 25).date() 
-BATCH_SIZE = 15  # एक बार में 15 स्टॉक्स डाउनलोड होंगे
+BATCH_SIZE = 15  
 
 R = {
     'backtest_start': START_DATE,
@@ -27,7 +27,15 @@ gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
-ws_output = sh.worksheet("CHoCH_SQUEEZE_SIGNALS")
+
+# 💎 AUTO-CREATE WORKSHEET LOGIC: शीट नहीं है तो खुद बनाओ!
+try:
+    ws_output = sh.worksheet("CHoCH_SQUEEZE_SIGNALS")
+    print("Existing Worksheet 'CHoCH_SQUEEZE_SIGNALS' connected.", flush=True)
+except gspread.exceptions.WorksheetNotFound:
+    # 1000 rows और 10 columns के साथ नई टैब ऑटोमैटिक बन जाएगी
+    ws_output = sh.add_worksheet(title="CHoCH_SQUEEZE_SIGNALS", rows="1000", cols="10")
+    print("👉 Worksheet 'CHoCH_SQUEEZE_SIGNALS' was missing. Created it automatically!", flush=True)
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -37,7 +45,6 @@ def get_watchlist_stocks():
     return stocks
 
 def check_structure_and_choch(df, idx, lookback=60):
-    """बिना इंडिकेटर के स्विंग स्ट्रक्चर चेक करना"""
     if idx < lookback: return False, None
     window = df.iloc[idx-lookback:idx+1]
     local_bottom_idx = window['Low'].idxmin()
@@ -55,9 +62,8 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
     signals = []
     try:
         df = stock_df.dropna(subset=['Close']).copy()
-        if len(df) < 80: return [] # पर्याप्त डेटा होना जरूरी है
+        if len(df) < 80: return []
 
-        # Base 20 EMA केवल ट्रेंड दिशा जानने के लिए (स्ट्रेंथ के लिए नहीं)
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['20_std'] = df['Close'].rolling(window=20).std()
         df['Squeeze_Threshold'] = df['20_std'].rolling(window=50).quantile(0.20)
@@ -73,37 +79,26 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
             prev_row = df.iloc[idx-1]
             prev_2_row = df.iloc[idx-2]
 
-            # FILTER 1: बुनियादी दिशा फ़िल्टर
             if row['Close'] < row['EMA20']: continue
 
-            # FILTER 2: चेंज ऑफ कैरेक्टर / स्ट्रक्चर फ़िल्टर
             struct_valid, recent_bottom = check_structure_and_choch(df, idx)
             if not struct_valid: continue
 
-            # =======================================================
-            # 💎 PURE PRICE ACTION STRENGTH ENGINE (NO INDICATORS)
-            # =======================================================
-            
-            # 1. CANDLE BODY RATIO: कैंडल की क्लोजिंग मजबूत होनी चाहिए (नो बड़ी ऊपरी पूंछ/wick)
+            # PURE PRICE ACTION STRENGTH ENGINE
             candle_range = row['High'] - row['Low']
             body_size = abs(row['Close'] - row['Open'])
             is_strong_candle = body_size >= (candle_range * 0.70) if candle_range > 0 else False
 
-            # 2. SLOPE ACCELERATION: पिछले 5 दिनों की तेजी, उसके पिछले 15 दिनों की औसत चाल से दोगुनी होनी चाहिए
             back_5_change = abs(row['Close'] - df.iloc[idx-5]['Close'])
             back_15_change = abs(df.iloc[idx-5]['Close'] - df.iloc[idx-20]['Close'])
             is_fast_slope = back_5_change > (back_15_change * 2)
 
-            # 3. VOLUME ESCALATION: आज का वॉल्यूम पिछले 2 दिनों के वॉल्यूम से लगातार बढ़ रहा हो
             is_volume_rising = row['Volume'] > prev_row['Volume'] and prev_row['Volume'] > prev_2_row['Volume']
 
-            # अगर इनमें से कोई भी प्राइस एक्शन स्ट्रेंथ मैच नहीं होती, तो स्टॉक रिजेक्ट
             if not (is_strong_candle and is_fast_slope and is_volume_rising): 
                 continue
 
-            # =======================================================
-            # FILTER 4: BREAKOUT OR SQUEEZE LOGIC
-            # =======================================================
+            # BREAKOUT OR SQUEEZE LOGIC
             recent_14 = df.iloc[idx-R['lookback_days']:idx]
             range_high = recent_14['High'].max()
             
@@ -135,7 +130,7 @@ stocks = get_watchlist_stocks()
 all_signals = []
 
 stock_batches = [stocks[i:i + BATCH_SIZE] for i in range(0, len(stocks), BATCH_SIZE)]
-print(f"\n=== STARTING PURE PRICE ACTION SCAN: {len(stock_batches)} Batches ===", flush=True)
+print(f"\n=== STARTING BATCH SCAN: {len(stock_batches)} Batches ===", flush=True)
 
 start_download_dt = START_DATE - timedelta(days=200)
 
