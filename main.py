@@ -9,18 +9,18 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V41.0: CHOCH + HH+HL + SWING PULLBACK ===", flush=True)
+print("=== V41.1: CHOCH + HH+HL + SWING PULLBACK FIXED ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=365)
-BATCH_SIZE = 15
+BATCH_SIZE = 50
 
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 5
 SWING_LENGTH = 5
-PULLBACK_ZONE_PCT = 3.0 # Swing level se 3% upar-neeche
+PULLBACK_ZONE_PCT = 3.0
 
 # ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -45,7 +45,7 @@ def get_swing_levels(df, idx, length=5):
     """Latest 2 swing high aur 2 swing low"""
     if idx < length * 4: return None
 
-    df_copy = df.iloc[:idx+1].copy()
+    df_copy = df.iloc[:idx+1].copy() # Copy banao taaki original modify na ho
 
     ph_mask = (df_copy['High'].shift(length) < df_copy['High']) & (df_copy['High'].shift(-length) < df_copy['High'])
     pl_mask = (df_copy['Low'].shift(length) > df_copy['Low']) & (df_copy['Low'].shift(-length) > df_copy['Low'])
@@ -60,11 +60,7 @@ def get_swing_levels(df, idx, length=5):
         'latest_ph': pivot_highs.iloc[-1],
         'prev_ph': pivot_highs.iloc[-2],
         'latest_pl': pivot_lows.iloc[-1],
-        'prev_pl': pivot_lows.iloc[-2],
-        'latest_ph_date': pivot_highs.index[-1],
-        'prev_ph_date': pivot_highs.index[-2],
-        'latest_pl_date': pivot_lows.index[-1],
-        'prev_pl_date': pivot_lows.index[-2]
+        'prev_pl': pivot_lows.iloc[-2]
     }
 
 def check_choch_major_bottom(df, idx, lookback=60):
@@ -76,11 +72,9 @@ def check_choch_major_bottom(df, idx, lookback=60):
     major_bottom_price = window.loc[major_bottom_idx, 'Low']
     major_bottom_date = window.index[major_bottom_idx]
 
-    # 1. CHOCH - Close major bottom ke upar
     if df.iloc[idx]['Close'] < major_bottom_price:
         return False, None
 
-    # 2. Major bottom intact - Baad me koi candle iske neeche close nahi hui
     post_bottom_df = df.loc[major_bottom_date:df.index[idx]]
     if post_bottom_df['Low'].min() < major_bottom_price * 0.99:
         return False, None
@@ -91,13 +85,8 @@ def check_hh_hl_swing_structure(swing_data, current_close):
     """Swing se HH+HL confirm karo"""
     if swing_data is None: return False
 
-    # HH: Latest PH > Prev PH
     hh = swing_data['latest_ph'] > swing_data['prev_ph']
-
-    # HL: Latest PL > Prev PL
     hl = swing_data['latest_pl'] > swing_data['prev_pl']
-
-    # Current price latest swing low ke upar - uptrend intact
     uptrend = current_close > swing_data['latest_pl']
 
     return hh and hl and uptrend
@@ -111,16 +100,16 @@ def check_pullback_to_swing_support(df, idx, swing_data):
     prev_ph = swing_data['prev_ph']
     prev_pl = swing_data['prev_pl']
 
-    # Condition: Latest PH se neeche aa gaya hai
+    # Latest PH se neeche aa gaya ho
     if current_close >= latest_ph * 0.99:
         return False, None, None
 
-    # Check 1: Prev Swing High ke paas hai
+    # Check 1: Prev Swing High ke paas
     dist_to_prev_ph = abs((current_close - prev_ph) / prev_ph) * 100
     if dist_to_prev_ph <= PULLBACK_ZONE_PCT:
         return True, "Prev_Swing_High", prev_ph
 
-    # Check 2: Prev Swing Low ke paas hai
+    # Check 2: Prev Swing Low ke paas
     dist_to_prev_pl = abs((current_close - prev_pl) / prev_pl) * 100
     if dist_to_prev_pl <= PULLBACK_ZONE_PCT:
         return True, "Prev_Swing_Low", prev_pl
@@ -131,13 +120,9 @@ def check_strength(df, idx):
     """Pullback ke baad strength - Green candle + volume up"""
     if idx < 2: return False
 
-    # Current candle green
     current_green = df.iloc[idx]['Close'] > df.iloc[idx]['Open']
-
-    # Volume aaj kal se zyada
     volume_up = df.iloc[idx]['Volume'] > df.iloc[idx-1]['Volume']
 
-    # Last 3 me 2 green
     last_3 = df.iloc[idx-2:idx+1]
     green_count = len(last_3[last_3['Close'] > last_3['Open']])
 
@@ -163,12 +148,12 @@ def analyze_stock(df, stock):
     if not choch_ok:
         return None
 
-    # 3. Swing levels nikalo
+    # 3. Swing levels
     swing_data = get_swing_levels(df, idx, SWING_LENGTH)
     if swing_data is None:
         return None
 
-    # 4. HH+HL structure check
+    # 4. HH+HL structure
     hh_hl_ok = check_hh_hl_swing_structure(swing_data, row['Close'])
     if not hh_hl_ok:
         return None
@@ -182,7 +167,6 @@ def analyze_stock(df, stock):
     if not check_strength(df, idx):
         return None
 
-    # Sab condition pass - Stock ready hai
     return {
         'Signal_Date': str(df.index[idx].date()),
         'Stock': stock.replace('.NS', ''),
@@ -216,8 +200,17 @@ for b_idx, batch in enumerate(stock_batches):
         if batch_data.empty: continue
 
         for stock in batch:
-            stock_df = batch_data if len(batch) == 1 else (batch_data[stock] if stock in batch_data.columns.levels[0] else None)
-            if stock_df is None: continue
+            # FIX 1: Check if stock exists in batch_data
+            if len(batch) == 1:
+                stock_df = batch_data
+            elif stock in batch_data.columns.levels[0]:
+                stock_df = batch_data[stock]
+            else:
+                continue
+
+            # FIX 2: Check if dataframe is empty
+            if stock_df.empty or len(stock_df) < 80:
+                continue
 
             signal = analyze_stock(stock_df, stock)
 
@@ -236,7 +229,6 @@ if all_signals:
     df_sniper = pd.DataFrame(all_signals).sort_values('Risk_Pct', ascending=True)
     ws_sniper.update('A1', [df_sniper.columns.tolist()] + df_sniper.values.tolist())
     print(f"\n=== FOUND {len(df_sniper)} SWING PULLBACK SETUPS ===", flush=True)
-    print(f"Best Pick: {df_sniper.iloc[0]['Stock']} | Pullback: {df_sniper.iloc[0]['Pullback_To']} | Risk: {df_sniper.iloc[0]['Risk_Pct']}%", flush=True)
 else:
     ws_sniper.update('A1', [['Aaj koi Swing Pullback Setup nahi mila']])
     print(f"\n=== NO SETUPS TODAY ===", flush=True)
