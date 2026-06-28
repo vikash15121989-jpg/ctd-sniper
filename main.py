@@ -9,13 +9,12 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V41.1: CHOCH + HH+HL + SWING PULLBACK FIXED ===", flush=True)
+print("=== V41.2: STABLE - ONE BY ONE DOWNLOAD ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=365)
-BATCH_SIZE = 50
 
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 5
@@ -42,10 +41,9 @@ def get_watchlist_stocks():
     return stocks
 
 def get_swing_levels(df, idx, length=5):
-    """Latest 2 swing high aur 2 swing low"""
     if idx < length * 4: return None
 
-    df_copy = df.iloc[:idx+1].copy() # Copy banao taaki original modify na ho
+    df_copy = df.iloc[:idx+1].copy()
 
     ph_mask = (df_copy['High'].shift(length) < df_copy['High']) & (df_copy['High'].shift(-length) < df_copy['High'])
     pl_mask = (df_copy['Low'].shift(length) > df_copy['Low']) & (df_copy['Low'].shift(-length) > df_copy['Low'])
@@ -64,7 +62,6 @@ def get_swing_levels(df, idx, length=5):
     }
 
 def check_choch_major_bottom(df, idx, lookback=60):
-    """CHOCH hua + Major bottom abhi tak break nahi hua"""
     if idx < lookback: return False, None
 
     window = df.iloc[idx-lookback:idx+1]
@@ -82,7 +79,6 @@ def check_choch_major_bottom(df, idx, lookback=60):
     return True, major_bottom_price
 
 def check_hh_hl_swing_structure(swing_data, current_close):
-    """Swing se HH+HL confirm karo"""
     if swing_data is None: return False
 
     hh = swing_data['latest_ph'] > swing_data['prev_ph']
@@ -92,7 +88,6 @@ def check_hh_hl_swing_structure(swing_data, current_close):
     return hh and hl and uptrend
 
 def check_pullback_to_swing_support(df, idx, swing_data):
-    """Price Prev Swing High ya Prev Swing Low ke paas hai"""
     if swing_data is None: return False, None, None
 
     current_close = df.iloc[idx]['Close']
@@ -100,16 +95,13 @@ def check_pullback_to_swing_support(df, idx, swing_data):
     prev_ph = swing_data['prev_ph']
     prev_pl = swing_data['prev_pl']
 
-    # Latest PH se neeche aa gaya ho
     if current_close >= latest_ph * 0.99:
         return False, None, None
 
-    # Check 1: Prev Swing High ke paas
     dist_to_prev_ph = abs((current_close - prev_ph) / prev_ph) * 100
     if dist_to_prev_ph <= PULLBACK_ZONE_PCT:
         return True, "Prev_Swing_High", prev_ph
 
-    # Check 2: Prev Swing Low ke paas
     dist_to_prev_pl = abs((current_close - prev_pl) / prev_pl) * 100
     if dist_to_prev_pl <= PULLBACK_ZONE_PCT:
         return True, "Prev_Swing_Low", prev_pl
@@ -117,7 +109,6 @@ def check_pullback_to_swing_support(df, idx, swing_data):
     return False, None, None
 
 def check_strength(df, idx):
-    """Pullback ke baad strength - Green candle + volume up"""
     if idx < 2: return False
 
     current_green = df.iloc[idx]['Close'] > df.iloc[idx]['Open']
@@ -132,38 +123,31 @@ def analyze_stock(df, stock):
     df = df.dropna(subset=['Close']).copy()
     if len(df) < 80: return None
 
-    # Indicators
     df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
     df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000
 
     idx = len(df) - 1
     row = df.iloc[idx]
 
-    # 1. Liquidity check
     if row['Avg_Vol'] < MIN_AVG_VOLUME or row['Avg_Turnover'] < MIN_AVG_TURNOVER_CR:
         return None
 
-    # 2. CHOCH + Major Bottom Intact
     choch_ok, major_bottom = check_choch_major_bottom(df, idx)
     if not choch_ok:
         return None
 
-    # 3. Swing levels
     swing_data = get_swing_levels(df, idx, SWING_LENGTH)
     if swing_data is None:
         return None
 
-    # 4. HH+HL structure
     hh_hl_ok = check_hh_hl_swing_structure(swing_data, row['Close'])
     if not hh_hl_ok:
         return None
 
-    # 5. Pullback to swing support
     pullback_ok, pullback_to, support_level = check_pullback_to_swing_support(df, idx, swing_data)
     if not pullback_ok:
         return None
 
-    # 6. Strength check
     if not check_strength(df, idx):
         return None
 
@@ -185,43 +169,35 @@ def analyze_stock(df, stock):
         'Risk_Pct': round(((row['Close'] - support_level * 0.99) / row['Close']) * 100, 2)
     }
 
-# ===== MAIN EXECUTION =====
+# ===== MAIN EXECUTION - ONE BY ONE =====
 stocks = get_watchlist_stocks()
 all_signals = []
-stock_batches = [stocks[i:i + BATCH_SIZE] for i in range(0, len(stocks), BATCH_SIZE)]
 
-print(f"\n=== SCANNING {len(stocks)} STOCKS ===", flush=True)
+print(f"\n=== SCANNING {len(stocks)} STOCKS ONE BY ONE ===", flush=True)
 start_download_dt = START_DATE - timedelta(days=200)
 
-for b_idx, batch in enumerate(stock_batches):
-    print(f"Processing Batch [{b_idx+1}/{len(stock_batches)}]...", flush=True)
+for i, stock in enumerate(stocks):
     try:
-        batch_data = yf.download(batch, start=start_download_dt, progress=False, group_by='ticker', auto_adjust=False)
-        if batch_data.empty: continue
+        print(f"[{i+1}/{len(stocks)}] Scanning {stock}...", flush=True)
 
-        for stock in batch:
-            # FIX 1: Check if stock exists in batch_data
-            if len(batch) == 1:
-                stock_df = batch_data
-            elif stock in batch_data.columns.levels[0]:
-                stock_df = batch_data[stock]
-            else:
-                continue
+        # FIX: Download one stock at a time
+        stock_df = yf.download(stock, start=start_download_dt, progress=False, auto_adjust=False)
 
-            # FIX 2: Check if dataframe is empty
-            if stock_df.empty or len(stock_df) < 80:
-                continue
+        if stock_df.empty or len(stock_df) < 80:
+            print(f" -> {stock}: No data / insufficient data", flush=True)
+            continue
 
-            signal = analyze_stock(stock_df, stock)
+        signal = analyze_stock(stock_df, stock)
 
-            if signal:
-                all_signals.append(signal)
-                print(f" -> {stock}: SNIPER FOUND! Pullback to {signal['Pullback_To']}", flush=True)
+        if signal:
+            all_signals.append(signal)
+            print(f" -> {stock}: SNIPER FOUND! Pullback to {signal['Pullback_To']}", flush=True)
 
-        time.sleep(2)
-    except Exception as batch_err:
-        print(f"Batch Error: {batch_err}", flush=True)
-        time.sleep(5)
+        time.sleep(0.5) # Rate limit avoid karne ke liye
+
+    except Exception as e:
+        print(f" -> {stock}: Error - {str(e)[:50]}", flush=True)
+        continue
 
 # ===== UPDATE SHEET =====
 ws_sniper.clear()
