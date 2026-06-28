@@ -9,35 +9,31 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V35.2: SQUEEZE SCANNER + LIQUIDITY FILTER ===", flush=True)
+print("=== V41.0: CHOCH + HH+HL + SWING PULLBACK ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
-END_DATE = datetime(2026, 6, 25).date()
-START_DATE = datetime(2025, 6, 25).date()
+END_DATE = datetime.now().date()
+START_DATE = END_DATE - timedelta(days=365)
 BATCH_SIZE = 15
 
-# 💰 LIQUIDITY FILTER CONFIG
-MIN_AVG_VOLUME = 100000 # 1 Lakh shares minimum avg volume
-MIN_AVG_TURNOVER_CR = 5 # 5 Cr minimum avg daily turnover
+MIN_AVG_VOLUME = 100000
+MIN_AVG_TURNOVER_CR = 5
+SWING_LENGTH = 5
+PULLBACK_ZONE_PCT = 3.0 # Swing level se 3% upar-neeche
 
-R = {
-    'backtest_start': START_DATE,
-    'backtest_end': END_DATE,
-    'lookback_days': 14,
-}
-
+# ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 ws_watchlist = sh.worksheet("Watchlist")
 
 try:
-    ws_output = sh.worksheet("CHoCH_SQUEEZE_SIGNALS")
-    print("Worksheet connected.", flush=True)
+    ws_sniper = sh.worksheet("SWING_PULLBACK_SNIPER")
 except gspread.exceptions.WorksheetNotFound:
-    ws_output = sh.add_worksheet(title="CHoCH_SQUEEZE_SIGNALS", rows="1000", cols="15")
-    print("Worksheet created automatically!", flush=True)
+    ws_sniper = sh.add_worksheet(title="SWING_PULLBACK_SNIPER", rows="1000", cols="20")
+
+print("Sniper Worksheet connected.", flush=True)
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -45,129 +41,202 @@ def get_watchlist_stocks():
     stocks = [s + '.NS' if not s.endswith('.NS') and not s.startswith('^') else s for s in stocks]
     return stocks
 
-def check_structure_and_choch(df, idx, lookback=60):
+def get_swing_levels(df, idx, length=5):
+    """Latest 2 swing high aur 2 swing low"""
+    if idx < length * 4: return None
+
+    df_copy = df.iloc[:idx+1].copy()
+
+    ph_mask = (df_copy['High'].shift(length) < df_copy['High']) & (df_copy['High'].shift(-length) < df_copy['High'])
+    pl_mask = (df_copy['Low'].shift(length) > df_copy['Low']) & (df_copy['Low'].shift(-length) > df_copy['Low'])
+
+    pivot_highs = df_copy[ph_mask]['High'].tail(2)
+    pivot_lows = df_copy[pl_mask]['Low'].tail(2)
+
+    if len(pivot_highs) < 2 or len(pivot_lows) < 2:
+        return None
+
+    return {
+        'latest_ph': pivot_highs.iloc[-1],
+        'prev_ph': pivot_highs.iloc[-2],
+        'latest_pl': pivot_lows.iloc[-1],
+        'prev_pl': pivot_lows.iloc[-2],
+        'latest_ph_date': pivot_highs.index[-1],
+        'prev_ph_date': pivot_highs.index[-2],
+        'latest_pl_date': pivot_lows.index[-1],
+        'prev_pl_date': pivot_lows.index[-2]
+    }
+
+def check_choch_major_bottom(df, idx, lookback=60):
+    """CHOCH hua + Major bottom abhi tak break nahi hua"""
     if idx < lookback: return False, None
+
     window = df.iloc[idx-lookback:idx+1]
-    local_bottom_idx = window['Low'].idxmin()
-    local_bottom_price = window.loc[local_bottom_idx, 'Low']
+    major_bottom_idx = window['Low'].idxmin()
+    major_bottom_price = window.loc[major_bottom_idx, 'Low']
+    major_bottom_date = window.index[major_bottom_idx]
+
+    # 1. CHOCH - Close major bottom ke upar
+    if df.iloc[idx]['Close'] < major_bottom_price:
+        return False, None
+
+    # 2. Major bottom intact - Baad me koi candle iske neeche close nahi hui
+    post_bottom_df = df.loc[major_bottom_date:df.index[idx]]
+    if post_bottom_df['Low'].min() < major_bottom_price * 0.99:
+        return False, None
+
+    return True, major_bottom_price
+
+def check_hh_hl_swing_structure(swing_data, current_close):
+    """Swing se HH+HL confirm karo"""
+    if swing_data is None: return False
+
+    # HH: Latest PH > Prev PH
+    hh = swing_data['latest_ph'] > swing_data['prev_ph']
+
+    # HL: Latest PL > Prev PL
+    hl = swing_data['latest_pl'] > swing_data['prev_pl']
+
+    # Current price latest swing low ke upar - uptrend intact
+    uptrend = current_close > swing_data['latest_pl']
+
+    return hh and hl and uptrend
+
+def check_pullback_to_swing_support(df, idx, swing_data):
+    """Price Prev Swing High ya Prev Swing Low ke paas hai"""
+    if swing_data is None: return False, None, None
 
     current_close = df.iloc[idx]['Close']
-    if current_close < local_bottom_price: return False, None
+    latest_ph = swing_data['latest_ph']
+    prev_ph = swing_data['prev_ph']
+    prev_pl = swing_data['prev_pl']
 
-    recent_20 = df.iloc[idx-20:idx+1]
-    if recent_20['Low'].min() <= local_bottom_price: return False, None
+    # Condition: Latest PH se neeche aa gaya hai
+    if current_close >= latest_ph * 0.99:
+        return False, None, None
 
-    return True, local_bottom_price
+    # Check 1: Prev Swing High ke paas hai
+    dist_to_prev_ph = abs((current_close - prev_ph) / prev_ph) * 100
+    if dist_to_prev_ph <= PULLBACK_ZONE_PCT:
+        return True, "Prev_Swing_High", prev_ph
 
-def process_single_stock_data(stock_df, stock, start_date, end_date):
-    signals = []
-    try:
-        df = stock_df.dropna(subset=['Close']).copy()
-        if len(df) < 80: return []
+    # Check 2: Prev Swing Low ke paas hai
+    dist_to_prev_pl = abs((current_close - prev_pl) / prev_pl) * 100
+    if dist_to_prev_pl <= PULLBACK_ZONE_PCT:
+        return True, "Prev_Swing_Low", prev_pl
 
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['20_std'] = df['Close'].rolling(window=20).std()
-        df['Squeeze_Threshold'] = df['20_std'].rolling(window=50).quantile(0.20)
-        df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
-        df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000 # In Crores
+    return False, None, None
 
-        df_scan = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
+def check_strength(df, idx):
+    """Pullback ke baad strength - Green candle + volume up"""
+    if idx < 2: return False
 
-        for i in range(len(df_scan)):
-            idx = df.index.get_loc(df_scan.index[i])
-            if idx < 20: continue
+    # Current candle green
+    current_green = df.iloc[idx]['Close'] > df.iloc[idx]['Open']
 
-            row = df.iloc[idx]
+    # Volume aaj kal se zyada
+    volume_up = df.iloc[idx]['Volume'] > df.iloc[idx-1]['Volume']
 
-            # =======================================================
-            # 💰 LIQUIDITY FILTER: Pahle yahi check karo
-            # =======================================================
-            is_liquid = (row['Avg_Vol'] >= MIN_AVG_VOLUME) and (row['Avg_Turnover'] >= MIN_AVG_TURNOVER_CR)
-            if not is_liquid: continue # Illiquid stock ko seedha skip
+    # Last 3 me 2 green
+    last_3 = df.iloc[idx-2:idx+1]
+    green_count = len(last_3[last_3['Close'] > last_3['Open']])
 
-            # 1. Base Trend: Uptrend में ही होना चाहिए
-            if row['Close'] < row['EMA20']: continue
+    return current_green and volume_up and green_count >= 2
 
-            # 2. Structure: कोई मेजर मंदी न चल रही हो
-            struct_valid, recent_bottom = check_structure_and_choch(df, idx)
-            if not struct_valid: continue
+def analyze_stock(df, stock):
+    df = df.dropna(subset=['Close']).copy()
+    if len(df) < 80: return None
 
-            # पिछले 14 दिनों की रेंज निकालें
-            recent_14 = df.iloc[idx-R['lookback_days']:idx]
-            range_high = recent_14['High'].max()
-            range_low = recent_14['Low'].min()
+    # Indicators
+    df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
+    df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000
 
-            # 3. Squeeze Conditions
-            has_not_broken_out = row['Close'] <= range_high
-            is_squeezed = row['20_std'] <= row['Squeeze_Threshold']
-            is_volume_dry = row['Volume'] < row['Avg_Vol']
+    idx = len(df) - 1
+    row = df.iloc[idx]
 
-            if has_not_broken_out and is_squeezed and is_volume_dry:
-                signal_date = df.index[idx].date()
-                distance_pct = round(((range_high - row['Close']) / row['Close']) * 100, 2)
+    # 1. Liquidity check
+    if row['Avg_Vol'] < MIN_AVG_VOLUME or row['Avg_Turnover'] < MIN_AVG_TURNOVER_CR:
+        return None
 
-                if distance_pct <= 1.5:
-                    setup_type = "READY_TO_BLAST"
-                elif distance_pct <= 4.0:
-                    setup_type = "SQUEEZE_STAGE_2"
-                else:
-                    setup_type = "SQUEEZE_STAGE_1"
+    # 2. CHOCH + Major Bottom Intact
+    choch_ok, major_bottom = check_choch_major_bottom(df, idx)
+    if not choch_ok:
+        return None
 
-                signals.append({
-                    'Signal_Date': str(signal_date),
-                    'Stock': stock.replace('.NS', ''),
-                    'Close': round(row['Close'], 2),
-                    '14D_Resistance': round(range_high, 2),
-                    '14D_Support': round(range_low, 2),
-                    'Distance_Pct': distance_pct,
-                    'Range_Size_Pct': round(((range_high - range_low) / range_low) * 100, 2),
-                    'Recent_Bottom': round(recent_bottom, 2),
-                    'Volume': int(row['Volume']),
-                    'Avg_Volume': int(row['Avg_Vol']),
-                    'Avg_Turnover_Cr': round(row['Avg_Turnover'], 2),
-                    'Setup_Type': setup_type
-                })
-    except Exception as e:
-        print(f"Logic error on {stock}: {e}", flush=True)
-    return signals
+    # 3. Swing levels nikalo
+    swing_data = get_swing_levels(df, idx, SWING_LENGTH)
+    if swing_data is None:
+        return None
+
+    # 4. HH+HL structure check
+    hh_hl_ok = check_hh_hl_swing_structure(swing_data, row['Close'])
+    if not hh_hl_ok:
+        return None
+
+    # 5. Pullback to swing support
+    pullback_ok, pullback_to, support_level = check_pullback_to_swing_support(df, idx, swing_data)
+    if not pullback_ok:
+        return None
+
+    # 6. Strength check
+    if not check_strength(df, idx):
+        return None
+
+    # Sab condition pass - Stock ready hai
+    return {
+        'Signal_Date': str(df.index[idx].date()),
+        'Stock': stock.replace('.NS', ''),
+        'Close': round(row['Close'], 2),
+        'Major_Bottom': round(major_bottom, 2),
+        'Latest_Swing_High': round(swing_data['latest_ph'], 2),
+        'Prev_Swing_High': round(swing_data['prev_ph'], 2),
+        'Prev_Swing_Low': round(swing_data['prev_pl'], 2),
+        'Pullback_To': pullback_to,
+        'Support_Level': round(support_level, 2),
+        'Distance_From_Support_Pct': round(((row['Close'] - support_level) / support_level) * 100, 2),
+        'Volume': int(row['Volume']),
+        'Avg_Volume': int(row['Avg_Vol']),
+        'Entry_Above': round(swing_data['latest_ph'] * 1.001, 2),
+        'Stop_Loss': round(support_level * 0.99, 2),
+        'Risk_Pct': round(((row['Close'] - support_level * 0.99) / row['Close']) * 100, 2)
+    }
 
 # ===== MAIN EXECUTION =====
 stocks = get_watchlist_stocks()
 all_signals = []
 stock_batches = [stocks[i:i + BATCH_SIZE] for i in range(0, len(stocks), BATCH_SIZE)]
 
-print(f"\n=== SCANNING LIQUID SQUEEZE STOCKS ({len(stock_batches)} BATCHES) ===", flush=True)
-print(f"Liquidity Filter: Vol > {MIN_AVG_VOLUME/100000:.1f}L | Turnover > {MIN_AVG_TURNOVER_CR}Cr", flush=True)
-
+print(f"\n=== SCANNING {len(stocks)} STOCKS ===", flush=True)
 start_download_dt = START_DATE - timedelta(days=200)
 
 for b_idx, batch in enumerate(stock_batches):
     print(f"Processing Batch [{b_idx+1}/{len(stock_batches)}]...", flush=True)
     try:
-        batch_data = yf.download(batch, start=start_download_dt, end=END_DATE + timedelta(days=1), progress=False, group_by='ticker', auto_adjust=False)
+        batch_data = yf.download(batch, start=start_download_dt, progress=False, group_by='ticker', auto_adjust=False)
         if batch_data.empty: continue
 
         for stock in batch:
             stock_df = batch_data if len(batch) == 1 else (batch_data[stock] if stock in batch_data.columns.levels[0] else None)
             if stock_df is None: continue
 
-            stock_signals = process_single_stock_data(stock_df, stock, START_DATE, END_DATE)
-            if stock_signals:
-                all_signals.extend(stock_signals)
-                print(f" -> {stock}: Liquid Squeeze Found!", flush=True)
+            signal = analyze_stock(stock_df, stock)
+
+            if signal:
+                all_signals.append(signal)
+                print(f" -> {stock}: SNIPER FOUND! Pullback to {signal['Pullback_To']}", flush=True)
+
         time.sleep(2)
     except Exception as batch_err:
+        print(f"Batch Error: {batch_err}", flush=True)
         time.sleep(5)
 
 # ===== UPDATE SHEET =====
-ws_output.clear()
+ws_sniper.clear()
 if all_signals:
-    df_final = pd.DataFrame(all_signals).drop_duplicates(subset=['Signal_Date', 'Stock']).sort_values('Distance_Pct', ascending=True)
-    ws_output.update('A1', [df_final.columns.tolist()] + df_final.values.tolist())
-    print(f"\n=== FOUND {len(df_final)} LIQUID SQUEEZE STOCKS ===", flush=True)
-    print(f"READY_TO_BLAST: {len(df_final[df_final['Setup_Type']=='READY_TO_BLAST'])}", flush=True)
-    print(f"SQUEEZE_STAGE_2: {len(df_final[df_final['Setup_Type']=='SQUEEZE_STAGE_2'])}", flush=True)
-    print(f"SQUEEZE_STAGE_1: {len(df_final[df_final['Setup_Type']=='SQUEEZE_STAGE_1'])}", flush=True)
+    df_sniper = pd.DataFrame(all_signals).sort_values('Risk_Pct', ascending=True)
+    ws_sniper.update('A1', [df_sniper.columns.tolist()] + df_sniper.values.tolist())
+    print(f"\n=== FOUND {len(df_sniper)} SWING PULLBACK SETUPS ===", flush=True)
+    print(f"Best Pick: {df_sniper.iloc[0]['Stock']} | Pullback: {df_sniper.iloc[0]['Pullback_To']} | Risk: {df_sniper.iloc[0]['Risk_Pct']}%", flush=True)
 else:
-    ws_output.update('A1', [['No Liquid Squeeze Found']])
-    print(f"\n=== 0 SIGNALS ===", flush=True)
+    ws_sniper.update('A1', [['Aaj koi Swing Pullback Setup nahi mila']])
+    print(f"\n=== NO SETUPS TODAY ===", flush=True)
