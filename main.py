@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V35.1: PRE-BREAKOUT SQUEEZE SCANNER - OPTION 2 ===", flush=True)
+print("=== V35.2: SQUEEZE SCANNER + LIQUIDITY FILTER ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -17,10 +17,14 @@ END_DATE = datetime(2026, 6, 25).date()
 START_DATE = datetime(2025, 6, 25).date()
 BATCH_SIZE = 15
 
+# 💰 LIQUIDITY FILTER CONFIG
+MIN_AVG_VOLUME = 100000 # 1 Lakh shares minimum avg volume
+MIN_AVG_TURNOVER_CR = 5 # 5 Cr minimum avg daily turnover
+
 R = {
     'backtest_start': START_DATE,
     'backtest_end': END_DATE,
-    'lookback_days': 14, # RANGE CHECK PERIOD
+    'lookback_days': 14,
 }
 
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -32,7 +36,7 @@ try:
     ws_output = sh.worksheet("CHoCH_SQUEEZE_SIGNALS")
     print("Worksheet connected.", flush=True)
 except gspread.exceptions.WorksheetNotFound:
-    ws_output = sh.add_worksheet(title="CHoCH_SQUEEZE_SIGNALS", rows="1000", cols="12")
+    ws_output = sh.add_worksheet(title="CHoCH_SQUEEZE_SIGNALS", rows="1000", cols="15")
     print("Worksheet created automatically!", flush=True)
 
 def get_watchlist_stocks():
@@ -65,6 +69,7 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
         df['20_std'] = df['Close'].rolling(window=20).std()
         df['Squeeze_Threshold'] = df['20_std'].rolling(window=50).quantile(0.20)
         df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
+        df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000 # In Crores
 
         df_scan = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
 
@@ -73,6 +78,12 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
             if idx < 20: continue
 
             row = df.iloc[idx]
+
+            # =======================================================
+            # 💰 LIQUIDITY FILTER: Pahle yahi check karo
+            # =======================================================
+            is_liquid = (row['Avg_Vol'] >= MIN_AVG_VOLUME) and (row['Avg_Turnover'] >= MIN_AVG_TURNOVER_CR)
+            if not is_liquid: continue # Illiquid stock ko seedha skip
 
             # 1. Base Trend: Uptrend में ही होना चाहिए
             if row['Close'] < row['EMA20']: continue
@@ -86,25 +97,15 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
             range_high = recent_14['High'].max()
             range_low = recent_14['Low'].min()
 
-            # =======================================================
-            # 💎 OPTION 2 LOGIC: SAB SQUEEZE PAKDO, DISTANCE SE SORT KARO
-            # =======================================================
-
-            # कंडीशन A: अभी ब्रेकआउट नहीं हुआ होना चाहिए
+            # 3. Squeeze Conditions
             has_not_broken_out = row['Close'] <= range_high
-
-            # कंडीशन B: पूरी तरह से स्क्वीज़
             is_squeezed = row['20_std'] <= row['Squeeze_Threshold']
-
-            # कंडीशन C: वॉल्यूम ड्राई अप
             is_volume_dry = row['Volume'] < row['Avg_Vol']
 
-            # ट्रिगर: Resistance ke paas hona zaroori nahi, bas squeeze ho
             if has_not_broken_out and is_squeezed and is_volume_dry:
                 signal_date = df.index[idx].date()
                 distance_pct = round(((range_high - row['Close']) / row['Close']) * 100, 2)
 
-                # Distance ke hisaab se Setup Type decide karo
                 if distance_pct <= 1.5:
                     setup_type = "READY_TO_BLAST"
                 elif distance_pct <= 4.0:
@@ -123,6 +124,7 @@ def process_single_stock_data(stock_df, stock, start_date, end_date):
                     'Recent_Bottom': round(recent_bottom, 2),
                     'Volume': int(row['Volume']),
                     'Avg_Volume': int(row['Avg_Vol']),
+                    'Avg_Turnover_Cr': round(row['Avg_Turnover'], 2),
                     'Setup_Type': setup_type
                 })
     except Exception as e:
@@ -134,7 +136,8 @@ stocks = get_watchlist_stocks()
 all_signals = []
 stock_batches = [stocks[i:i + BATCH_SIZE] for i in range(0, len(stocks), BATCH_SIZE)]
 
-print(f"\n=== SCANNING FOR ALL SQUEEZE STAGES ({len(stock_batches)} BATCHES) ===", flush=True)
+print(f"\n=== SCANNING LIQUID SQUEEZE STOCKS ({len(stock_batches)} BATCHES) ===", flush=True)
+print(f"Liquidity Filter: Vol > {MIN_AVG_VOLUME/100000:.1f}L | Turnover > {MIN_AVG_TURNOVER_CR}Cr", flush=True)
 
 start_download_dt = START_DATE - timedelta(days=200)
 
@@ -151,7 +154,7 @@ for b_idx, batch in enumerate(stock_batches):
             stock_signals = process_single_stock_data(stock_df, stock, START_DATE, END_DATE)
             if stock_signals:
                 all_signals.extend(stock_signals)
-                print(f" -> {stock}: Squeeze Setup Found!", flush=True)
+                print(f" -> {stock}: Liquid Squeeze Found!", flush=True)
         time.sleep(2)
     except Exception as batch_err:
         time.sleep(5)
@@ -161,10 +164,10 @@ ws_output.clear()
 if all_signals:
     df_final = pd.DataFrame(all_signals).drop_duplicates(subset=['Signal_Date', 'Stock']).sort_values('Distance_Pct', ascending=True)
     ws_output.update('A1', [df_final.columns.tolist()] + df_final.values.tolist())
-    print(f"\n=== FOUND {len(df_final)} SQUEEZE STOCKS ===", flush=True)
+    print(f"\n=== FOUND {len(df_final)} LIQUID SQUEEZE STOCKS ===", flush=True)
     print(f"READY_TO_BLAST: {len(df_final[df_final['Setup_Type']=='READY_TO_BLAST'])}", flush=True)
     print(f"SQUEEZE_STAGE_2: {len(df_final[df_final['Setup_Type']=='SQUEEZE_STAGE_2'])}", flush=True)
     print(f"SQUEEZE_STAGE_1: {len(df_final[df_final['Setup_Type']=='SQUEEZE_STAGE_1'])}", flush=True)
 else:
-    ws_output.update('A1', [['No Squeeze Found']])
+    ws_output.update('A1', [['No Liquid Squeeze Found']])
     print(f"\n=== 0 SIGNALS ===", flush=True)
