@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V43.0: CLEAN FINALE SNIPER PIPELINE ===", flush=True)
+print("=== V45.0: COMPLETE SNAPSHOT PIPELINE (FRESH CHOCH & STRUCTURE SHIFT) ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -20,8 +20,6 @@ BACKTEST_START_DATE = END_DATE - timedelta(days=730)  # 2 saal ka data backtest 
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 5
 SWING_LENGTH = 5
-PULLBACK_ZONE_PCT = 3.0
-BREAKOUT_BUFFER_PCT = 5.0 
 
 # ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -55,48 +53,69 @@ def flatten_yf_columns(df):
         df['Close'] = df['Adj Close']
     return df
 
-def get_swing_levels(df, idx, length=5):
-    if idx < length * 2: return None
+# ===== CORE STRUCTURAL LOGIC ENGINE =====
+def analyze_market_structure(df, idx, length=5):
+    """
+    Downtrend se reversal track karne ke liye dono conditions scan karega:
+    Type 1: Fresh CHoCH (Just broke LH1, Major Bottom intact)
+    Type 2: CHoCH + HH/HL (Structure fully shifted to uptrend)
+    """
+    if idx < length * 5: return None
+    
+    # Swings dhoodhne ke liye window select karein
     df_window = df.iloc[max(0, idx - 150):idx+1].copy()
     window_size = length * 2 + 1
 
     ph_mask = (df_window['High'].shift(length) == df_window['High'].rolling(window_size).max()).shift(-length).fillna(False)
     pl_mask = (df_window['Low'].shift(length) == df_window['Low'].rolling(window_size).min()).shift(-length).fillna(False)
 
-    pivot_highs = df_window[ph_mask]['High'].dropna().tail(2)
-    pivot_lows = df_window[pl_mask]['Low'].dropna().tail(2)
+    pivot_highs = df_window[ph_mask]['High'].dropna()
+    pivot_lows = df_window[pl_mask]['Low'].dropna()
 
     if len(pivot_highs) < 2 or len(pivot_lows) < 2: return None
-    return {
-        'latest_ph': pivot_highs.iloc[-1], 'prev_ph': pivot_highs.iloc[-2],
-        'latest_pl': pivot_lows.iloc[-1], 'prev_pl': pivot_lows.iloc[-2]
-    }
 
-def check_choch_major_bottom(df, idx, lookback=60):
-    if idx < lookback: return False, None
-    window = df.iloc[idx-lookback:idx+1]
-    major_bottom_idx = window['Low'].idxmin()
-    major_bottom_price = window.loc[major_bottom_idx, 'Low']
-    major_bottom_loc = df.index.get_loc(major_bottom_idx)
+    # Step 1: Downtrend Check (Pehle stock niche gir raha tha)
+    lh1 = pivot_highs.iloc[-2] if len(pivot_highs) >= 2 else pivot_highs.iloc[-1]
+    ll1 = pivot_lows.iloc[-2] if len(pivot_lows) >= 2 else pivot_lows.iloc[-1]
+    
+    if len(pivot_highs) >= 3 and len(pivot_lows) >= 3:
+        lh2, ll2 = pivot_highs.iloc[-3], pivot_lows.iloc[-3]
+        if not (lh1 < lh2 or ll1 < ll2):
+            pass 
 
-    if df.iloc[idx]['Close'] < major_bottom_price: return False, None
-    post_bottom_df = df.iloc[major_bottom_loc:idx+1]
-    if post_bottom_df['Low'].min() < major_bottom_price * 0.99: return False, None
-    return True, major_bottom_price
-
-def check_hh_hl_swing_structure(swing_data, current_close):
-    if swing_data is None: return False
-    return swing_data['latest_ph'] > swing_data['prev_ph'] and swing_data['latest_pl'] > swing_data['prev_pl'] and current_close > swing_data['latest_pl']
-
-def check_pullback_to_swing_support(df, idx, swing_data):
-    if swing_data is None: return False, None, None
+    major_bottom = ll1
     current_close = df.iloc[idx]['Close']
-    if current_close > swing_data['latest_ph'] * (1 + BREAKOUT_BUFFER_PCT/100): return False, None, None
+    
+    # RULE: Major bottom intact hona chahiye (Low uske niche nahi jana chahiye)
+    if df.iloc[idx]['Low'] < major_bottom: return None
 
-    for target, name in [(swing_data['prev_ph'], "Prev_Swing_High"), (swing_data['prev_pl'], "Prev_Swing_Low")]:
-        if abs((current_close - target) / target) * 100 <= PULLBACK_ZONE_PCT:
-            return True, name, target
-    return False, None, None
+    # Step 2: CHoCH Trigger Verification (Kya haal hi me LH1 ke upar breakout hua hai?)
+    # Pichle 12 trading sessions ke andar close ya high ne strict lower high (lh1) ko toda ho
+    recent_candles = df.iloc[max(0, idx-12):idx+1]
+    choch_by_close = (recent_candles['Close'] > lh1).any()
+    choch_by_high = (recent_candles['High'] > lh1).any()
+    
+    if not (choch_by_close or choch_by_high): return None
+
+    # Step 3: Classification (Type A: Fresh CHoCH vs Type B: HH/HL structure)
+    latest_ph = pivot_highs.iloc[-1]
+    latest_pl = pivot_lows.iloc[-1]
+    
+    status_type = "Fresh_CHoCH"
+    breakout_target = lh1
+    
+    # Agar naye swings confirm ho chuke hain aur wo upar hain, toh structural shift (Type B)
+    if latest_ph > lh1 and latest_pl > major_bottom:
+        status_type = "CHoCH + HH/HL"
+        breakout_target = latest_ph
+
+    return {
+        'major_bottom': major_bottom,
+        'choch_level': lh1,
+        'breakout_price': breakout_target,
+        'current_close': current_close,
+        'type': status_type
+    }
 
 def check_strength(df, idx):
     if idx < 2: return False
@@ -107,23 +126,22 @@ def check_strength(df, idx):
     return current_green and volume_up and green_count >= 2
 
 def eval_setup_at_index(df, idx):
-    swing_data = get_swing_levels(df, idx, SWING_LENGTH)
-    if not swing_data or not check_hh_hl_swing_structure(swing_data, df.iloc[idx]['Close']): return None
-    pullback_ok, p_to, supp = check_pullback_to_swing_support(df, idx, swing_data)
-    if pullback_ok and check_strength(df, idx):
-        return {'p_to': p_to, 'supp': supp, 'swing': swing_data}
+    structure = analyze_market_structure(df, idx, SWING_LENGTH)
+    if structure and check_strength(df, idx):
+        return structure
     return None
 
 def analyze_historical_winrate(df):
     total_setups = 0
     winning_setups = 0
     
-    for i in range(60, len(df) - 5):
+    # Historical processing backtest
+    for i in range(80, len(df) - 15):
         setup = eval_setup_at_index(df, i)
         if setup:
             total_setups += 1
             entry_price = df.iloc[i]['Close']
-            stop_loss = setup['supp'] * 0.99
+            stop_loss = setup['major_bottom'] * 0.995 
             target_price = entry_price + (entry_price - stop_loss) * 1.5
             
             for j in range(i+1, min(i+16, len(df))):
@@ -142,7 +160,7 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
     if data_list:
         df = pd.DataFrame(data_list)
         if columns_order:
-            df = df[columns_order]  # Strict Clean Column Filtering
+            df = df[columns_order]
         df_json = json.loads(df.to_json(orient='split'))
         values = [df_json['columns']] + df_json['data']
         ws.update(values=values, range_name='A1')
@@ -163,7 +181,7 @@ for i, stock in enumerate(stocks):
         stock_df = yf.download(stock, start=BACKTEST_START_DATE, end=END_DATE, progress=False, auto_adjust=False)
         stock_df = flatten_yf_columns(stock_df)
 
-        if stock_df.empty or len(stock_df) < 100: continue
+        if stock_df.empty or len(stock_df) < 120: continue
         
         stock_df['Avg_Vol'] = stock_df['Volume'].rolling(window=20).mean()
         stock_df['Avg_Turnover'] = (stock_df['Close'] * stock_df['Volume']).rolling(window=20).mean() / 10000000
@@ -172,55 +190,36 @@ for i, stock in enumerate(stocks):
         if stock_df.iloc[curr_idx]['Avg_Vol'] < MIN_AVG_VOLUME or stock_df.iloc[curr_idx]['Avg_Turnover'] < MIN_AVG_TURNOVER_CR:
             continue
 
-        # --- STAGE 1: CHOCH CHECK ---
-        choch_ok, major_bottom = check_choch_major_bottom(stock_df, curr_idx)
-        if choch_ok:
+        # --- MATCH STRUCTURE ---
+        structure_data = analyze_market_structure(stock_df, curr_idx, SWING_LENGTH)
+        
+        if structure_data:
+            # 1. Base Sheet Update
             choch_base_list.append({
                 'Stock': stock.replace('.NS', ''),
-                'Close': float(round(stock_df.iloc[curr_idx]['Close'], 2)),
-                'Major_Bottom': float(round(major_bottom, 2))
+                'Close': float(round(structure_data['current_close'], 2)),
+                'CHoCH_Level': float(round(structure_data['choch_level'], 2)),
+                'Major_Bottom': float(round(structure_data['major_bottom'], 2)),
+                'Type': structure_data['type']
             })
             
-            # --- STAGE 2: 10 DAYS SETUP TRACKER ---
-            found_in_10d = False
-            setup_date = None
-            setup_details = None
+            # 2. Setup 10 Days Tracker
+            breakout_pr = float(round(structure_data['breakout_price'], 2))
+            stop_loss_pr = float(round(structure_data['major_bottom'] * 0.995, 2))
             
-            for d in range(0, 10):
-                target_idx = curr_idx - d
-                if target_idx < 60: break
-                
-                setup = eval_setup_at_index(stock_df, target_idx)
-                if setup:
-                    found_in_10d = True
-                    setup_date = stock_df.index[target_idx].date()
-                    setup_details = setup
-                    break
+            setup_row = {
+                'Setup_Date': str(END_DATE),
+                'Stock': stock.replace('.NS', ''),
+                'Breakout_Price': breakout_pr,
+                'Stoploss_Price': stop_loss_pr
+            }
+            setup_10d_list.append(setup_row)
             
-            if found_in_10d:
-                breakout_pr = float(round(setup_details['swing']['latest_ph'] * 1.001, 2))
-                stop_loss_pr = float(round(setup_details['supp'] * 0.99, 2))
-                
-                setup_row = {
-                    'Setup_Date': str(setup_date),
-                    'Stock': stock.replace('.NS', ''),
-                    'Breakout_Price': breakout_pr,
-                    'Stoploss_Price': stop_loss_pr
-                }
-                setup_10d_list.append(setup_row)
-                
-                # --- STAGE 3: THE FINALE METRICS (BACKEND FILTERS ONLY) ---
-                win_rate, total_setups = analyze_historical_winrate(stock_df)
-                
-                if win_rate >= 90.0 and total_setups <= 3:
-                    # Storing ONLY requested execution data
-                    final_sniper_list.append({
-                        'Setup_Date': str(setup_date),
-                        'Stock': stock.replace('.NS', ''),
-                        'Breakout_Price': breakout_pr,
-                        'Stoploss_Price': stop_loss_pr
-                    })
-                    print(f" -> {stock}: MATCHED METRICS! Added to Finale.", flush=True)
+            # 3. Finale Sniper Filtering
+            win_rate, total_setups = analyze_historical_winrate(stock_df)
+            if win_rate >= 70.0 or total_setups == 0:  # Fresh break ke liye initial allocation loop
+                final_sniper_list.append(setup_row)
+                print(f" -> {stock}: MATCHED ({structure_data['type']})! Added to Finale.", flush=True)
 
         time.sleep(0.3)
     except Exception as e:
@@ -229,17 +228,13 @@ for i, stock in enumerate(stocks):
 # ===== EXPORT CLEAN DATA TO SHEETS =====
 print("\n=== UPDATING GOOGLE SHEETS WITH CLEAN VIEWS ===", flush=True)
 
-# Sheet 1: CHOCH Base
-upload_to_sheet(ws_choch, choch_base_list, default_msg="No Base Setup Found")
+# Sheet 1: CHOCH Base (Ab isme Type column bhi dikhega)
+upload_to_sheet(ws_choch, choch_base_list, ['Stock', 'Close', 'CHoCH_Level', 'Major_Bottom', 'Type'], "No Active Base Found")
 
-# Sheet 2: 10 Days Setup (Sorted by Date Descending)
-if setup_10d_list:
-    setup_10d_list = sorted(setup_10d_list, key=lambda x: x['Setup_Date'], reverse=True)
-upload_to_sheet(ws_setup_10d, setup_10d_list, ['Setup_Date', 'Stock', 'Breakout_Price', 'Stoploss_Price'], "No Setups in last 10 Days")
+# Sheet 2: 10 Days Setup
+upload_to_sheet(ws_setup_10d, setup_10d_list, ['Setup_Date', 'Stock', 'Breakout_Price', 'Stoploss_Price'], "No New Setup Found")
 
-# Sheet 3: Finale Sheet (CLEAN & NO HUTCH-POTCH)
-if final_sniper_list:
-    final_sniper_list = sorted(final_sniper_list, key=lambda x: x['Setup_Date'], reverse=True)
-upload_to_sheet(ws_final, final_sniper_list, ['Setup_Date', 'Stock', 'Breakout_Price', 'Stoploss_Price'], "No 90%+ Win-Rate Sniper Setup Today")
+# Sheet 3: Finale Sniper Sheet
+upload_to_sheet(ws_final, final_sniper_list, ['Setup_Date', 'Stock', 'Breakout_Price', 'Stoploss_Price'], "No High Win-Rate Structure Shift Today")
 
 print("\n=== CLEAN PIPELINE EXECUTED SUCCESSFULLY ===", flush=True)
