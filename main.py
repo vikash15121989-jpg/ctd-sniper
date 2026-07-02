@@ -13,7 +13,8 @@ print("=== V100.2: THE SMART GRADING & AUTO-FILTER ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
-END_DATE = datetime.now().date()
+# yfinance में end_date हमेशा exclusive होती है, इसलिए 1 दिन आगे रखने से आज (Current Day) का डेटा पूरा शामिल हो जाता है
+END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
 
 MIN_AVG_VOLUME = 100000
@@ -61,6 +62,8 @@ def scan_pre_dhamaka(df, idx):
         return None
 
     current_close = df.iloc[idx]['Close']
+    # किस तारीख का क्लोजिंग डेटा लिया जा रहा है उसे ट्रैक करने के लिए
+    signal_date = df.index[idx].strftime('%d-%b') 
 
     # 1. BADA FRAMEWORK (Pichle 100 dino ka data)
     historical_100d = df.iloc[max(0, idx-100):idx]
@@ -135,13 +138,14 @@ def scan_pre_dhamaka(df, idx):
 
             return {
                 'Stock': '', 
-                'Grade': grade, # Naya Grading Column
+                'Grade': grade, 
                 'Current_Close': round(current_close, 2),
                 'Buy_Level': round(current_close, 2),
                 'StopLoss': stop_loss,
                 'Target': target_1,
                 'RR': round(reward/risk, 1),
-                'Details': f"Tested:{total_touchpoints}x | {status_msg} ({round(best_range_found, 1)}%)"
+                # Details में तारीख (Date) जोड़ दी है ताकि कन्फर्म रहे कि किस दिन का क्लोज प्राइस है
+                'Details': f"[{signal_date}] Tested:{total_touchpoints}x | {status_msg} ({round(best_range_found, 1)}%)"
             }
 
     return None
@@ -188,7 +192,8 @@ for i, stock in enumerate(stocks):
             continue
 
         print(f"[{i+1}/{len(stocks)}] Scanning {stock}...", end=' ', flush=True)
-        stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=False)
+        # auto_adjust=True किया ताकि क्लोजिंग डेटा में कोई टाइमज़ोन एडजस्टमेंट एरर न आए
+        stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
         stock_df = flatten_yf_columns(stock_df)
 
         if stock_df.empty or len(stock_df) < MIN_DATA_DAYS:
