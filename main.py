@@ -9,32 +9,23 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V100.3: THE SMART GRADING & AUTO-FILTER ENGINE (DYNAMIC MARGIN) ===", flush=True)
-print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+print("=========================================================", flush=True)
+print("=== V400_BACKTEST: SMART MONEY CONCEPT BACKTESTER ===", flush=True)
+print("=========================================================", flush=True)
 
 # ===== CONFIG =====
-END_DATE = (datetime.now() + timedelta(days=1)).date()
-START_DATE = END_DATE - timedelta(days=365)
+BACKTEST_DAYS = 45  # पिछले 45 दिनों के डेटा में सिग्नल ढूंढेगा
+LOOKAHEAD_DAYS = 3  # सिग्नल मिलने के बाद अगले 3 दिनों का मैक्सिमम मूव ट्रैक करेगा
 
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 5
-MIN_DATA_DAYS = 50 
+MIN_DATA_DAYS = 50
 
-# ===== GOOGLE SHEETS SETUP =====
+# ===== GOOGLE SHEETS SETUP (केवल वॉचलिस्ट से स्टॉक नाम पढ़ने के लिए) =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
-
-def get_or_create_sheet(title):
-    try:
-        return sh.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows="1000", cols="20")
-
 ws_watchlist = sh.worksheet("Watchlist")
-ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
-
-print("All Sheets Connected Safely.", flush=True)
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -55,167 +46,115 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== 🎯 THE SMART AUTO-GRADING ENGINE (V100.3) 🎯 =====
-def scan_pre_dhamaka(df, idx):
-    if idx < MIN_DATA_DAYS or df.iloc[idx]['Volume'] == 0:
-        return None
-
-    current_close = df.iloc[idx]['Close']
-    signal_date = df.index[idx].strftime('%d-%b') 
-
-    # 1. BADA FRAMEWORK (Pichle 100 dino ka data)
-    historical_100d = df.iloc[max(0, idx-100):idx]
-    if len(historical_100d) < 20: return None
-
-    absolute_low = historical_100d['Low'].min()
-
-    # --- STEP 1: MULTI-SUPPORT CHECK (मार्जिन बढ़ाया: 1.8% से 4.0% किया) ---
-    support_zone_upper = absolute_low * 1.04
-    candles_in_zone = historical_100d[historical_100d['Low'] <= support_zone_upper]
-    total_touchpoints = len(candles_in_zone)
-
-    # --- STEP 2: SMART MONEY ENTRY CHECK ---
-    vol_20ma_hist = df['Volume'].iloc[max(0, idx-35):idx].mean()
-    if pd.isna(vol_20ma_hist) or vol_20ma_hist == 0: return None
-
-    recent_25d = df.iloc[max(0, idx-25):idx]
-    has_smart_money = (recent_25d['Volume'] > (vol_20ma_hist * 2.5)).any()
-
-    # --- STEP 3 & 4: LOOK-BACK WINDOW FOR SQUEEZE ---
-    matched_in_window = False
-    best_range_found = 100.0
-    days_ago_matched = 0
-
-    for shift in range(4): 
-        check_idx = idx - shift
-        if check_idx < 20: continue
-
-        recent_6d = df['Close'].iloc[max(0, check_idx-5):check_idx+1] 
-        if len(recent_6d) < 6: continue
-        price_range_pct = ((recent_6d.max() - recent_6d.min()) / recent_6d.min()) * 100
-
-        vol_20ma_current = df['Volume'].iloc[max(0, check_idx-20):check_idx].mean()
-        if pd.isna(vol_20ma_current) or vol_20ma_current == 0: continue
-
-        day_volume = df.iloc[check_idx]['Volume']
-
-        if price_range_pct <= 3.8 and day_volume < (vol_20ma_current * 0.85):
-            matched_in_window = True
-            if price_range_pct < best_range_found:
-                best_range_found = price_range_pct
-                days_ago_matched = shift
-
-    # --- STEP 5: CURRENT PRICE POSITION (मार्जिन बढ़ाया: 3.0% से 15.0% किया) ---
-    distance_from_floor = ((current_close - absolute_low) / absolute_low) * 100
-    is_at_support_now = 0.0 <= distance_from_floor <= 15.0
-
-    # ===== TRIGGER COMPILATION & GRADING LOGIC =====
-    if total_touchpoints >= 1 and has_smart_money and matched_in_window and is_at_support_now:
-
-        # SL Calculation (सपोर्ट बेस बड़ा होने पर एब्सोल्यूट लो की जगह करंट क्लोज से 6% का बफर भी सेफ रखता है)
-        atr = (df['High'] - df['Low']).iloc[max(0, idx-14):idx].mean()
-        stop_loss = round(max(absolute_low * 0.99, current_close - 1.5 * atr, current_close * 0.94), 2)
-
-        # Target Calculation
-        swing_high = df['High'].iloc[max(0, idx-100):idx].max()
-        target_1 = round(current_close * 1.15, 2) if swing_high <= current_close * 1.02 else round(swing_high, 2)
-
-        risk = current_close - stop_loss
-        reward = target_1 - current_close
-
-        if risk > 0 and (reward / risk) >= 1.5 and current_close > stop_loss:
-            status_msg = "Squeeze Today" if days_ago_matched == 0 else f"Squeeze {days_ago_matched}D Ago"
-            
-            # 🎯 VIKASH SMART GRADING MATRIX (नए मार्जिन के हिसाब से अडैप्टेड) 🎯
-            if total_touchpoints >= 4 and best_range_found <= 2.2 and distance_from_floor <= 5.0:
-                grade = "GRADE A+ (Ultra Sniper)"
-            elif has_smart_money and distance_from_floor <= 15.0 and best_range_found <= 3.5:
-                grade = "GRADE A (High Vol Breakout Setup)"
-            else:
-                grade = "GRADE B (Watch closely)"
-
-            return {
-                'Stock': '', 
-                'Grade': grade, 
-                'Current_Close': round(current_close, 2),
-                'Buy_Level': round(current_close, 2),
-                'StopLoss': stop_loss,
-                'Target': target_1,
-                'RR': round(reward/risk, 1),
-                'Details': f"[{signal_date}] FloorDist:{round(distance_from_floor, 1)}% | {status_msg} ({round(best_range_found, 1)}%)"
-            }
-
-    return None
-
-def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
-    try:
-        ws.batch_clear(['A:Z'])
-        time.sleep(1)
-        if data_list:
-            df = pd.DataFrame(data_list)
-            if columns_order:
-                for col in columns_order:
-                    if col not in df.columns: df[col] = ''
-                df = df[columns_order]
-            
-            df.sort_values(by=['Grade'], ascending=True, inplace=True)
-            
-            df_json = json.loads(df.to_json(orient='split'))
-            values = [df_json['columns']] + df_json['data']
-            ws.update(values=values, range_name='A1')
-            print(f"Uploaded {len(data_list)} sorted rows.", flush=True)
-        else:
-            ws.update(values=[[default_msg]], range_name='A1')
-    except Exception as e:
-        print(f"Sheet Error: {str(e)}", flush=True)
-
-# ===== MAIN EXECUTION LOOP =====
+# ===== BACKTEST EXECUTION =====
 stocks = get_watchlist_stocks()
-final_dhamaka_watchlist = []
+all_signals = []
 
-REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
+print(f"Total Stocks Loaded from Watchlist: {len(stocks)}", flush=True)
+print("Fetching data and running analysis... कृपया प्रतीक्षा करें...\n", flush=True)
 
-print(f"\n=== PROCESSING {len(stocks)} STOCKS ===", flush=True)
+# 1 साल का डेटा डाउनलोड करेंगे ताकि 20 MA सही से बने
+end_date = (datetime.now() + timedelta(days=1)).date()
+start_date = end_date - timedelta(days=365)
 
-for i, stock in enumerate(stocks):
+for stock in stocks:
     try:
         symbol_clean = stock.replace('.NS', '')
-        
-        if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
-            print(f"[{i+1}/{len(stocks)}] {stock} -> Skip: ETF/Liquid Fund Detected.", flush=True)
+        df = yf.download(stock, start=start_date, end=end_date, progress=False, auto_adjust=True)
+        df = flatten_yf_columns(df)
+
+        if df.empty or len(df) < MIN_DATA_DAYS:
             continue
 
-        print(f"[{i+1}/{len(stocks)}] Scanning {stock}...", end=' ', flush=True)
-        stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
-        stock_df = flatten_yf_columns(stock_df)
+        # इंडिकेटर्स की गणना
+        df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
+        df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000
 
-        if stock_df.empty or len(stock_df) < MIN_DATA_DAYS:
-            print("Skipped: Insufficient data", flush=True)
-            continue
+        total_rows = len(df)
+        # पिछले 45 दिनों के दायरे में हर एक दिन पर लॉजिक चेक करेंगे
+        start_idx = max(MIN_DATA_DAYS, total_rows - BACKTEST_DAYS)
 
-        stock_df['Avg_Vol'] = stock_df['Volume'].rolling(window=20).mean()
-        stock_df['Avg_Turnover'] = (stock_df['Close'] * stock_df['Volume']).rolling(window=20).mean() / 10000000
+        for idx in range(start_idx, total_rows - LOOKAHEAD_DAYS):
+            current_close = df.iloc[idx]['Close']
+            current_high = df.iloc[idx]['High']
+            current_low = df.iloc[idx]['Low']
+            current_vol = df.iloc[idx]['Volume']
+            prev_close = df.iloc[idx-1]['Close']
+            vol_20ma = df.iloc[idx]['Avg_Vol']
+            avg_turnover = df.iloc[idx]['Avg_Turnover']
 
-        curr_idx = len(stock_df) - 1
-        avg_vol = stock_df.iloc[curr_idx]['Avg_Vol']
-        avg_turnover = stock_df.iloc[curr_idx]['Avg_Turnover']
+            if pd.isna(vol_20ma) or vol_20ma == 0 or current_vol == 0: 
+                continue
+            if vol_20ma < MIN_AVG_VOLUME or avg_turnover < MIN_AVG_TURNOVER_CR:
+                continue
 
-        if pd.isna(avg_vol) or pd.isna(avg_turnover) or avg_vol < MIN_AVG_VOLUME or avg_turnover < MIN_AVG_TURNOVER_CR:
-            print("Skipped: Low liquidity/NaN filters", flush=True)
-            continue
+            # --- 🎯 कड़े स्मार्ट मनी नियम 🎯 ---
+            # 1. वॉल्यूम शॉक (3.5 गुना से ज्यादा)
+            is_institutional_vol = current_vol >= (vol_20ma * 3.5)
+            
+            # 2. प्राइस एब्जॉर्प्शन (क्लोज पिछले 5 दिन के क्लोज एवरेज से ऊपर)
+            avg_close_5d = df['Close'].iloc[max(0, idx-5):idx].mean()
+            is_price_absorbed = current_close > avg_close_5d
 
-        setup = scan_pre_dhamaka(stock_df, curr_idx)
-        if setup:
-            setup['Stock'] = symbol_clean
-            final_dhamaka_watchlist.append(setup)
-            print(f"🔥 MATCHED! {setup['Grade']}", flush=True)
-        else:
-            print("No setup", flush=True)
+            # 3. मजबूत क्लोजिंग (ऊपरी 30% हिस्से में क्लोज)
+            candle_range = current_high - current_low
+            is_smart_close = False
+            if candle_range > 0:
+                is_smart_close = (current_high - current_close) / candle_range <= 0.30
 
-        time.sleep(0.15)
+            # 4. शांत प्राइस मूव (सिर्फ 1% से 5% के बीच की बढ़त)
+            daily_gain = ((current_close - prev_close) / prev_close) * 100
+            is_valid_range = 1.0 <= daily_gain <= 5.0
+
+            # अगर सारे नियम पास हुए, तो यह "सिग्नल का दिन" है
+            if is_institutional_vol and is_price_absorbed and is_smart_close and is_valid_range:
+                signal_date = df.index[idx].strftime('%Y-%m-%d')
+                
+                # --- 🔍 अब अगले 3 दिनों का सच ट्रैक करेंगे 🔍 ---
+                future_df = df.iloc[idx+1 : idx+1+LOOKAHEAD_DAYS]
+                
+                # सिग्नल वाले दिन के क्लोज से अगले 3 दिनों का सबसे उच्चतम स्तर (Max High)
+                max_future_high = future_df['High'].max()
+                
+                # कितना मैक्सिमम रिटर्न मिला (%)
+                max_move_pct = ((max_future_high - current_close) / current_close) * 100
+                
+                # पहले दिन (T+1) का ओपन और लो (यह चेक करने के लिए कि क्या एंट्री मिली)
+                next_day_open = future_df.iloc[0]['Open']
+                next_day_low = future_df.iloc[0]['Low']
+
+                all_signals.append({
+                    'Stock': symbol_clean,
+                    'Signal_Date': signal_date,
+                    'Vol_Shock': round(current_vol / vol_20ma, 1),
+                    'Signal_Gain%': round(daily_gain, 1),
+                    'Close_Price': round(current_close, 2),
+                    'Next_3D_Max_Move%': round(max_move_pct, 1)
+                })
+
+        time.sleep(0.05)
     except Exception as e:
-        print(f"Error - {str(e)}", flush=True)
+        pass
 
-columns = ['Stock', 'Grade', 'Current_Close', 'Buy_Level', 'StopLoss', 'Target', 'RR', 'Details']
-upload_to_sheet(ws_dhamaka_watch, final_dhamaka_watchlist, columns, "No Pre-Dhamaka Setup Found Today")
-print("\n=== SYSTEM EXECUTION COMPLETED ===", flush=True)
+# ===== रिजल्ट प्रिंट करना =====
+print("\n=================== BACKTEST RESULTS ===================", flush=True)
+if all_signals:
+    backtest_df = pd.DataFrame(all_signals)
+    # तारीख के हिसाब से सॉर्ट करें
+    backtest_df.sort_values(by='Signal_Date', ascending=False, inplace=True)
+    
+    # रिजल्ट को सुंदर टेबल फॉर्मेट में दिखाएं
+    print(backtest_df.to_string(index=False), flush=True)
+    
+    # समरी स्टैट्स
+    hit_10pct = sum(backtest_df['Next_3D_Max_Move%'] >= 10.0)
+    hit_5pct = sum(backtest_df['Next_3D_Max_Move%'] >= 5.0)
+    total_signals = len(backtest_df)
+    
+    print("\n========= SUMMARY =========", flush=True)
+    print(f"Total Signals Found: {total_signals}", flush=True)
+    print(f"Signals giving > 5% move within 3 days: {hit_5pct} ({round(hit_5pct/total_signals*100, 1)}%)", flush=True)
+    print(f"Signals giving > 10% move (Target) within 3 days: {hit_10pct} ({round(hit_10pct/total_signals*100, 1)}%)", flush=True)
+else:
+    print("पिछले दिनों में इस कड़े क्राइटेरिया पर कोई स्टॉक मैच नहीं हुआ। नियम बहुत कड़े हैं!", flush=True)
+print("========================================================", flush=True)
