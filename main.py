@@ -9,11 +9,10 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V100.2: THE SMART GRADING & AUTO-FILTER ENGINE ===", flush=True)
+print("=== V100.3: THE SMART GRADING & AUTO-FILTER ENGINE (DYNAMIC MARGIN) ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
-# yfinance में end_date हमेशा exclusive होती है, इसलिए 1 दिन आगे रखने से आज (Current Day) का डेटा पूरा शामिल हो जाता है
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
 
@@ -56,13 +55,12 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== 🎯 THE SMART AUTO-GRADING ENGINE (V100.2) 🎯 =====
+# ===== 🎯 THE SMART AUTO-GRADING ENGINE (V100.3) 🎯 =====
 def scan_pre_dhamaka(df, idx):
     if idx < MIN_DATA_DAYS or df.iloc[idx]['Volume'] == 0:
         return None
 
     current_close = df.iloc[idx]['Close']
-    # किस तारीख का क्लोजिंग डेटा लिया जा रहा है उसे ट्रैक करने के लिए
     signal_date = df.index[idx].strftime('%d-%b') 
 
     # 1. BADA FRAMEWORK (Pichle 100 dino ka data)
@@ -71,8 +69,8 @@ def scan_pre_dhamaka(df, idx):
 
     absolute_low = historical_100d['Low'].min()
 
-    # --- STEP 1: MULTI-SUPPORT CHECK ---
-    support_zone_upper = absolute_low * 1.018
+    # --- STEP 1: MULTI-SUPPORT CHECK (मार्जिन बढ़ाया: 1.8% से 4.0% किया) ---
+    support_zone_upper = absolute_low * 1.04
     candles_in_zone = historical_100d[historical_100d['Low'] <= support_zone_upper]
     total_touchpoints = len(candles_in_zone)
 
@@ -107,32 +105,32 @@ def scan_pre_dhamaka(df, idx):
                 best_range_found = price_range_pct
                 days_ago_matched = shift
 
-    # --- STEP 5: CURRENT PRICE POSITION ---
+    # --- STEP 5: CURRENT PRICE POSITION (मार्जिन बढ़ाया: 3.0% से 15.0% किया) ---
     distance_from_floor = ((current_close - absolute_low) / absolute_low) * 100
-    is_at_support_now = 0.0 <= distance_from_floor <= 3.0
+    is_at_support_now = 0.0 <= distance_from_floor <= 15.0
 
     # ===== TRIGGER COMPILATION & GRADING LOGIC =====
-    if total_touchpoints >= 2 and has_smart_money and matched_in_window and is_at_support_now:
+    if total_touchpoints >= 1 and has_smart_money and matched_in_window and is_at_support_now:
 
-        # SL Calculation
+        # SL Calculation (सपोर्ट बेस बड़ा होने पर एब्सोल्यूट लो की जगह करंट क्लोज से 6% का बफर भी सेफ रखता है)
         atr = (df['High'] - df['Low']).iloc[max(0, idx-14):idx].mean()
-        stop_loss = round(max(absolute_low * 0.99, current_close - 1.5 * atr, current_close * 0.95), 2)
+        stop_loss = round(max(absolute_low * 0.99, current_close - 1.5 * atr, current_close * 0.94), 2)
 
         # Target Calculation
         swing_high = df['High'].iloc[max(0, idx-100):idx].max()
-        target_1 = round(current_close * 1.10, 2) if swing_high <= current_close * 1.02 else round(swing_high, 2)
+        target_1 = round(current_close * 1.15, 2) if swing_high <= current_close * 1.02 else round(swing_high, 2)
 
         risk = current_close - stop_loss
         reward = target_1 - current_close
 
-        if risk > 0 and (reward / risk) >= 2.0 and current_close > stop_loss:
+        if risk > 0 and (reward / risk) >= 1.5 and current_close > stop_loss:
             status_msg = "Squeeze Today" if days_ago_matched == 0 else f"Squeeze {days_ago_matched}D Ago"
             
-            # 🎯 VIKASH SMART GRADING MATRIX 🎯
-            if total_touchpoints >= 6 and best_range_found <= 2.0:
+            # 🎯 VIKASH SMART GRADING MATRIX (नए मार्जिन के हिसाब से अडैप्टेड) 🎯
+            if total_touchpoints >= 4 and best_range_found <= 2.2 and distance_from_floor <= 5.0:
                 grade = "GRADE A+ (Ultra Sniper)"
-            elif total_touchpoints >= 4 or best_range_found <= 2.8:
-                grade = "GRADE A (High Match)"
+            elif has_smart_money and distance_from_floor <= 15.0 and best_range_found <= 3.5:
+                grade = "GRADE A (High Vol Breakout Setup)"
             else:
                 grade = "GRADE B (Watch closely)"
 
@@ -144,8 +142,7 @@ def scan_pre_dhamaka(df, idx):
                 'StopLoss': stop_loss,
                 'Target': target_1,
                 'RR': round(reward/risk, 1),
-                # Details में तारीख (Date) जोड़ दी है ताकि कन्फर्म रहे कि किस दिन का क्लोज प्राइस है
-                'Details': f"[{signal_date}] Tested:{total_touchpoints}x | {status_msg} ({round(best_range_found, 1)}%)"
+                'Details': f"[{signal_date}] FloorDist:{round(distance_from_floor, 1)}% | {status_msg} ({round(best_range_found, 1)}%)"
             }
 
     return None
@@ -161,7 +158,6 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
                     if col not in df.columns: df[col] = ''
                 df = df[columns_order]
             
-            # Sort sheet by Grade so A+ and A come on top automatically
             df.sort_values(by=['Grade'], ascending=True, inplace=True)
             
             df_json = json.loads(df.to_json(orient='split'))
@@ -177,7 +173,6 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
 stocks = get_watchlist_stocks()
 final_dhamaka_watchlist = []
 
-# Keywords jinhe auto-reject karna hai
 REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
 print(f"\n=== PROCESSING {len(stocks)} STOCKS ===", flush=True)
@@ -186,13 +181,11 @@ for i, stock in enumerate(stocks):
     try:
         symbol_clean = stock.replace('.NS', '')
         
-        # 🚫 AUTO ETF & LIQUID FUND ELIMINATION 🚫
         if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
             print(f"[{i+1}/{len(stocks)}] {stock} -> Skip: ETF/Liquid Fund Detected.", flush=True)
             continue
 
         print(f"[{i+1}/{len(stocks)}] Scanning {stock}...", end=' ', flush=True)
-        # auto_adjust=True किया ताकि क्लोजिंग डेटा में कोई टाइमज़ोन एडजस्टमेंट एरर न आए
         stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
         stock_df = flatten_yf_columns(stock_df)
 
@@ -223,7 +216,6 @@ for i, stock in enumerate(stocks):
     except Exception as e:
         print(f"Error - {str(e)}", flush=True)
 
-# Export columns order
 columns = ['Stock', 'Grade', 'Current_Close', 'Buy_Level', 'StopLoss', 'Target', 'RR', 'Details']
 upload_to_sheet(ws_dhamaka_watch, final_dhamaka_watchlist, columns, "No Pre-Dhamaka Setup Found Today")
 print("\n=== SYSTEM EXECUTION COMPLETED ===", flush=True)
