@@ -10,14 +10,14 @@ import warnings
 warnings.filterwarnings('ignore')
 
 print("=========================================================", flush=True)
-print("=== V1300: ENDLESS BASE VCP (NO TIME LIMIT TRACKER) ===", flush=True)
+print("=== V1350: ENDLESS BASE VCP WITH DETAILED SUMMARY ===", flush=True)
 print("=========================================================", flush=True)
 
 # ===== CONFIG =====
-BACKTEST_DAYS = 120            # बैकटेस्ट की अवधि थोड़ी बढ़ा दी ताकि पुराने बेस भी दिखें
+BACKTEST_DAYS = 120            
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 10
-LOOKBACK_ULTRA_VOL = 50        # Day 0 के लिए 50-Day Absolute Max Volume
+LOOKBACK_ULTRA_VOL = 50        
 
 # ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -81,7 +81,6 @@ for stock in stocks:
                 idx += 1
                 continue
 
-            # 1. Day 0 का ट्रिगर (50-Day Max Volume + Bullish Close)
             if current_vol > absolute_max_vol_50d and current_close > current_open:
                 anchor_date = df.index[idx].strftime('%Y-%m-%d')
                 anchor_close = current_close
@@ -91,32 +90,26 @@ for stock in stocks:
                 breakout_idx = -1
                 f_idx = idx + 1
                 
-                # 2. 🚨 अनंत लूप (जब तक नियम न टूटे, चेक करते रहो)
                 while f_idx < total_rows:
                     f_close = df.iloc[f_idx]['Close']
                     f_vol = df.iloc[f_idx]['Volume']
                     f_avg_vol = df.iloc[f_idx]['Avg_Vol']
                     
-                    # नियम टूटने की शर्त: अगर प्राइस Day 0 के क्लोज से 5% से ज़्यादा नीचे टूट गया, तो बेस फेल!
                     if f_close < (anchor_close * 0.95):
                         break
                         
-                    # अगर प्राइस ऊपर की तरफ 8% से ज़्यादा भाग गया बिना वॉल्यूम के, तो भी सेटअप इनवैलिड
                     if f_close > (anchor_close * 1.08) and f_vol < (f_avg_vol * 1.5):
                         break
                     
-                    # वॉल्यूम ड्राई-अप की गिनती चालू रखो
                     if f_vol < (anchor_vol * 0.25):
                         dry_up_days_count += 1
                     
-                    # 3. असली ब्लास्ट डे का ट्रिगर (जब भी वॉल्यूम 1.8x फटे और क्लोजिंग ऊपर हो)
                     if f_close > anchor_close and f_vol >= (f_avg_vol * 1.8) and (f_idx - idx) >= 3:
                         breakout_idx = f_idx
                         break
                         
                     f_idx += 1
                 
-                # अगर बेस के दौरान कम से कम 2 दिन वॉल्यूम सूखा था और ब्लास्ट मिला
                 if breakout_idx != -1 and dry_up_days_count >= 2:
                     b_close = df.iloc[breakout_idx]['Close']
                     b_prev_close = df.iloc[breakout_idx-1]['Close']
@@ -131,12 +124,12 @@ for stock in stocks:
                         'Stock': symbol_clean,
                         'Day0_Vol_Date': anchor_date,
                         'Blast_Date': b_date,
-                        'Base_Days': base_duration,  # यह अब 10, 20, 30 कुछ भी हो सकता है
+                        'Base_Days': base_duration,  
                         'DryUp_Days': dry_up_days_count,
                         'Blast_Vol_X': round(b_vol / b_avg_vol, 1),
                         'Blast_Move%': round(breakout_move, 1)
                     })
-                    idx = breakout_idx  # सीधे ब्लास्ट वाले इंडेक्स पर कूदें
+                    idx = breakout_idx  
                     continue
 
             idx += 1
@@ -144,12 +137,25 @@ for stock in stocks:
     except Exception as e:
         pass
 
-# ===== रिजल्ट प्रिंट करना =====
+# ===== 📊 फाइनल रिजल्ट और समरी प्रिंट करना =====
 print("\n=================== ENDLESS BASE RESULTS ===================", flush=True)
 if all_signals:
     backtest_df = pd.DataFrame(all_signals)
     backtest_df.sort_values(by='Blast_Move%', ascending=False, inplace=True)
     print(backtest_df.to_string(index=False), flush=True)
+    
+    total_signals = len(backtest_df)
+    hit_5 = sum(backtest_df['Blast_Move%'] >= 4.5)
+    hit_10 = sum(backtest_df['Blast_Move%'] >= 9.5)
+    hit_20 = sum(backtest_df['Blast_Move%'] >= 19.5)
+    loss_signals = sum(backtest_df['Blast_Move%'] < 0.0)
+    
+    print("\n========= 🎯 STATS DASHBOARD =========", flush=True)
+    print(f"Total Quality Setups Found         : {total_signals}", flush=True)
+    print(f"Signals with > 5% Gain 🟢           : {hit_5} ({round(hit_5/total_signals*100, 1)}%)", flush=True)
+    print(f"Signals with > 10% Jackpot 🚀      : {hit_10} ({round(hit_10/total_signals*100, 1)}%)", flush=True)
+    print(f"Signals with > 20% Upper Circuit 🏆: {hit_20} ({round(hit_20/total_signals*100, 1)}%)", flush=True)
+    print(f"Signals in Loss (Negative Day) 🔴  : {loss_signals} ({round(loss_signals/total_signals*100, 1)}%)", flush=True)
 else:
     print("इस ओपन-एंडेड वॉल्यूम कॉन्ट्रैक्शन लॉजिक पर कोई स्टॉक मैच नहीं हुआ।", flush=True)
 print("========================================================", flush=True)
