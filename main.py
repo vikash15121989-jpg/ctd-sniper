@@ -9,21 +9,32 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=========================================================", flush=True)
-print("=== V1350: ENDLESS BASE VCP WITH DETAILED SUMMARY ===", flush=True)
-print("=========================================================", flush=True)
+print("=== V100.4: COMSYN LIVE ANCHOR & SQUEEZE GRADING ENGINE ===", flush=True)
+print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
-BACKTEST_DAYS = 120            
+END_DATE = (datetime.now() + timedelta(days=1)).date()
+START_DATE = END_DATE - timedelta(days=365)
+
 MIN_AVG_VOLUME = 100000
-MIN_AVG_TURNOVER_CR = 10
-LOOKBACK_ULTRA_VOL = 50        
+MIN_AVG_TURNOVER_CR = 5
+LOOKBACK_ULTRA_VOL = 50        # Day 0 ढूंढने का पैमाना
 
 # ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
+
+def get_or_create_sheet(title):
+    try:
+        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows="1000", cols="20")
+
 ws_watchlist = sh.worksheet("Watchlist")
+ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
+
+print("All Sheets Connected Safely.", flush=True)
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -44,118 +55,159 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== BACKTEST EXECUTION =====
+# ===== 🎯 COMSYN LIVE ANCHOR & SQUEEZE ENGINE 🎯 =====
+def scan_live_comsyn_base(df):
+    total_rows = len(df)
+    if total_rows < 60: return None
+
+    live_idx = total_rows - 1
+    live_close = df.iloc[live_idx]['Close']
+    
+    # पिछले 40 दिनों में मुड़कर सबसे लेटेस्ट वैलिड 'Day 0' (Anchor) खोजना
+    found_anchor = False
+    anchor_date = None
+    anchor_close = 0
+    anchor_vol = 0
+    anchor_row_idx = -1
+    
+    for idx in range(live_idx - 40, live_idx - 1):
+        if idx < LOOKBACK_ULTRA_VOL: continue
+        
+        check_vol = df.iloc[idx]['Volume']
+        check_close = df.iloc[idx]['Close']
+        check_open = df.iloc[idx]['Open']
+        
+        past_50d = df.iloc[idx-LOOKBACK_ULTRA_VOL:idx]
+        max_vol_50d = past_50d['Volume'].max()
+        
+        # 50-Day Absolute Max Volume + Bullish Green Candle
+        if check_vol > max_vol_50d and check_close > check_open:
+            anchor_date = df.index[idx].strftime('%d-%b')
+            anchor_close = check_close
+            anchor_vol = check_vol
+            anchor_row_idx = idx
+            found_anchor = True
+
+    if found_anchor:
+        is_base_alive = True
+        dry_up_days = 0
+        prices_in_base = []
+        
+        # एंकर बनने के बाद से आज तक के पूरे बेस का ट्रैक रिकॉर्ड निकालना
+        for check_idx in range(anchor_row_idx + 1, total_rows):
+            f_close = df.iloc[check_idx]['Close']
+            f_vol = df.iloc[check_idx]['Volume']
+            prices_in_base.append(f_close)
+            
+            # स्टॉपलॉस नियम: अगर प्राइस कभी भी एंकर क्लोज से 5% से नीचे गया, तो बेस फेल!
+            if f_close < (anchor_close * 0.95):
+                is_base_alive = False
+                break
+            
+            # वॉल्यूम ड्राई-अपकाउंटर (Anchor Vol के 25% से कम)
+            if f_vol < (anchor_vol * 0.25):
+                dry_up_days += 1
+                
+        if is_base_alive and len(prices_in_base) >= 2:
+            base_min = min(prices_in_base)
+            base_max = max(prices_in_base)
+            # बेस का कुल वास्तविक दायरा (Contract Range %)
+            current_range_pct = ((base_max - base_min) / base_min) * 100
+            
+            base_days_count = live_idx - anchor_row_idx
+            
+            # 🎯 VIKASH SMART AUTO-GRADING MATRIX (FOR COMSYN SQUEEZE) 🎯
+            if current_range_pct <= 3.5 and dry_up_days >= 4:
+                grade = "GRADE A+ (Ultra Sniper Squeeze)"
+            elif current_range_pct <= 5.0 and dry_up_days >= 2:
+                grade = "GRADE A (High Vol Base Setup)"
+            else:
+                grade = "GRADE B (Watch Closely)"
+                
+            # SL and Target
+            stop_loss = round(anchor_close * 0.95, 2)
+            target_1 = round(live_close * 1.15, 2)
+            
+            risk = max(0.01, live_close - stop_loss)
+            reward = target_1 - live_close
+
+            return {
+                'Stock': '', 
+                'Grade': grade, 
+                'Current_Close': round(live_close, 2),
+                'Buy_Level': f"Near {round(anchor_close, 2)}",
+                'StopLoss': stop_loss,
+                'Target': target_1,
+                'RR': round(reward/risk, 1),
+                'Details': f"Anchor:[{anchor_date}] | BaseDays:{base_days_count} | Range:{round(current_range_pct, 1)}% | DryDays:{dry_up_days}"
+            }
+            
+    return None
+
+def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
+    try:
+        ws.batch_clear(['A:Z'])
+        time.sleep(1)
+        if data_list:
+            df = pd.DataFrame(data_list)
+            if columns_order:
+                for col in columns_order:
+                    if col not in df.columns: df[col] = ''
+                df = df[columns_order]
+            
+            # ग्रेड के हिसाब से सॉर्टिंग (A+ ऊपर चमकेगा)
+            df.sort_values(by=['Grade'], ascending=True, inplace=True)
+            
+            df_json = json.loads(df.to_json(orient='split'))
+            values = [df_json['columns']] + df_json['data']
+            ws.update(values=values, range_name='A1')
+            print(f"Uploaded {len(data_list)} sorted rows to Pre_Dhamaka_Watch.", flush=True)
+        else:
+            ws.update(values=[[default_msg]], range_name='A1')
+    except Exception as e:
+        print(f"Sheet Error: {str(e)}", flush=True)
+
+# ===== MAIN EXECUTION LOOP =====
 stocks = get_watchlist_stocks()
-all_signals = []
+final_dhamaka_watchlist = []
 
-print(f"Total Stocks Loaded: {len(stocks)}", flush=True)
-print("बिना किसी टाइम लिमिट के ओपन बेस स्कैनिंग शुरू हो रही है...\n", flush=True)
+REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
-end_date = (datetime.now() + timedelta(days=1)).date()
-start_date = end_date - timedelta(days=365)
+print(f"\n=== SCANNINIG {len(stocks)} STOCKS FOR LIVE COMSYN BASE ===", flush=True)
 
-for stock in stocks:
+for i, stock in enumerate(stocks):
     try:
         symbol_clean = stock.replace('.NS', '')
-        df = yf.download(stock, start=start_date, end=end_date, progress=False, auto_adjust=True)
-        df = flatten_yf_columns(df)
+        
+        if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
+            continue
 
-        if df.empty or len(df) < 100: continue
+        stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
+        stock_df = flatten_yf_columns(stock_df)
 
-        df['Avg_Vol'] = df['Volume'].rolling(window=20).mean()
-        df['Avg_Turnover'] = (df['Close'] * df['Volume']).rolling(window=20).mean() / 10000000
+        if stock_df.empty or len(stock_df) < 60:
+            continue
 
-        total_rows = len(df)
-        start_idx = max(100, total_rows - BACKTEST_DAYS)
+        stock_df['Avg_Vol'] = stock_df['Volume'].rolling(window=20).mean()
+        stock_df['Avg_Turnover'] = (stock_df['Close'] * stock_df['Volume']).rolling(window=20).mean() / 10000000
 
-        idx = start_idx
-        while idx < total_rows - 2:
-            current_close = df.iloc[idx]['Close']
-            current_open = df.iloc[idx]['Open']
-            current_vol = df.iloc[idx]['Volume']
-            
-            past_50d = df.iloc[max(0, idx-LOOKBACK_ULTRA_VOL):idx]
-            absolute_max_vol_50d = past_50d['Volume'].max()
+        curr_idx = len(stock_df) - 1
+        avg_vol = stock_df.iloc[curr_idx]['Avg_Vol']
+        avg_turnover = stock_df.iloc[curr_idx]['Avg_Turnover']
 
-            if pd.isna(absolute_max_vol_50d) or absolute_max_vol_50d == 0:
-                idx += 1
-                continue
+        if pd.isna(avg_vol) or pd.isna(avg_turnover) or avg_vol < MIN_AVG_VOLUME or avg_turnover < MIN_AVG_TURNOVER_CR:
+            continue
 
-            if current_vol > absolute_max_vol_50d and current_close > current_open:
-                anchor_date = df.index[idx].strftime('%Y-%m-%d')
-                anchor_close = current_close
-                anchor_vol = current_vol
-                
-                dry_up_days_count = 0
-                breakout_idx = -1
-                f_idx = idx + 1
-                
-                while f_idx < total_rows:
-                    f_close = df.iloc[f_idx]['Close']
-                    f_vol = df.iloc[f_idx]['Volume']
-                    f_avg_vol = df.iloc[f_idx]['Avg_Vol']
-                    
-                    if f_close < (anchor_close * 0.95):
-                        break
-                        
-                    if f_close > (anchor_close * 1.08) and f_vol < (f_avg_vol * 1.5):
-                        break
-                    
-                    if f_vol < (anchor_vol * 0.25):
-                        dry_up_days_count += 1
-                    
-                    if f_close > anchor_close and f_vol >= (f_avg_vol * 1.8) and (f_idx - idx) >= 3:
-                        breakout_idx = f_idx
-                        break
-                        
-                    f_idx += 1
-                
-                if breakout_idx != -1 and dry_up_days_count >= 2:
-                    b_close = df.iloc[breakout_idx]['Close']
-                    b_prev_close = df.iloc[breakout_idx-1]['Close']
-                    b_date = df.index[breakout_idx].strftime('%Y-%m-%d')
-                    b_vol = df.iloc[breakout_idx]['Volume']
-                    b_avg_vol = df.iloc[breakout_idx]['Avg_Vol']
-                    
-                    breakout_move = ((b_close - b_prev_close) / b_prev_close) * 100
-                    base_duration = breakout_idx - idx
-                    
-                    all_signals.append({
-                        'Stock': symbol_clean,
-                        'Day0_Vol_Date': anchor_date,
-                        'Blast_Date': b_date,
-                        'Base_Days': base_duration,  
-                        'DryUp_Days': dry_up_days_count,
-                        'Blast_Vol_X': round(b_vol / b_avg_vol, 1),
-                        'Blast_Move%': round(breakout_move, 1)
-                    })
-                    idx = breakout_idx  
-                    continue
+        setup = scan_live_comsyn_base(stock_df)
+        if setup:
+            setup['Stock'] = symbol_clean
+            final_dhamaka_watchlist.append(setup)
+            print(f"🔥 LIVE MATCH! [{symbol_clean}] -> {setup['Grade']}", flush=True)
 
-            idx += 1
-        time.sleep(0.01)
+        time.sleep(0.15)
     except Exception as e:
         pass
 
-# ===== 📊 फाइनल रिजल्ट और समरी प्रिंट करना =====
-print("\n=================== ENDLESS BASE RESULTS ===================", flush=True)
-if all_signals:
-    backtest_df = pd.DataFrame(all_signals)
-    backtest_df.sort_values(by='Blast_Move%', ascending=False, inplace=True)
-    print(backtest_df.to_string(index=False), flush=True)
-    
-    total_signals = len(backtest_df)
-    hit_5 = sum(backtest_df['Blast_Move%'] >= 4.5)
-    hit_10 = sum(backtest_df['Blast_Move%'] >= 9.5)
-    hit_20 = sum(backtest_df['Blast_Move%'] >= 19.5)
-    loss_signals = sum(backtest_df['Blast_Move%'] < 0.0)
-    
-    print("\n========= 🎯 STATS DASHBOARD =========", flush=True)
-    print(f"Total Quality Setups Found         : {total_signals}", flush=True)
-    print(f"Signals with > 5% Gain 🟢           : {hit_5} ({round(hit_5/total_signals*100, 1)}%)", flush=True)
-    print(f"Signals with > 10% Jackpot 🚀      : {hit_10} ({round(hit_10/total_signals*100, 1)}%)", flush=True)
-    print(f"Signals with > 20% Upper Circuit 🏆: {hit_20} ({round(hit_20/total_signals*100, 1)}%)", flush=True)
-    print(f"Signals in Loss (Negative Day) 🔴  : {loss_signals} ({round(loss_signals/total_signals*100, 1)}%)", flush=True)
-else:
-    print("इस ओपन-एंडेड वॉल्यूम कॉन्ट्रैक्शन लॉजिक पर कोई स्टॉक मैच नहीं हुआ।", flush=True)
-print("========================================================", flush=True)
+columns = ['Stock', 'Grade', 'Current_Close', 'Buy_Level', 'StopLoss', 'Target', 'RR', 'Details']
+upload_to_sheet(ws_dhamaka_watch, final_dhamaka_watchlist, columns, "No Live COMSYN Squeeze Found Today")
+print("\n=== SYSTEM EXECUTION COMPLETED ===", flush=True)
