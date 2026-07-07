@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V100.4: COMSYN LIVE ANCHOR & SQUEEZE GRADING ENGINE ===", flush=True)
+print("=== V100.5: COMSYN LIVE ANCHOR & SQUEEZE ACTION ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -18,7 +18,7 @@ START_DATE = END_DATE - timedelta(days=365)
 
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 5
-LOOKBACK_ULTRA_VOL = 50        # Day 0 ढूंढने का पैमाना
+LOOKBACK_ULTRA_VOL = 50        
 
 # ===== GOOGLE SHEETS SETUP =====
 gcp_json_creds = json.loads(os.environ['GSHEET_KEY'])
@@ -33,6 +33,8 @@ def get_or_create_sheet(title):
 
 ws_watchlist = sh.worksheet("Watchlist")
 ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
+# 🔥 नई शीट: कल एंट्री लेने वाले शेयर्स के लिए
+ws_ready_tomorrow = get_or_create_sheet("Ready_For_Tomorrow")
 
 print("All Sheets Connected Safely.", flush=True)
 
@@ -55,7 +57,7 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== 🎯 COMSYN LIVE ANCHOR & SQUEEZE ENGINE 🎯 =====
+# ===== 🎯 COMSYN ACTION UPGRADED ENGINE 🎯 =====
 def scan_live_comsyn_base(df):
     total_rows = len(df)
     if total_rows < 60: return None
@@ -63,7 +65,6 @@ def scan_live_comsyn_base(df):
     live_idx = total_rows - 1
     live_close = df.iloc[live_idx]['Close']
     
-    # पिछले 40 दिनों में मुड़कर सबसे लेटेस्ट वैलिड 'Day 0' (Anchor) खोजना
     found_anchor = False
     anchor_date = None
     anchor_close = 0
@@ -80,7 +81,6 @@ def scan_live_comsyn_base(df):
         past_50d = df.iloc[idx-LOOKBACK_ULTRA_VOL:idx]
         max_vol_50d = past_50d['Volume'].max()
         
-        # 50-Day Absolute Max Volume + Bullish Green Candle
         if check_vol > max_vol_50d and check_close > check_open:
             anchor_date = df.index[idx].strftime('%d-%b')
             anchor_close = check_close
@@ -93,53 +93,57 @@ def scan_live_comsyn_base(df):
         dry_up_days = 0
         prices_in_base = []
         
-        # एंकर बनने के बाद से आज तक के पूरे बेस का ट्रैक रिकॉर्ड निकालना
         for check_idx in range(anchor_row_idx + 1, total_rows):
             f_close = df.iloc[check_idx]['Close']
             f_vol = df.iloc[check_idx]['Volume']
             prices_in_base.append(f_close)
             
-            # स्टॉपलॉस नियम: अगर प्राइस कभी भी एंकर क्लोज से 5% से नीचे गया, तो बेस फेल!
             if f_close < (anchor_close * 0.95):
                 is_base_alive = False
                 break
             
-            # वॉल्यूम ड्राई-अपकाउंटर (Anchor Vol के 25% से कम)
             if f_vol < (anchor_vol * 0.25):
                 dry_up_days += 1
                 
         if is_base_alive and len(prices_in_base) >= 2:
             base_min = min(prices_in_base)
             base_max = max(prices_in_base)
-            # बेस का कुल वास्तविक दायरा (Contract Range %)
             current_range_pct = ((base_max - base_min) / base_min) * 100
-            
             base_days_count = live_idx - anchor_row_idx
             
-            # 🎯 VIKASH SMART AUTO-GRADING MATRIX (FOR COMSYN SQUEEZE) 🎯
+            # ग्रेडिंग सिस्टम
             if current_range_pct <= 3.5 and dry_up_days >= 4:
-                grade = "GRADE A+ (Ultra Sniper Squeeze)"
+                grade = "GRADE A+ (Ultra Sniper)"
             elif current_range_pct <= 5.0 and dry_up_days >= 2:
-                grade = "GRADE A (High Vol Base Setup)"
+                grade = "GRADE A (High Vol Base)"
             else:
-                grade = "GRADE B (Watch Closely)"
+                grade = "GRADE B (Watch)"
                 
-            # SL and Target
             stop_loss = round(anchor_close * 0.95, 2)
             target_1 = round(live_close * 1.15, 2)
             
             risk = max(0.01, live_close - stop_loss)
             reward = target_1 - live_close
 
+            # 🔥 [NEW LOGIC] कल के लिए ब्रेकआउट ट्रिगर चेक
+            # अगर आज की क्लोजिंग बेस के हाई (Upper Range) के 1% के पास है, या उसे तोड़ रही है
+            breakout_trigger_level = base_max
+            is_ready_for_tomorrow = False
+            
+            # अगर क्लोजिंग हाई के पास है (Within 1.5% of Base Max) या आज ही ब्रेकआउट शुरू हुआ है
+            if live_close >= (breakout_trigger_level * 0.985):
+                is_ready_for_tomorrow = True
+
             return {
                 'Stock': '', 
                 'Grade': grade, 
                 'Current_Close': round(live_close, 2),
-                'Buy_Level': f"Near {round(anchor_close, 2)}",
+                'Trigger_Above': round(breakout_trigger_level, 2), # कल इसके ऊपर निकलते ही एंट्री लेनी है
                 'StopLoss': stop_loss,
                 'Target': target_1,
                 'RR': round(reward/risk, 1),
-                'Details': f"Anchor:[{anchor_date}] | BaseDays:{base_days_count} | Range:{round(current_range_pct, 1)}% | DryDays:{dry_up_days}"
+                'Details': f"Anchor:[{anchor_date}] | BaseDays:{base_days_count} | Range:{round(current_range_pct, 1)}% | DryDays:{dry_up_days}",
+                'Ready_Tomorrow': is_ready_for_tomorrow # फिल्टर करने के लिए फ्लैग
             }
             
     return None
@@ -155,13 +159,10 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
                     if col not in df.columns: df[col] = ''
                 df = df[columns_order]
             
-            # ग्रेड के हिसाब से सॉर्टिंग (A+ ऊपर चमकेगा)
             df.sort_values(by=['Grade'], ascending=True, inplace=True)
-            
             df_json = json.loads(df.to_json(orient='split'))
             values = [df_json['columns']] + df_json['data']
             ws.update(values=values, range_name='A1')
-            print(f"Uploaded {len(data_list)} sorted rows to Pre_Dhamaka_Watch.", flush=True)
         else:
             ws.update(values=[[default_msg]], range_name='A1')
     except Exception as e:
@@ -170,23 +171,21 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
 # ===== MAIN EXECUTION LOOP =====
 stocks = get_watchlist_stocks()
 final_dhamaka_watchlist = []
+ready_tomorrow_watchlist = [] # 🔥 कल के लिए स्पेशल लिस्ट
 
 REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
-print(f"\n=== SCANNINIG {len(stocks)} STOCKS FOR LIVE COMSYN BASE ===", flush=True)
+print(f"\n=== SCANNING {len(stocks)} STOCKS FOR LIVE COMSYN BASE ===", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
         symbol_clean = stock.replace('.NS', '')
-        
-        if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
-            continue
+        if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS): continue
 
         stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
         stock_df = flatten_yf_columns(stock_df)
 
-        if stock_df.empty or len(stock_df) < 60:
-            continue
+        if stock_df.empty or len(stock_df) < 60: continue
 
         stock_df['Avg_Vol'] = stock_df['Volume'].rolling(window=20).mean()
         stock_df['Avg_Turnover'] = (stock_df['Close'] * stock_df['Volume']).rolling(window=20).mean() / 10000000
@@ -201,13 +200,30 @@ for i, stock in enumerate(stocks):
         setup = scan_live_comsyn_base(stock_df)
         if setup:
             setup['Stock'] = symbol_clean
+            
+            # अगर कल के लिए रेडी है तो इसे 'Ready_For_Tomorrow' लिस्ट में डालो
+            if setup['Ready_Tomorrow']:
+                ready_tomorrow_watchlist.append(setup)
+                print(f"🚀 READY FOR TOMORROW! [{symbol_clean}] -> Trigger Above: {setup['Trigger_Above']}", flush=True)
+            
             final_dhamaka_watchlist.append(setup)
-            print(f"🔥 LIVE MATCH! [{symbol_clean}] -> {setup['Grade']}", flush=True)
 
         time.sleep(0.15)
     except Exception as e:
         pass
 
-columns = ['Stock', 'Grade', 'Current_Close', 'Buy_Level', 'StopLoss', 'Target', 'RR', 'Details']
+# शीट अपलोडिंग
+columns = ['Stock', 'Grade', 'Current_Close', 'Trigger_Above', 'StopLoss', 'Target', 'RR', 'Details']
+
+# 1. मुख्य वॉचलिस्ट (जो अभी स्क्वीज हो रहे हैं)
 upload_to_sheet(ws_dhamaka_watch, final_dhamaka_watchlist, columns, "No Live COMSYN Squeeze Found Today")
+print(f"Uploaded {len(final_dhamaka_watchlist)} rows to Pre_Dhamaka_Watch.", flush=True)
+
+# 2. 🔥 कल सुबह ब्लास्ट होने वाले शेयर्स की शीट (Ready_For_Tomorrow)
+# इसमें से 'Ready_Tomorrow' फ्लैग हटाकर साफ़ डेटा भेजेंगे
+for item in ready_tomorrow_watchlist: item.pop('Ready_Tomorrow', None)
+upload_to_sheet(ws_ready_tomorrow, ready_tomorrow_watchlist, columns, "कल के लिए कोई स्टॉक ट्रिगर के पास नहीं है।")
+print(f"Uploaded {len(ready_tomorrow_watchlist)} ACTION ROWS to Ready_For_Tomorrow.", flush=True)
+
 print("\n=== SYSTEM EXECUTION COMPLETED ===", flush=True)
+    
