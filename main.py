@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V112.0: INSIDE-BOX PURE VOL-ACCUMULATION ENGINE ===", flush=True)
+print("=== V112.2: INSIDE-BOX PURE VOL-ACCUMULATION ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -60,7 +60,11 @@ def scan_pure_vol_dry_squeeze(df):
 
     live_idx = total_rows - 1
     live_close = df.iloc[live_idx]['Close']
+    live_open = df.iloc[live_idx]['Open']
+    live_high = df.iloc[live_idx]['High']
+    live_low = df.iloc[live_idx]['Low']
     live_vol = df.iloc[live_idx]['Volume']
+    prev_close = df.iloc[live_idx - 1]['Close']
     
     # 20 दिनों का रोलिंग एवरेज वॉल्यूम
     df['Vol_Avg_20'] = df['Volume'].rolling(window=20).mean()
@@ -134,11 +138,19 @@ def scan_pure_vol_dry_squeeze(df):
         past_10d_vol = df.iloc[live_idx-11:live_idx]['Volume']
         max_vol_10d = past_10d_vol.max() if not past_10d_vol.empty else 0
         
-        # 🔥 [NEW PURE VOL-BASED TRIGGER]:
-        # प्राइस बॉक्स के हाई से 5% नीचे हो, 10% नीचे हो, या बिल्कुल बीच में हो—कोई मतलब नहीं!
-        # अगर आज का वॉल्यूम पिछले 10 दिनों के मैक्सिमम वॉल्यूम से ज़्यादा आ गया, तो एंट्री पक्की।
+        # 🔥 [NEW CONDITION FOR READY TODAY]:
+        # 1. Aaj ka Volume past 10 days ke MAX Volume se jyada ho
+        is_vol_breakout = live_vol > max_vol_10d
+        
+        # 2. Up-Side Closing: Previous Close se upar ho aur Green Candle ho
+        is_price_up = (live_close > prev_close) and (live_close >= live_open)
+        
+        # 3. Near Day High Condition: Closing Day High ke paas ho (> (High + Low) / 2)
+        mid_point = (live_high + live_low) / 2.0
+        is_close_near_high = live_close > mid_point
+        
         is_ready_today = False
-        if live_vol > max_vol_10d:
+        if is_vol_breakout and is_price_up and is_close_near_high:
             is_ready_today = True
             
         stop_loss = round(pre_anchor_support, 2)
@@ -150,7 +162,7 @@ def scan_pure_vol_dry_squeeze(df):
             'Stock': '', 
             'Grade': grade,
             'Current_Close': round(live_close, 2),
-            'Trigger_Above': round(box_high, 2), # यह अभी भी बॉक्स का हाई दिखाएगा ताकि आपको पता रहे कि रेसिस्टेंस कहाँ है
+            'Trigger_Above': round(box_high, 2),
             'Pre_Anchor_SL': stop_loss,
             'Target': target_1,
             'RR': round(reward/risk, 1),
@@ -228,6 +240,7 @@ for i, stock in enumerate(stocks):
 
 columns = ['Stock', 'Grade', 'Current_Close', 'Trigger_Above', 'Pre_Anchor_SL', 'Target', 'RR', 'Details']
 upload_to_sheet(ws_dhamaka_watch, pre_dhamaka_watchlist, columns, "No Vol-Dry Squeeze Stock Found Today")
-upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "आज एंट्री के लिए कोई Inside-Box Vol Breakout स्टॉक नहीं मिला।")
+upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "आज एंट्री के लिए कोई Inside-Box Vol Breakout (Near Day High) स्टॉक नहीं मिला।")
 
 print("\n=== SYSTEM EXECUTION COMPLETED SUCCESSFULLY ===", flush=True)
+    
