@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V112.3: EOD INSIDE-BOX PURE VOL-ACCUMULATION ENGINE (NEXT-DAY TRIGGER) ===", flush=True)
+print("=== V112.4: EOD INSIDE-BOX VOL-ACCUMULATION + 3 TRADING DAYS UPTREND ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -32,7 +32,8 @@ def get_or_create_sheet(title):
 
 ws_watchlist = sh.worksheet("Watchlist")
 ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
-ws_ready_today = get_or_create_sheet("Ready_For_Today")  # Agle din ki entry ke liye sheet
+ws_ready_today = get_or_create_sheet("Ready_For_Today")
+ws_uptrend_3d = get_or_create_sheet("UpTrend_3D_Dhamaka")  # 🎯 3-Trading Days Sheet
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -58,7 +59,7 @@ def scan_pure_vol_dry_squeeze(df):
     total_rows = len(df)
     if total_rows < 60: return None
 
-    # EOD Scanning: Last row is today's completed candle
+    # EOD Scanning: Last row is today's completed trading candle
     eod_idx = total_rows - 1
     eod_close = df.iloc[eod_idx]['Close']
     eod_open = df.iloc[eod_idx]['Open']
@@ -71,7 +72,7 @@ def scan_pure_vol_dry_squeeze(df):
     df['Vol_Avg_20'] = df['Volume'].rolling(window=20).mean()
     possible_anchors = []
     
-    # 1. Past 40 days me Anchor Day dhoondhna (Aaj ki completed candle tak check)
+    # 1. Past 40 trading days me Anchor Day dhoondhna
     for idx in range(max(20, eod_idx - 40), eod_idx + 1):
         check_vol = df.iloc[idx]['Volume']
         check_close = df.iloc[idx]['Close']
@@ -94,14 +95,11 @@ def scan_pure_vol_dry_squeeze(df):
     anchor_row_idx = best_anchor['idx']
     anchor_date = best_anchor['date']
     
-    # Pre-Anchor Support Level (Swing Low before Anchor)
+    # Pre-Anchor Support Level
     pre_anchor_zone = df.iloc[max(0, anchor_row_idx-20):anchor_row_idx]
-    if not pre_anchor_zone.empty:
-        pre_anchor_support = pre_anchor_zone['Low'].min()
-    else:
-        pre_anchor_support = df.iloc[anchor_row_idx]['Low']
+    pre_anchor_support = pre_anchor_zone['Low'].min() if not pre_anchor_zone.empty else df.iloc[anchor_row_idx]['Low']
         
-    # Consolidation Box High (Breakout / Trigger Level for Tomorrow)
+    # Consolidation Box High (Trigger Level)
     post_anchor_zone = df.iloc[anchor_row_idx:eod_idx+1]
     box_high = post_anchor_zone['High'].max()
         
@@ -109,13 +107,13 @@ def scan_pure_vol_dry_squeeze(df):
     dry_up_days = 0
     total_base_days = max(1, eod_idx - anchor_row_idx)
     
-    # Support Safety & Volume Dry Check (Anchor se lekar EOD tak)
+    # Support Safety & Volume Dry Check
     for check_idx in range(anchor_row_idx + 1, total_rows):
         f_close = df.iloc[check_idx]['Close']
         f_vol = df.iloc[check_idx]['Volume']
         avg_vol_that_day = df.iloc[check_idx]['Vol_Avg_20']
         
-        # 1% Buffer for Support Safety (Wick Spike Protection)
+        # 1% Buffer for Support Breakdown
         if f_close < (pre_anchor_support * 0.99):
             is_support_safe = False
             break
@@ -125,21 +123,34 @@ def scan_pure_vol_dry_squeeze(df):
             
     if is_support_safe:
         dry_ratio = dry_up_days / total_base_days if total_base_days > 0 else 0
-        grade = "A+" if dry_ratio >= 0.70 else ("A" if dry_ratio >= 0.45 else "B")
+        grade = "A+" if dry_ratio >= 0.70 else ("A" if dry_ratio >= 0.50 else "B")
         
-        # ===== 🎯 READY FOR TOMORROW LOGIC 🎯 =====
-        # 1. Close is sitting near Box High (Within 3% of Breakout Level)
-        near_breakout = (eod_close >= box_high * 0.97)
+        avg_vol_20_today = df.iloc[eod_idx]['Vol_Avg_20']
         
-        # 2. Strong Closing (Close in top 30% of day's High-Low range)
+        # ===== 🎯 STRICT READY FOR TOMORROW LOGIC 🎯 =====
+        very_near_breakout = (eod_close >= box_high * 0.985)  # Box High ke 1.5% ke andar
         day_range = eod_high - eod_low
-        strong_close = (eod_close >= (eod_high - day_range * 0.30)) if day_range > 0 else True
+        strong_close = (eod_close >= (eod_high - day_range * 0.25)) if day_range > 0 else True
+        vol_expansion = eod_vol >= (avg_vol_20_today * 1.2)
+        quality_grade = dry_ratio >= 0.50  # Grade A ya A+
         
-        # 3. Positive Day Close (Green Candle & Above Prev Close)
-        is_price_up = (eod_close > prev_close) and (eod_close >= eod_open)
+        is_ready_tomorrow = (
+            very_near_breakout and 
+            strong_close and 
+            (eod_close > prev_close) and 
+            vol_expansion and 
+            quality_grade
+        )
+
+        # ===== 🎯 STRICT 3 TRADING DAYS HIGHER HIGH & HIGHER LOW LOGIC 🎯 =====
+        # eod_idx = Current Trading Session (Trading Day 0)
+        # eod_idx - 1 = Previous Trading Session (Trading Day 1)
+        # eod_idx - 2 = 2nd Previous Trading Session (Trading Day 2)
+        h0, h1, h2 = df.iloc[eod_idx]['High'], df.iloc[eod_idx-1]['High'], df.iloc[eod_idx-2]['High']
+        l0, l1, l2 = df.iloc[eod_idx]['Low'], df.iloc[eod_idx-1]['Low'], df.iloc[eod_idx-2]['Low']
         
-        # Agle din ke liye tabhi Select hoga jab Trigger Level ke paas strong close ho
-        is_ready_tomorrow = near_breakout and strong_close and is_price_up
+        # Continuous 3 Trading Sessions Condition
+        is_uptrend_3d = (h0 > h1) and (h1 > h2) and (l0 > l1) and (l1 > l2)
             
         stop_loss = round(pre_anchor_support, 2)
         target_1 = round(eod_close * 1.15, 2)
@@ -155,7 +166,8 @@ def scan_pure_vol_dry_squeeze(df):
             'Target': target_1,
             'RR': round(reward/risk, 1),
             'Details': f"Anchor:[{anchor_date}] | Pre-Support:{round(pre_anchor_support,1)} | DryDays:{dry_up_days}/{total_base_days}",
-            'Ready_Tomorrow': is_ready_tomorrow
+            'Ready_Tomorrow': is_ready_tomorrow,
+            'UpTrend_3D': is_uptrend_3d
         }
         
     return None
@@ -186,10 +198,11 @@ def upload_to_sheet(ws, data_list, columns_order=None, default_msg="No Data"):
 stocks = get_watchlist_stocks()
 pre_dhamaka_watchlist = []
 ready_today_watchlist = [] 
+uptrend_3d_watchlist = []
 
 REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
-print(f"\n=== SCANNING {len(stocks)} STOCKS FOR EOD VOL-BLAST (NEXT-DAY SELECTION) ===", flush=True)
+print(f"\n=== SCANNING {len(stocks)} STOCKS FOR EOD VOL-BLAST + 3D UPTREND ===", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
@@ -215,13 +228,22 @@ for i, stock in enumerate(stocks):
         if setup:
             setup['Stock'] = symbol_clean
             
-            # Agar stock agle din trigger level cross karne ke bilkul paas hai
+            # 1. Ready For Tomorrow Sheet Entry
             if setup['Ready_Tomorrow']:
-                clean_setup = setup.copy()
-                clean_setup.pop('Ready_Tomorrow', None)
-                ready_today_watchlist.append(clean_setup)
+                clean_ready = setup.copy()
+                clean_ready.pop('Ready_Tomorrow', None)
+                clean_ready.pop('UpTrend_3D', None)
+                ready_today_watchlist.append(clean_ready)
             
+            # 2. 3-Trading Days Higher High/Low Sheet Entry
+            if setup['UpTrend_3D']:
+                clean_3d = setup.copy()
+                clean_3d.pop('Ready_Tomorrow', None)
+                clean_3d.pop('UpTrend_3D', None)
+                uptrend_3d_watchlist.append(clean_3d)
+
             setup.pop('Ready_Tomorrow', None)
+            setup.pop('UpTrend_3D', None)
             pre_dhamaka_watchlist.append(setup)
 
         time.sleep(0.15)
@@ -229,7 +251,10 @@ for i, stock in enumerate(stocks):
         pass
 
 columns = ['Stock', 'Grade', 'Current_Close', 'Trigger_Above', 'Pre_Anchor_SL', 'Target', 'RR', 'Details']
+
+# Uploading to 3 Worksheets
 upload_to_sheet(ws_dhamaka_watch, pre_dhamaka_watchlist, columns, "No Vol-Dry Squeeze Stock Found Today")
-upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "Agle din entry ke liye koi Box High Breakout ke paas stock nahi mila.")
+upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "Agle din entry ke liye koi Strict Box High Breakout stock nahi mila.")
+upload_to_sheet(ws_uptrend_3d, uptrend_3d_watchlist, columns, "3 Continuous Trading Days se Higher High/Low banane wala koi stock nahi mila.")
 
 print("\n=== EOD SYSTEM EXECUTION COMPLETED SUCCESSFULLY ===", flush=True)
