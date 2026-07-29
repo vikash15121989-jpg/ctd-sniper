@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V112.2: INSIDE-BOX PURE VOL-ACCUMULATION ENGINE ===", flush=True)
+print("=== V112.3: EOD INSIDE-BOX PURE VOL-ACCUMULATION ENGINE (NEXT-DAY TRIGGER) ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -32,7 +32,7 @@ def get_or_create_sheet(title):
 
 ws_watchlist = sh.worksheet("Watchlist")
 ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
-ws_ready_today = get_or_create_sheet("Ready_For_Today")
+ws_ready_today = get_or_create_sheet("Ready_For_Today")  # Agle din ki entry ke liye sheet
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -53,27 +53,26 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== 🎯 PURE VOL-ACCUMULATION SCANNER 🎯 =====
+# ===== 🎯 PURE VOL-ACCUMULATION EOD SCANNER 🎯 =====
 def scan_pure_vol_dry_squeeze(df):
     total_rows = len(df)
     if total_rows < 60: return None
 
-    live_idx = total_rows - 1
-    live_close = df.iloc[live_idx]['Close']
-    live_open = df.iloc[live_idx]['Open']
-    live_high = df.iloc[live_idx]['High']
-    live_low = df.iloc[live_idx]['Low']
-    live_vol = df.iloc[live_idx]['Volume']
-    prev_close = df.iloc[live_idx - 1]['Close']
+    # EOD Scanning: Last row is today's completed candle
+    eod_idx = total_rows - 1
+    eod_close = df.iloc[eod_idx]['Close']
+    eod_open = df.iloc[eod_idx]['Open']
+    eod_high = df.iloc[eod_idx]['High']
+    eod_low = df.iloc[eod_idx]['Low']
+    eod_vol = df.iloc[eod_idx]['Volume']
+    prev_close = df.iloc[eod_idx - 1]['Close']
     
-    # 20 दिनों का रोलिंग एवरेज वॉल्यूम
+    # 20-Day Rolling Average Volume
     df['Vol_Avg_20'] = df['Volume'].rolling(window=20).mean()
     possible_anchors = []
     
-    # 1. पिछले 40 दिनों में सभी वैलिड एंकर ढूंढना
-    for idx in range(live_idx - 40, live_idx - 1):
-        if idx < 20: continue
-        
+    # 1. Past 40 days me Anchor Day dhoondhna (Aaj ki completed candle tak check)
+    for idx in range(max(20, eod_idx - 40), eod_idx + 1):
         check_vol = df.iloc[idx]['Volume']
         check_close = df.iloc[idx]['Close']
         check_open = df.iloc[idx]['Open']
@@ -81,6 +80,7 @@ def scan_pure_vol_dry_squeeze(df):
         
         if pd.isna(avg_vol_then) or avg_vol_then == 0: continue
         
+        # Anchor Condition: 3x Volume + Green Candle
         if check_vol > (avg_vol_then * 3.0) and check_close > check_open:
             possible_anchors.append({
                 'idx': idx,
@@ -90,84 +90,72 @@ def scan_pure_vol_dry_squeeze(df):
     if not possible_anchors:
         return None
         
-    # सबसे ताज़ा वैलिड एंकर का चुनाव
     best_anchor = possible_anchors[-1] 
     anchor_row_idx = best_anchor['idx']
     anchor_date = best_anchor['date']
     
-    # एंकर कैंडल से पीछे जाकर 20 दिनों का स्विंग लो (Pre-Anchor Support) निकालना
+    # Pre-Anchor Support Level (Swing Low before Anchor)
     pre_anchor_zone = df.iloc[max(0, anchor_row_idx-20):anchor_row_idx]
     if not pre_anchor_zone.empty:
         pre_anchor_support = pre_anchor_zone['Low'].min()
     else:
         pre_anchor_support = df.iloc[anchor_row_idx]['Low']
         
-    # बॉक्स का हाई निकाल रहे हैं सिर्फ 'Trigger_Above' वैल्यू को शीट में दिखाने के लिए
-    post_anchor_zone_before_today = df.iloc[anchor_row_idx:live_idx]
-    if not post_anchor_zone_before_today.empty:
-        box_high = post_anchor_zone_before_today['High'].max()
-    else:
-        box_high = df.iloc[anchor_row_idx]['High']
+    # Consolidation Box High (Breakout / Trigger Level for Tomorrow)
+    post_anchor_zone = df.iloc[anchor_row_idx:eod_idx+1]
+    box_high = post_anchor_zone['High'].max()
         
     is_support_safe = True
     dry_up_days = 0
-    total_base_days = live_idx - anchor_row_idx
+    total_base_days = max(1, eod_idx - anchor_row_idx)
     
-    # 2. एंकर बनने के बाद से आज तक वॉल्यूम और सपोर्ट की जांच
+    # Support Safety & Volume Dry Check (Anchor se lekar EOD tak)
     for check_idx in range(anchor_row_idx + 1, total_rows):
         f_close = df.iloc[check_idx]['Close']
         f_vol = df.iloc[check_idx]['Volume']
         avg_vol_that_day = df.iloc[check_idx]['Vol_Avg_20']
         
-        # नियम 1: प्राइस प्री-एंकर सपोर्ट के नीचे क्लोज नहीं होना चाहिए
-        if f_close < pre_anchor_support:
+        # 1% Buffer for Support Safety (Wick Spike Protection)
+        if f_close < (pre_anchor_support * 0.99):
             is_support_safe = False
             break
         
-        # नियम 2: वॉल्यूम 20-दिन के रनिंग एवरेज से कम होना चाहिए (Dry Day)
         if not pd.isna(avg_vol_that_day) and f_vol < avg_vol_that_day:
             dry_up_days += 1
             
-    if is_support_safe and total_base_days >= 2:
+    if is_support_safe:
+        dry_ratio = dry_up_days / total_base_days if total_base_days > 0 else 0
+        grade = "A+" if dry_ratio >= 0.70 else ("A" if dry_ratio >= 0.45 else "B")
         
-        # ऑटोमैटिक ग्रेडिंग (सूखे वॉल्यूम के दिन के आधार पर)
-        dry_ratio = dry_up_days / total_base_days
-        grade = "A+" if dry_ratio >= 0.75 else ("A" if dry_ratio >= 0.50 else "B")
+        # ===== 🎯 READY FOR TOMORROW LOGIC 🎯 =====
+        # 1. Close is sitting near Box High (Within 3% of Breakout Level)
+        near_breakout = (eod_close >= box_high * 0.97)
         
-        # पिछले 10 दिनों का अधिकतम वॉल्यूम (आज का छोड़कर)
-        past_10d_vol = df.iloc[live_idx-11:live_idx]['Volume']
-        max_vol_10d = past_10d_vol.max() if not past_10d_vol.empty else 0
+        # 2. Strong Closing (Close in top 30% of day's High-Low range)
+        day_range = eod_high - eod_low
+        strong_close = (eod_close >= (eod_high - day_range * 0.30)) if day_range > 0 else True
         
-        # 🔥 [NEW CONDITION FOR READY TODAY]:
-        # 1. Aaj ka Volume past 10 days ke MAX Volume se jyada ho
-        is_vol_breakout = live_vol > max_vol_10d
+        # 3. Positive Day Close (Green Candle & Above Prev Close)
+        is_price_up = (eod_close > prev_close) and (eod_close >= eod_open)
         
-        # 2. Up-Side Closing: Previous Close se upar ho aur Green Candle ho
-        is_price_up = (live_close > prev_close) and (live_close >= live_open)
-        
-        # 3. Near Day High Condition: Closing Day High ke paas ho (> (High + Low) / 2)
-        mid_point = (live_high + live_low) / 2.0
-        is_close_near_high = live_close > mid_point
-        
-        is_ready_today = False
-        if is_vol_breakout and is_price_up and is_close_near_high:
-            is_ready_today = True
+        # Agle din ke liye tabhi Select hoga jab Trigger Level ke paas strong close ho
+        is_ready_tomorrow = near_breakout and strong_close and is_price_up
             
         stop_loss = round(pre_anchor_support, 2)
-        target_1 = round(live_close * 1.15, 2)
-        risk = max(0.01, live_close - stop_loss)
-        reward = target_1 - live_close
+        target_1 = round(eod_close * 1.15, 2)
+        risk = max(0.01, eod_close - stop_loss)
+        reward = target_1 - eod_close
 
         return {
             'Stock': '', 
             'Grade': grade,
-            'Current_Close': round(live_close, 2),
+            'Current_Close': round(eod_close, 2),
             'Trigger_Above': round(box_high, 2),
             'Pre_Anchor_SL': stop_loss,
             'Target': target_1,
             'RR': round(reward/risk, 1),
             'Details': f"Anchor:[{anchor_date}] | Pre-Support:{round(pre_anchor_support,1)} | DryDays:{dry_up_days}/{total_base_days}",
-            'Ready_Today': is_ready_today
+            'Ready_Tomorrow': is_ready_tomorrow
         }
         
     return None
@@ -201,7 +189,7 @@ ready_today_watchlist = []
 
 REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
-print(f"\n=== SCANNING {len(stocks)} STOCKS FOR INSIDE-BOX VOL-BLAST ===", flush=True)
+print(f"\n=== SCANNING {len(stocks)} STOCKS FOR EOD VOL-BLAST (NEXT-DAY SELECTION) ===", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
@@ -226,12 +214,14 @@ for i, stock in enumerate(stocks):
         setup = scan_pure_vol_dry_squeeze(stock_df)
         if setup:
             setup['Stock'] = symbol_clean
-            if setup['Ready_Today']:
+            
+            # Agar stock agle din trigger level cross karne ke bilkul paas hai
+            if setup['Ready_Tomorrow']:
                 clean_setup = setup.copy()
-                clean_setup.pop('Ready_Today', None)
+                clean_setup.pop('Ready_Tomorrow', None)
                 ready_today_watchlist.append(clean_setup)
             
-            setup.pop('Ready_Today', None)
+            setup.pop('Ready_Tomorrow', None)
             pre_dhamaka_watchlist.append(setup)
 
         time.sleep(0.15)
@@ -240,7 +230,6 @@ for i, stock in enumerate(stocks):
 
 columns = ['Stock', 'Grade', 'Current_Close', 'Trigger_Above', 'Pre_Anchor_SL', 'Target', 'RR', 'Details']
 upload_to_sheet(ws_dhamaka_watch, pre_dhamaka_watchlist, columns, "No Vol-Dry Squeeze Stock Found Today")
-upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "आज एंट्री के लिए कोई Inside-Box Vol Breakout (Near Day High) स्टॉक नहीं मिला।")
+upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "Agle din entry ke liye koi Box High Breakout ke paas stock nahi mila.")
 
-print("\n=== SYSTEM EXECUTION COMPLETED SUCCESSFULLY ===", flush=True)
-    
+print("\n=== EOD SYSTEM EXECUTION COMPLETED SUCCESSFULLY ===", flush=True)
