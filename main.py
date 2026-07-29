@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== V112.4: EOD INSIDE-BOX VOL-ACCUMULATION + 3 TRADING DAYS UPTREND ENGINE ===", flush=True)
+print("=== V112.5: EOD INSIDE-BOX VOL-ACCUMULATION + PRICE UP-SHIFTED 3D ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIG =====
@@ -33,7 +33,7 @@ def get_or_create_sheet(title):
 ws_watchlist = sh.worksheet("Watchlist")
 ws_dhamaka_watch = get_or_create_sheet("Pre_Dhamaka_Watch")
 ws_ready_today = get_or_create_sheet("Ready_For_Today")
-ws_uptrend_3d = get_or_create_sheet("UpTrend_3D_Dhamaka")  # 🎯 3-Trading Days Sheet
+ws_uptrend_3d = get_or_create_sheet("UpTrend_3D_Dhamaka")  # 🎯 Price Up-Shifted & Resistance Breakout Sheet
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -54,7 +54,7 @@ def flatten_yf_columns(df):
     df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
     return df
 
-# ===== 🎯 PURE VOL-ACCUMULATION EOD SCANNER 🎯 =====
+# ===== 🎯 PURE VOL-ACCUMULATION & UP-SHIFTED SCANNER 🎯 =====
 def scan_pure_vol_dry_squeeze(df):
     total_rows = len(df)
     if total_rows < 60: return None
@@ -99,7 +99,7 @@ def scan_pure_vol_dry_squeeze(df):
     pre_anchor_zone = df.iloc[max(0, anchor_row_idx-20):anchor_row_idx]
     pre_anchor_support = pre_anchor_zone['Low'].min() if not pre_anchor_zone.empty else df.iloc[anchor_row_idx]['Low']
         
-    # Consolidation Box High (Trigger Level)
+    # Consolidation Box High (Resistance / Trigger Level)
     post_anchor_zone = df.iloc[anchor_row_idx:eod_idx+1]
     box_high = post_anchor_zone['High'].max()
         
@@ -142,15 +142,25 @@ def scan_pure_vol_dry_squeeze(df):
             quality_grade
         )
 
-        # ===== 🎯 STRICT 3 TRADING DAYS HIGHER HIGH & HIGHER LOW LOGIC 🎯 =====
-        # eod_idx = Current Trading Session (Trading Day 0)
-        # eod_idx - 1 = Previous Trading Session (Trading Day 1)
-        # eod_idx - 2 = 2nd Previous Trading Session (Trading Day 2)
+        # ===== 🎯 NEW: 3D PRICE UP-SHIFTED & RESISTANCE PROXIMITY LOGIC 🎯 =====
+        # Data for last 3 Trading Sessions
         h0, h1, h2 = df.iloc[eod_idx]['High'], df.iloc[eod_idx-1]['High'], df.iloc[eod_idx-2]['High']
         l0, l1, l2 = df.iloc[eod_idx]['Low'], df.iloc[eod_idx-1]['Low'], df.iloc[eod_idx-2]['Low']
         
-        # Continuous 3 Trading Sessions Condition
-        is_uptrend_3d = (h0 > h1) and (h1 > h2) and (l0 > l1) and (l1 > l2)
+        # 1. Price Shifted Up Condition (3 Consecutive Higher Highs & Higher Lows)
+        is_3d_higher = (h0 > h1) and (h1 > h2) and (l0 > l1) and (l1 > l2)
+
+        # 2. Resistance Level Proximity (Price Resistance Level ke 3% ke andar ho ya slight breakout)
+        near_resistance = (eod_close >= box_high * 0.97) and (eod_close <= box_high * 1.015)
+
+        # 3. Volume Expansion (In 3-days, kam se kam 1 दिन Volume Avg se ziada ho)
+        v0, v1, v2 = df.iloc[eod_idx]['Volume'], df.iloc[eod_idx-1]['Volume'], df.iloc[eod_idx-2]['Volume']
+        v_avg0, v_avg1, v_avg2 = df.iloc[eod_idx]['Vol_Avg_20'], df.iloc[eod_idx-1]['Vol_Avg_20'], df.iloc[eod_idx-2]['Vol_Avg_20']
+        
+        has_vol_expansion = (v0 >= v_avg0) or (v1 >= v_avg1) or (v2 >= v_avg2)
+
+        # Combine all to confirm Price Up-Shift near Resistance Zone
+        is_uptrend_3d = is_3d_higher and near_resistance and has_vol_expansion
             
         stop_loss = round(pre_anchor_support, 2)
         target_1 = round(eod_close * 1.15, 2)
@@ -165,7 +175,7 @@ def scan_pure_vol_dry_squeeze(df):
             'Pre_Anchor_SL': stop_loss,
             'Target': target_1,
             'RR': round(reward/risk, 1),
-            'Details': f"Anchor:[{anchor_date}] | Pre-Support:{round(pre_anchor_support,1)} | DryDays:{dry_up_days}/{total_base_days}",
+            'Details': f"Anchor:[{anchor_date}] | Resistance:{round(box_high,1)} | DryDays:{dry_up_days}/{total_base_days}",
             'Ready_Tomorrow': is_ready_tomorrow,
             'UpTrend_3D': is_uptrend_3d
         }
@@ -202,7 +212,7 @@ uptrend_3d_watchlist = []
 
 REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
 
-print(f"\n=== SCANNING {len(stocks)} STOCKS FOR EOD VOL-BLAST + 3D UPTREND ===", flush=True)
+print(f"\n=== SCANNING {len(stocks)} STOCKS FOR EOD VOL-BLAST + 3D UP-SHIFTED RESISTANCE SCAN ===", flush=True)
 
 for i, stock in enumerate(stocks):
     try:
@@ -235,7 +245,7 @@ for i, stock in enumerate(stocks):
                 clean_ready.pop('UpTrend_3D', None)
                 ready_today_watchlist.append(clean_ready)
             
-            # 2. 3-Trading Days Higher High/Low Sheet Entry
+            # 2. 3-Trading Days Up-Shifted & Near Resistance Sheet Entry
             if setup['UpTrend_3D']:
                 clean_3d = setup.copy()
                 clean_3d.pop('Ready_Tomorrow', None)
@@ -255,6 +265,6 @@ columns = ['Stock', 'Grade', 'Current_Close', 'Trigger_Above', 'Pre_Anchor_SL', 
 # Uploading to 3 Worksheets
 upload_to_sheet(ws_dhamaka_watch, pre_dhamaka_watchlist, columns, "No Vol-Dry Squeeze Stock Found Today")
 upload_to_sheet(ws_ready_today, ready_today_watchlist, columns, "Agle din entry ke liye koi Strict Box High Breakout stock nahi mila.")
-upload_to_sheet(ws_uptrend_3d, uptrend_3d_watchlist, columns, "3 Continuous Trading Days se Higher High/Low banane wala koi stock nahi mila.")
+upload_to_sheet(ws_uptrend_3d, uptrend_3d_watchlist, columns, "Price Up-Shifted aur Resistance Zone ke paas koi stock nahi mila.")
 
 print("\n=== EOD SYSTEM EXECUTION COMPLETED SUCCESSFULLY ===", flush=True)
