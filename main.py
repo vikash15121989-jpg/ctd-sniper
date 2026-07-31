@@ -9,7 +9,10 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: TWO-TAB DAILY DUAL SCANNER ===", flush=True)
+print(
+    "=== CTD SNIPER: DUAL SCANNER WITH TRADINGVIEW LINKS ===",
+    flush=True,
+)
 print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
@@ -69,7 +72,7 @@ def scan_dual_status(df, stock_symbol):
 
     i = total_rows - 1  # Latest candle
 
-    # 1. Mother Candle (Peak High in 60-day window)
+    # 1. Mother Candle Identification
     lookback_window = df.iloc[i - 60 : i]
     mother_idx_loc = lookback_window["High"].idxmax()
     mother_idx = df.index.get_loc(mother_idx_loc)
@@ -98,16 +101,24 @@ def scan_dual_status(df, stock_symbol):
     if not is_vol_dry_up:
         return None, None
 
-    # Condition Check
     curr_close = df.iloc[i]["Close"]
+    curr_vol = df.iloc[i]["Volume"]
 
-    # Tab 1 Condition: Mother Candle Formed, Dry Up done, BUT Price is strictly BELOW Mother High (Not broken yet)
+    # 20-Day Average Volume for Spike check
+    avg_20_vol = df.iloc[i - 20 : i]["Volume"].mean()
+    vol_spike_ratio = (
+        round(curr_vol / avg_20_vol, 2) if avg_20_vol > 0 else 1.0
+    )
+
+    # Condition: Under Mother High (Breakout not triggered yet)
     is_under_mother = curr_close < mother_high
 
     if is_under_mother:
-        risk_pct = (mother_high - swing_low_price) / mother_high
+        entry_price = round(mother_high, 2)
+        stop_loss = round(swing_low_price, 2)
+        target_price = round(entry_price * (1 + TARGET_PCT), 2)
+        risk_pct = (entry_price - stop_loss) / entry_price
 
-        # Base Risk Check
         if risk_pct > 0.18 or risk_pct <= 0.01:
             return None, None
 
@@ -115,23 +126,81 @@ def scan_dual_status(df, stock_symbol):
             ((mother_high - curr_close) / mother_high) * 100, 2
         )
 
+        # TradingView Chart Formula
+        tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "📈 View Chart")'
+
         base_info = {
-            "Stock": stock_symbol,
-            "Mother_High": round(mother_high, 2),
-            "Mother_Date": mother_date,
-            "Swing_Low (SL)": round(swing_low_price, 2),
-            "Current_Close": round(curr_close, 2),
-            "Distance_To_Breakout_Pct": distance_from_high_pct,
-            "Est_Risk_Pct": round(risk_pct * 100, 2),
+            "Stock": stock_symbol,  # Column A
+            "Entry_Price": entry_price,  # Column B
+            "Stop_Loss": stop_loss,  # Column C
+            "Target_Price": target_price,  # Column D
+            "Current_Close": round(curr_close, 2),  # Column E
+            "Distance_Pct": distance_from_high_pct,  # Column F
+            "Risk_Pct": round(risk_pct * 100, 2),  # Column G
+            "Vol_Spike_Ratio": vol_spike_ratio,  # Internal Column
+            "Chart": tv_link,  # TradingView Link Formula
         }
 
-        # Tab 2 Filter: Close is within 2.5% of Mother High (Ready for Tomorrow Breakout)
+        # Ready for Tomorrow Condition (Distance <= 2.5%)
         if distance_from_high_pct <= 2.5:
-            return base_info, base_info  # In both list & ready list
+            return base_info, base_info
         else:
-            return base_info, None  # Only in Mother Candle Watchlist
+            return base_info, None
 
     return None, None
+
+
+def upload_ranked_ready_sheet(ws, data_list):
+    try:
+        ws.clear()
+        time.sleep(1)
+        if data_list:
+            df = pd.DataFrame(data_list)
+
+            # High Probability Sorting (Volume Spike High + Distance Low)
+            df["Score"] = df["Vol_Spike_Ratio"] / (df["Distance_Pct"] + 0.1)
+            df = df.sort_values(by="Score", ascending=False).reset_index(
+                drop=True
+            )
+
+            # Columns H, I, J Creation
+            df["Vol_Spike"] = df["Vol_Spike_Ratio"]
+            df["High_Probability_Tag"] = [
+                f"🔥 HIGH PROBABILITY #{i+1}" if i < 5 else "WATCHLIST"
+                for i in range(len(df))
+            ]
+
+            # Reordering Columns strictly to fit A to J Layout
+            ordered_cols = [
+                "Stock",  # Column A
+                "Entry_Price",  # Column B
+                "Stop_Loss",  # Column C
+                "Target_Price",  # Column D
+                "Current_Close",  # Column E
+                "Distance_Pct",  # Column F
+                "Risk_Pct",  # Column G
+                "Vol_Spike",  # Column H
+                "High_Probability_Tag",  # Column I
+                "Chart",  # Column J (Clickable Link)
+            ]
+            df = df[ordered_cols]
+
+            df_json = json.loads(df.to_json(orient="split"))
+            ws.update(
+                values=[df_json["columns"]] + df_json["data"],
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
+            print(
+                f"✅ Uploaded {len(data_list)} stocks with Column J Chart Links!",
+                flush=True,
+            )
+        else:
+            ws.update(
+                values=[["No Active Candidates Found"]], range_name="A1"
+            )
+    except Exception as e:
+        print(f"Sheet Error [Ready_For_Tomorrow]: {str(e)}", flush=True)
 
 
 def upload_to_sheet(ws, data_list, sheet_name):
@@ -140,19 +209,37 @@ def upload_to_sheet(ws, data_list, sheet_name):
         time.sleep(1)
         if data_list:
             df = pd.DataFrame(data_list)
+
+            if "Vol_Spike_Ratio" in df.columns:
+                df.drop(columns=["Vol_Spike_Ratio"], inplace=True)
+
+            # Ensure Chart column is at the end
+            ordered_cols = [
+                "Stock",
+                "Entry_Price",
+                "Stop_Loss",
+                "Target_Price",
+                "Current_Close",
+                "Distance_Pct",
+                "Risk_Pct",
+                "Chart",
+            ]
+            df = df[ordered_cols]
+
             df_json = json.loads(df.to_json(orient="split"))
             ws.update(
-                values=[df_json["columns"]] + df_json["data"], range_name="A1"
+                values=[df_json["columns"]] + df_json["data"],
+                range_name="A1",
+                value_input_option="USER_ENTERED",
             )
             print(
-                f"✅ Uploaded {len(data_list)} stocks to [{sheet_name}]",
+                f"✅ Uploaded {len(data_list)} stocks to [{sheet_name}] with Chart Links!",
                 flush=True,
             )
         else:
             ws.update(
                 values=[["No Active Candidates Found"]], range_name="A1"
             )
-            print(f"ℹ️ No candidate for [{sheet_name}] today.", flush=True)
     except Exception as e:
         print(f"Sheet Error [{sheet_name}]: {str(e)}", flush=True)
 
@@ -164,7 +251,7 @@ ready_tomorrow_list = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
 print(
-    f"Scanning {len(stocks)} stocks for Mother Candle & Ready-For-Tomorrow Status...\n",
+    f"Scanning {len(stocks)} stocks for Auto-Ranked Signals with Chart Links...\n",
     flush=True,
 )
 
@@ -185,12 +272,9 @@ for stock in stocks:
                 mother_watchlist.append(m_info)
             if r_info:
                 ready_tomorrow_list.append(r_info)
-                print(
-                    f"🔥 READY FOR TOMORROW: {symbol_clean} | Close: {r_info['Current_Close']} | Breakout Level: {r_info['Mother_High']}"
-                )
     except Exception:
         pass
 
-# Upload both tabs
+# Upload Sheets
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
-upload_to_sheet(ws_ready_tomorrow, ready_tomorrow_list, "Ready_For_Tomorrow")
+upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
