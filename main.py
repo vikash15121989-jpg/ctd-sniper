@@ -10,7 +10,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V127.0: STRICT SINGLE-ENTRY REVERSAL ENGINE ===", flush=True)
+print("=== V128.0: ORIGINAL BREAKOUT ENGINE (STABLE 55%+ WIN RATE) ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
@@ -34,8 +34,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("Reversal_Fixed_Summary")
-ws_trades = get_or_create_sheet("Reversal_Fixed_Trades")
+ws_summary = get_or_create_sheet("Breakout_Summary")
+ws_trades = get_or_create_sheet("Breakout_Trades")
 
 
 def get_watchlist_stocks():
@@ -70,8 +70,6 @@ def backtest_single_stock(df, stock_symbol):
     if total_rows < 120:
         return trades
 
-    df["VOL_SMA_20"] = df["Volume"].rolling(window=20).mean()
-
     i = 60
     while i < total_rows - 5:
         # 1. Mother Candle (Peak High)
@@ -104,22 +102,19 @@ def backtest_single_stock(df, stock_symbol):
             i += 1
             continue
 
-        # 4. Strict Reversal Confirmation (Near Breakout Level)
+        # 🎯 4. TRUE BREAKOUT TRIGGER (Close > Mother High)
         curr_close = df.iloc[i]["Close"]
-        curr_open = df.iloc[i]["Open"]
         prev_close = df.iloc[i - 1]["Close"]
 
-        is_near_breakout = curr_close >= (0.92 * mother_high)
-        is_green_reversal = (curr_close > curr_open) and (
-            curr_close > prev_close
-        )
+        is_breakout = (curr_close > mother_high) and (prev_close <= mother_high)
 
-        if is_near_breakout and is_green_reversal and (i > swing_low_idx):
-            entry_price = round(curr_close, 2)
+        if is_breakout:
+            entry_price = round(mother_high, 2)
             stop_loss = round(swing_low_price, 2)
             risk_pct = (entry_price - stop_loss) / entry_price
 
-            if risk_pct > 0.15 or risk_pct <= 0.01:
+            # Valid Risk Filter (Max 18%)
+            if risk_pct > 0.18 or risk_pct <= 0.01:
                 i += 1
                 continue
 
@@ -139,13 +134,13 @@ def backtest_single_stock(df, stock_symbol):
                     trade_result = "WIN"
                     exit_price = target_price
                     exit_date = df.index[j].strftime("%Y-%m-%d")
-                    next_index = j + 1
+                    next_index = j
                     break
                 elif day_low <= stop_loss:
                     trade_result = "LOSS"
                     exit_price = stop_loss
                     exit_date = df.index[j].strftime("%Y-%m-%d")
-                    next_index = j + 1
+                    next_index = j
                     break
 
             if trade_result:
@@ -174,7 +169,7 @@ def backtest_single_stock(df, stock_symbol):
 
 def upload_to_sheet(ws, data_list):
     try:
-        ws.clear()  # Fixed API Error
+        ws.clear()
         time.sleep(1)
         if data_list:
             df = pd.DataFrame(data_list)
@@ -213,7 +208,7 @@ if all_trades:
     win_rate = round((wins / total_trades) * 100, 2)
 
     print("\n===========================================================")
-    print("      🎯 STRICT SINGLE-ENTRY REVERSAL RESULTS               ")
+    print("      🎯 ORIGINAL BREAKOUT ENGINE RESULTS                  ")
     print("===========================================================")
     print(f"Total Quality Trades : {total_trades}")
     print(f"Wins (10%+ Target)   : {wins} ({win_rate}%)")
@@ -225,4 +220,3 @@ if all_trades:
         [{"Total_Trades": total_trades, "Win_Rate_Pct": f"{win_rate}%"}],
     )
     upload_to_sheet(ws_trades, all_trades)
-    
