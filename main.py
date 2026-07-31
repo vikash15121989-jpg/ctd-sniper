@@ -11,15 +11,14 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 print(
-    "=== V115.0: MOTHER CANDLE + SWING LOW CANDLE CLUBBED CONFIRMATION ENGINE"
-    " ===",
+    "=== V116.0: MOTHER CANDLE + SWING LOW PATTERN BREAKDOWN AUDITOR ===",
     flush=True,
 )
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
 BACKTEST_YEARS = 2
-TARGET_PCT = 0.10  # 10% Target
+TARGET_PCT = 0.10  # 10% Minimum Target
 MIN_AVG_VOLUME = 100000
 MIN_AVG_TURNOVER_CR = 2
 
@@ -40,8 +39,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("Backtest_Summary")
-ws_trades = get_or_create_sheet("High_Prob_Trade_Logs")
+ws_breakdown = get_or_create_sheet("Pattern_Wise_Breakdown")
+ws_trades = get_or_create_sheet("All_Trade_Logs_With_Patterns")
 
 
 def get_watchlist_stocks():
@@ -73,29 +72,30 @@ def flatten_yf_columns(df):
     return df
 
 
-# ===== 🎯 CANDLE CLUBBING & SWING LOW CONFIRMATION AUDITOR 🎯 =====
-def audit_swing_low_confirmations(df, swing_low_idx):
+# ===== 🎯 EXACT SWING LOW PATTERN CLASSIFIER (SINGLE + CLUBBED) 🎯 =====
+def classify_swing_low_pattern(df, swing_low_idx):
     if swing_low_idx + 1 >= len(df):
-        return False, "No Data"
+        return "Unknown / Edge Case"
 
     # Single Candle Details at Swing Low
     c0_open = df.iloc[swing_low_idx]["Open"]
     c0_high = df.iloc[swing_low_idx]["High"]
     c0_low = df.iloc[swing_low_idx]["Low"]
     c0_close = df.iloc[swing_low_idx]["Close"]
+    c0_vol = df.iloc[swing_low_idx]["Volume"]
+
     c0_range = max(0.001, c0_high - c0_low)
     c0_body = abs(c0_close - c0_open)
     c0_lwick = min(c0_open, c0_close) - c0_low
+    c0_uwick = c0_high - max(c0_open, c0_close)
 
-    # Single Candle Checks
-    is_hammer = (c0_lwick / c0_range >= 0.40) and (c0_close >= c0_open)
-
-    # 2-Day Candle Clubbing (Merge Swing Low Day + Next Day)
+    # Next Day Candle (for 2-Day Clubbing)
     c1_open = df.iloc[swing_low_idx + 1]["Open"]
     c1_high = df.iloc[swing_low_idx + 1]["High"]
     c1_low = df.iloc[swing_low_idx + 1]["Low"]
     c1_close = df.iloc[swing_low_idx + 1]["Close"]
 
+    # 2-Day Clubbed Candle Math
     club_open = c0_open
     club_high = max(c0_high, c1_high)
     club_low = min(c0_low, c1_low)
@@ -103,35 +103,53 @@ def audit_swing_low_confirmations(df, swing_low_idx):
     club_range = max(0.001, club_high - club_low)
     club_body = abs(club_close - club_open)
     club_lwick = min(club_open, club_close) - club_low
+    club_uwick = club_high - max(club_open, club_close)
 
-    # Combined Patterns
-    is_clubbed_bullish_hammer = (club_lwick / club_range >= 0.35) and (
-        club_close > club_open
-    )
-    is_engulfing = (
+    # Historical avg vol for volume dry test
+    lookback_vol = df.iloc[max(0, swing_low_idx - 20) : swing_low_idx][
+        "Volume"
+    ].mean()
+    is_vol_dry = c0_vol < lookback_vol
+
+    # --- CLASSIFICATION LOGIC ---
+
+    # 1. Bullish Engulfing
+    if (
         (c0_close < c0_open)
         and (c1_close > c1_open)
         and (c1_close >= c0_open)
         and (c1_open <= c0_close)
-    )
-    is_tweezer_bottom = (
-        abs(c0_low - c1_low) / c0_low <= 0.003
-    ) and (c1_close > c1_open)
+    ):
+        return "1. Bullish Engulfing (2-Day Club)"
 
-    # High Probability Match Condition
-    if is_engulfing:
-        return True, "Bullish Engulfing"
-    elif is_clubbed_bullish_hammer:
-        return True, "Clubbed Bullish Hammer"
-    elif is_hammer:
-        return True, "Single Hammer"
-    elif is_tweezer_bottom:
-        return True, "Tweezer Bottom"
+    # 2. Clubbed Bullish Hammer
+    if (club_lwick / club_range >= 0.40) and (club_close > club_open):
+        return "2. Clubbed Bullish Hammer (2-Day Club)"
 
-    return False, "Weak / Fake Reversal"
+    # 3. Single Hammer / Pinbar
+    if (c0_lwick / c0_range >= 0.45) and (c0_uwick / c0_range <= 0.20):
+        return "3. Single Day Hammer / Pinbar"
+
+    # 4. Tweezer Bottom
+    if (abs(c0_low - c1_low) / c0_low <= 0.003) and (c1_close > c1_open):
+        return "4. Tweezer Bottom (Double Low Reversal)"
+
+    # 5. Shooting Star / Upper Wick Rejection (Weakness)
+    if (c0_uwick / c0_range >= 0.45) or (club_uwick / club_range >= 0.45):
+        return "5. Shooting Star / Upper Wick Rejection"
+
+    # 6. Full Red Body / Strong Bearish Close
+    if (c0_close < c0_open) and (c0_body / c0_range >= 0.60):
+        return "6. Full Red Body (No Reversal Support)"
+
+    # 7. Volume Dry + Small Body (Doji / Spinning Top)
+    if is_vol_dry and (c0_body / c0_range <= 0.30):
+        return "7. Volume Dry + Small Body Doji"
+
+    return "8. Normal / Mixed Candle Structure"
 
 
-# ===== 🎯 HIGH-PROBABILITY BACKTEST ENGINE 🎯 =====
+# ===== 🎯 BACKTEST EXECUTION =====
 def backtest_single_stock(df, stock_symbol):
     trades = []
     total_rows = len(df)
@@ -141,7 +159,6 @@ def backtest_single_stock(df, stock_symbol):
 
     i = 60
     while i < total_rows - 5:
-        # 1. Mother Candle (Peak High)
         lookback_window = df.iloc[i - 60 : i]
         mother_idx_loc = lookback_window["High"].idxmax()
         mother_idx = df.index.get_loc(mother_idx_loc)
@@ -152,14 +169,12 @@ def backtest_single_stock(df, stock_symbol):
 
         mother_high = df.iloc[mother_idx]["High"]
 
-        # 2. Swing Low (Lowest point after Mother Candle)
         post_mother_zone = df.iloc[mother_idx:i]
         swing_low_idx_loc = post_mother_zone["Low"].idxmin()
         swing_low_idx = df.index.get_loc(swing_low_idx_loc)
-
         swing_low_price = df.iloc[swing_low_idx]["Low"]
 
-        # 3. Volume Trendline Check
+        # Volume Trendline Check
         vol_phase = df.iloc[mother_idx : swing_low_idx + 1]["Volume"]
         if len(vol_phase) >= 3:
             x = np.arange(len(vol_phase))
@@ -168,17 +183,14 @@ def backtest_single_stock(df, stock_symbol):
         else:
             is_vol_decreasing = False
 
-        # 4. Entry Trigger: Breakout above Mother High
         curr_close = df.iloc[i]["Close"]
         prev_close = df.iloc[i - 1]["Close"]
 
         is_breakout = (curr_close > mother_high) and (prev_close <= mother_high)
 
         if is_breakout and is_vol_decreasing:
-            # 🎯 5. CHECK SWING LOW CANDLE CLUBBING & CONFIRMATION
-            has_high_prob_confirmation, pattern_type = (
-                audit_swing_low_confirmations(df, swing_low_idx)
-            )
+            # Classify Pattern
+            pattern_type = classify_swing_low_pattern(df, swing_low_idx)
 
             entry_date = df.index[i].strftime("%Y-%m-%d")
             entry_price = round(mother_high, 2)
@@ -226,7 +238,6 @@ def backtest_single_stock(df, stock_symbol):
                     "Exit_Price": exit_price,
                     "Result": trade_result,
                     "PnL_Pct": pnl,
-                    "High_Prob_Confirmed": has_high_prob_confirmation,
                     "Swing_Low_Pattern": pattern_type,
                 })
                 i = j
@@ -238,33 +249,24 @@ def backtest_single_stock(df, stock_symbol):
     return trades
 
 
-def upload_to_sheet(ws, data_list, default_msg="No Data"):
+def upload_to_sheet(ws, df_data):
     try:
         ws.batch_clear(["A:Z"])
         time.sleep(1)
-        if data_list:
-            df = pd.DataFrame(data_list)
-            df_json = json.loads(df.to_json(orient="split"))
+        if not df_data.empty:
+            df_json = json.loads(df_data.to_json(orient="split"))
             values = [df_json["columns"]] + df_json["data"]
             ws.update(values=values, range_name="A1")
-        else:
-            ws.update(values=[[default_msg]], range_name="A1")
     except Exception as e:
         print(f"Sheet Error: {str(e)}", flush=True)
 
 
-# ===== MAIN BACKTEST EXECUTION =====
+# ===== MAIN EXECUTION =====
 stocks = get_watchlist_stocks()
 all_trades = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
-print(
-    f"\n=== BACKTESTING {len(stocks)} STOCKS WITH CANDLE CLUBBING & SWING LOW"
-    " AUDIT ===",
-    flush=True,
-)
-
-for i, stock in enumerate(stocks):
+for stock in stocks:
     try:
         symbol_clean = stock.replace(".NS", "")
         if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
@@ -280,52 +282,43 @@ for i, stock in enumerate(stocks):
 
         stock_trades = backtest_single_stock(stock_df, symbol_clean)
         all_trades.extend(stock_trades)
-
-        time.sleep(0.1)
+        time.sleep(0.05)
     except Exception as e:
         pass
 
 if all_trades:
-    df_results = pd.DataFrame(all_trades)
+    trades_df = pd.DataFrame(all_trades)
 
-    # 1. Overall Results
-    total_trades = len(df_results)
-    total_wins = len(df_results[df_results["Result"] == "WIN"])
+    # 🎯 PATTERN-WISE BREAKDOWN TABLE GENERATION 🎯
+    breakdown_list = []
+    for pattern, group in trades_df.groupby("Swing_Low_Pattern"):
+        tot = len(group)
+        w = len(group[group["Result"] == "WIN"])
+        l = len(group[group["Result"] == "LOSS"])
+        wr = round((w / tot) * 100, 2)
 
-    # 2. High Probability Filtered Results (Where Swing Low Confirmation Was Present)
-    high_prob_df = df_results[df_results["High_Prob_Confirmed"] == True]
-    hp_total = len(high_prob_df)
-    hp_wins = len(high_prob_df[high_prob_df["Result"] == "WIN"])
-    hp_losses = len(high_prob_df[high_prob_df["Result"] == "LOSS"])
-    hp_win_rate = round((hp_wins / hp_total) * 100, 2) if hp_total > 0 else 0
+        tag = "🏆 HIGH WINNER SETUP" if wr >= 70 else ("🔴 LOSS MAKER SETUP" if wr < 45 else "🟢 MODERATE SETUP")
 
-    print("\n==========================================")
-    print("      📊 SWING LOW CONFIRMATION AUDIT     ")
-    print("==========================================")
-    print(f"Total Base Trades Tested     : {total_trades}")
-    print(
-        f"High-Probability Filtered Trades : {hp_total} (Filtered out weak SL"
-        " trades)"
+        breakdown_list.append({
+            "Swing_Low_Pattern": pattern,
+            "Total_Trades": tot,
+            "Wins": w,
+            "Losses": l,
+            "Win_Rate_Pct": f"{wr}%",
+            "Setup_Tag": tag,
+        })
+
+    breakdown_df = pd.DataFrame(breakdown_list).sort_values(
+        by="Wins", ascending=False
     )
-    print(f"Target Hits (Wins)           : {hp_wins}")
-    print(f"Stop Loss Hits (Losses)      : {hp_losses}")
-    print(
-        f"🎯 High-Probability Win Rate : {hp_win_rate}%  (vs 60.4% base win"
-        " rate)"
-    )
-    print("==========================================\n")
 
-    summary_metrics = [{
-        "Total_Tested_Trades": total_trades,
-        "Filtered_High_Prob_Trades": hp_total,
-        "Wins": hp_wins,
-        "Losses": hp_losses,
-        "Base_Win_Rate": f"{round((total_wins/total_trades)*100, 2)}%",
-        "High_Prob_Win_Rate": f"{hp_win_rate}%",
-    }]
+    print("\n===========================================================")
+    print("      📊 PATTERN-WISE WIN vs LOSS DETAILED BREAKDOWN       ")
+    print("===========================================================")
+    print(breakdown_df.to_string(index=False))
+    print("===========================================================\n")
 
-    upload_to_sheet(ws_summary, summary_metrics)
-    upload_to_sheet(ws_trades, all_trades)
-else:
-    print("\nNo trades generated.")
-    
+    # Upload to Google Sheet
+    upload_to_sheet(ws_breakdown, breakdown_df)
+    upload_to_sheet(ws_trades, trades_df)
+                    
