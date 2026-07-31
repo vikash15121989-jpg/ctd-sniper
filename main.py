@@ -11,15 +11,15 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 print(
-    "=== V120.0: MOTHER CANDLE + VOL TRENDLINE + SUPPORT ZONE REVERSAL"
-    " BACKTEST ===",
+    "=== V123.0: MOTHER CANDLE + REAL VOLUME DRY-UP (NOT STRICT SLOPE) ===",
     flush=True,
 )
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
+# ===== CONFIGURATION =====
 BACKTEST_YEARS = 2
 TARGET_PCT = 0.10  # 10% Target
-ZONE_TOLERANCE = 0.02  # 2% Tolerance for Support Level Test
+SUPPORT_BUFFER_PCT = 0.05  # 5% Buffer Zone for Support Retest
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=BACKTEST_YEARS * 365)
@@ -38,8 +38,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("Support_Zone_Summary")
-ws_trades = get_or_create_sheet("Support_Zone_Trades")
+ws_summary = get_or_create_sheet("Volume_DryUp_Summary")
+ws_trades = get_or_create_sheet("Volume_DryUp_Trades")
 
 
 def get_watchlist_stocks():
@@ -74,9 +74,9 @@ def backtest_single_stock(df, stock_symbol):
     if total_rows < 120:
         return trades
 
-    i = 100
+    i = 80
     while i < total_rows - 5:
-        # 1. Mother Candle (Pichhle 60 days ka High)
+        # 1. Mother Candle (Peak High in last 60 days)
         lookback_window = df.iloc[i - 60 : i]
         mother_idx_loc = lookback_window["High"].idxmax()
         mother_idx = df.index.get_loc(mother_idx_loc)
@@ -86,53 +86,56 @@ def backtest_single_stock(df, stock_symbol):
             continue
 
         mother_high = df.iloc[mother_idx]["High"]
+        mother_vol = df.iloc[mother_idx]["Volume"]
 
-        # 2. Swing Low (Mother Candle ke baad ka sabse lower price)
+        # 2. Swing Low (Lowest price after Mother Candle)
         post_mother_zone = df.iloc[mother_idx:i]
         swing_low_idx_loc = post_mother_zone["Low"].idxmin()
         swing_low_idx = df.index.get_loc(swing_low_idx_loc)
         swing_low_price = df.iloc[swing_low_idx]["Low"]
 
-        # 🎯 3. PREVIOUS SUPPORT ZONE CHECK (Prev Swing High or Prev Swing Low)
-        # Mother Candle se pehle ke 60 days me Key Levels dhundho
+        # 3. PREVIOUS SUPPORT ZONE & 5% BUFFER CHECK
         history_window = df.iloc[
-            max(0, mother_idx - 60) : max(1, mother_idx - 5)
+            max(0, mother_idx - 60) : max(1, mother_idx - 3)
         ]
-
         if len(history_window) < 10:
             i += 1
             continue
 
+        prev_support_low = history_window["Low"].min()
         prev_swing_high = history_window["High"].max()
-        prev_swing_low = history_window["Low"].min()
 
-        # Check agar Current Swing Low kisi Support Level (Prev High / Low) ke pass hai
-        near_prev_high = (
+        diff_with_prev_low = (
+            abs(swing_low_price - prev_support_low) / prev_support_low
+        )
+        diff_with_prev_high = (
             abs(swing_low_price - prev_swing_high) / prev_swing_high
-        ) <= ZONE_TOLERANCE
-        near_prev_low = (
-            abs(swing_low_price - prev_swing_low) / prev_swing_low
-        ) <= ZONE_TOLERANCE
+        )
 
-        is_at_support_zone = near_prev_high or near_prev_low
+        is_within_5pct_buffer = (
+            diff_with_prev_low <= SUPPORT_BUFFER_PCT
+            or diff_with_prev_high <= SUPPORT_BUFFER_PCT
+        )
 
-        if not is_at_support_zone:
+        if not is_within_5pct_buffer:
             i += 1
             continue
 
-        # 4. Volume Trendline Check (Mother High se Swing Low tak)
-        vol_phase = df.iloc[mother_idx : swing_low_idx + 1]["Volume"]
-        if len(vol_phase) >= 3:
-            slope, _ = np.polyfit(np.arange(len(vol_phase)), vol_phase.values, 1)
-            is_vol_decreasing = slope < 0
+        # 🎯 4. REAL VOLUME DRY-UP CHECK (No strict slope required)
+        # Pullback phase ka average volume Mother Candle volume se kam (dry) hona chahiye
+        pullback_vols = df.iloc[mother_idx + 1 : swing_low_idx + 1]["Volume"]
+        if len(pullback_vols) > 0:
+            avg_pullback_vol = pullback_vols.mean()
+            # Dynamic Dry Up: Pullback volume < 70% of Mother Candle Volume
+            is_vol_dry_up = avg_pullback_vol < (0.70 * mother_vol)
         else:
-            is_vol_decreasing = False
+            is_vol_dry_up = False
 
-        if not is_vol_decreasing:
+        if not is_vol_dry_up:
             i += 1
             continue
 
-        # 5. Mother Candle Breakout Trigger
+        # 5. Breakout Trigger
         curr_close = df.iloc[i]["Close"]
         prev_close = df.iloc[i - 1]["Close"]
 
@@ -234,7 +237,7 @@ if all_trades:
     win_rate = round((wins / total_trades) * 100, 2)
 
     print("\n===========================================================")
-    print("      🎯 SUPPORT ZONE REVERSAL BACKTEST RESULTS             ")
+    print("      🎯 REAL VOLUME DRY-UP BACKTEST RESULTS               ")
     print("===========================================================")
     print(f"Total Quality Trades : {total_trades}")
     print(f"Wins (10%+ Target)   : {wins} ({win_rate}%)")
