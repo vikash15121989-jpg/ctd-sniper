@@ -10,7 +10,7 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 print(
-    "=== CTD SNIPER: DUAL SCANNER WITH TRADINGVIEW LINKS ===",
+    "=== CTD SNIPER: DUAL SCANNER WITH SINGLE-STOCK POSITION CALCULATOR ===",
     flush=True,
 )
 print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
@@ -38,6 +38,7 @@ def get_or_create_sheet(title):
 ws_watchlist = sh.worksheet("Watchlist")
 ws_mother_list = get_or_create_sheet("Mother_Candle_Watchlist")
 ws_ready_tomorrow = get_or_create_sheet("Ready_For_Tomorrow")
+ws_pos_sizing = get_or_create_sheet("Position_Sizing")
 
 
 def get_watchlist_stocks():
@@ -138,7 +139,7 @@ def scan_dual_status(df, stock_symbol):
             "Distance_Pct": distance_from_high_pct,  # Column F
             "Risk_Pct": round(risk_pct * 100, 2),  # Column G
             "Vol_Spike_Ratio": vol_spike_ratio,  # Internal Column
-            "Chart": tv_link,  # TradingView Link Formula
+            "Chart": tv_link,  # Column J
         }
 
         # Ready for Tomorrow Condition (Distance <= 2.5%)
@@ -163,25 +164,23 @@ def upload_ranked_ready_sheet(ws, data_list):
                 drop=True
             )
 
-            # Columns H, I, J Creation
             df["Vol_Spike"] = df["Vol_Spike_Ratio"]
             df["High_Probability_Tag"] = [
                 f"🔥 HIGH PROBABILITY #{i+1}" if i < 5 else "WATCHLIST"
                 for i in range(len(df))
             ]
 
-            # Reordering Columns strictly to fit A to J Layout
             ordered_cols = [
-                "Stock",  # Column A
-                "Entry_Price",  # Column B
-                "Stop_Loss",  # Column C
-                "Target_Price",  # Column D
-                "Current_Close",  # Column E
-                "Distance_Pct",  # Column F
-                "Risk_Pct",  # Column G
-                "Vol_Spike",  # Column H
-                "High_Probability_Tag",  # Column I
-                "Chart",  # Column J (Clickable Link)
+                "Stock",
+                "Entry_Price",
+                "Stop_Loss",
+                "Target_Price",
+                "Current_Close",
+                "Distance_Pct",
+                "Risk_Pct",
+                "Vol_Spike",
+                "High_Probability_Tag",
+                "Chart",
             ]
             df = df[ordered_cols]
 
@@ -192,7 +191,7 @@ def upload_ranked_ready_sheet(ws, data_list):
                 value_input_option="USER_ENTERED",
             )
             print(
-                f"✅ Uploaded {len(data_list)} stocks with Column J Chart Links!",
+                f"✅ Uploaded {len(data_list)} stocks with Chart Links!",
                 flush=True,
             )
         else:
@@ -213,7 +212,6 @@ def upload_to_sheet(ws, data_list, sheet_name):
             if "Vol_Spike_Ratio" in df.columns:
                 df.drop(columns=["Vol_Spike_Ratio"], inplace=True)
 
-            # Ensure Chart column is at the end
             ordered_cols = [
                 "Stock",
                 "Entry_Price",
@@ -233,7 +231,7 @@ def upload_to_sheet(ws, data_list, sheet_name):
                 value_input_option="USER_ENTERED",
             )
             print(
-                f"✅ Uploaded {len(data_list)} stocks to [{sheet_name}] with Chart Links!",
+                f"✅ Uploaded {len(data_list)} stocks to [{sheet_name}]!",
                 flush=True,
             )
         else:
@@ -244,6 +242,73 @@ def upload_to_sheet(ws, data_list, sheet_name):
         print(f"Sheet Error [{sheet_name}]: {str(e)}", flush=True)
 
 
+def setup_position_sizing_tab(ws):
+    """Configures A1 as Capital Input and A2 as Stock Input with auto calculations"""
+    try:
+        # Check if setup already exists so we don't wipe out user inputs in A1 & A2
+        existing_label = ws.acell("B1").value
+        if not existing_label or "TOTAL CAPITAL" not in str(existing_label):
+            ws.clear()
+            time.sleep(1)
+
+            # Creating Structured Single-Stock Calculator Layout
+            layout = [
+                [
+                    100000,
+                    "⬅️ Enter Your Total Capital (A1)",
+                ],  # Row 1: A1 = Capital
+                [
+                    "TATAMOTORS",
+                    "⬅️ Enter Stock Symbol (A2)",
+                ],  # Row 2: A2 = Stock Symbol
+                ["", ""],  # Row 3: Blank
+                [
+                    "Metric / Detail",
+                    "Value / Calculation",
+                ],  # Row 4: Table Headers
+                [
+                    "Max Allowed Risk (2% of Capital)",
+                    "=A1*0.02",
+                ],  # Row 5: Max Risk (B5)
+                [
+                    "Entry Price (₹)",
+                    '=IFERROR(XLOOKUP(A2, Ready_For_Tomorrow!A:A, Ready_For_Tomorrow!B:B), "Stock Not Found")',
+                ],  # Row 6: Entry (B6)
+                [
+                    "Stop Loss (₹)",
+                    '=IFERROR(XLOOKUP(A2, Ready_For_Tomorrow!A:A, Ready_For_Tomorrow!C:C), "Stock Not Found")',
+                ],  # Row 7: SL (B7)
+                [
+                    "Risk Per Share (₹)",
+                    '=IF(ISNUMBER(B6), B6-B7, "-")',
+                ],  # Row 8: Risk/Share (B8)
+                [
+                    "🎯 BUY POSITION SIZE (QUANTITY)",
+                    '=IF(AND(ISNUMBER(B8), B8>0), INT(B5/B8), "Invalid Entry/SL")',
+                ],  # Row 9: Quantity (B9)
+                [
+                    "Total Investment Amount Needed (₹)",
+                    '=IF(ISNUMBER(B9), B9*B6, "-")',
+                ],  # Row 10: Investment (B10)
+                [
+                    "Actual Risk Amount (₹)",
+                    '=IF(ISNUMBER(B9), B9*B8, "-")',
+                ],  # Row 11: Actual Loss (B11)
+            ]
+
+            ws.update(
+                values=layout,
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
+            print(
+                "✅ Created & Configured [Position_Sizing] Tab (A1=Capital, A2=Stock)!",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"Sheet Error [Position_Sizing]: {str(e)}", flush=True)
+
+
 # ===== MAIN EXECUTION =====
 stocks = get_watchlist_stocks()
 mother_watchlist = []
@@ -251,7 +316,7 @@ ready_tomorrow_list = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
 print(
-    f"Scanning {len(stocks)} stocks for Auto-Ranked Signals with Chart Links...\n",
+    f"Scanning {len(stocks)} stocks for Signals & Setting up Calculator...\n",
     flush=True,
 )
 
@@ -275,6 +340,7 @@ for stock in stocks:
     except Exception:
         pass
 
-# Upload Sheets
+# Upload Sheets & Setup Sizing Calculator Tab
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
 upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
+setup_position_sizing_tab(ws_pos_sizing)
