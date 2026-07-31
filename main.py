@@ -11,15 +11,13 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 print(
-    "=== V123.0: MOTHER CANDLE + REAL VOLUME DRY-UP (NOT STRICT SLOPE) ===",
-    flush=True,
+    "=== V125.0: SWING LOW REVERSAL CONFIRMATION ENTRY BACKTEST ===", flush=True
 )
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
 BACKTEST_YEARS = 2
 TARGET_PCT = 0.10  # 10% Target
-SUPPORT_BUFFER_PCT = 0.05  # 5% Buffer Zone for Support Retest
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=BACKTEST_YEARS * 365)
@@ -38,8 +36,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("Volume_DryUp_Summary")
-ws_trades = get_or_create_sheet("Volume_DryUp_Trades")
+ws_summary = get_or_create_sheet("Confirmation_Entry_Summary")
+ws_trades = get_or_create_sheet("Confirmation_Entry_Trades")
 
 
 def get_watchlist_stocks():
@@ -71,12 +69,12 @@ def backtest_single_stock(df, stock_symbol):
     trades = []
     total_rows = len(df)
 
-    if total_rows < 120:
+    if total_rows < 100:
         return trades
 
-    i = 80
+    i = 60
     while i < total_rows - 5:
-        # 1. Mother Candle (Peak High in last 60 days)
+        # 1. Mother Candle (Peak High)
         lookback_window = df.iloc[i - 60 : i]
         mother_idx_loc = lookback_window["High"].idxmax()
         mother_idx = df.index.get_loc(mother_idx_loc)
@@ -88,46 +86,17 @@ def backtest_single_stock(df, stock_symbol):
         mother_high = df.iloc[mother_idx]["High"]
         mother_vol = df.iloc[mother_idx]["Volume"]
 
-        # 2. Swing Low (Lowest price after Mother Candle)
+        # 2. Swing Low Identification (Up to current index i)
         post_mother_zone = df.iloc[mother_idx:i]
         swing_low_idx_loc = post_mother_zone["Low"].idxmin()
         swing_low_idx = df.index.get_loc(swing_low_idx_loc)
         swing_low_price = df.iloc[swing_low_idx]["Low"]
 
-        # 3. PREVIOUS SUPPORT ZONE & 5% BUFFER CHECK
-        history_window = df.iloc[
-            max(0, mother_idx - 60) : max(1, mother_idx - 3)
-        ]
-        if len(history_window) < 10:
-            i += 1
-            continue
-
-        prev_support_low = history_window["Low"].min()
-        prev_swing_high = history_window["High"].max()
-
-        diff_with_prev_low = (
-            abs(swing_low_price - prev_support_low) / prev_support_low
-        )
-        diff_with_prev_high = (
-            abs(swing_low_price - prev_swing_high) / prev_swing_high
-        )
-
-        is_within_5pct_buffer = (
-            diff_with_prev_low <= SUPPORT_BUFFER_PCT
-            or diff_with_prev_high <= SUPPORT_BUFFER_PCT
-        )
-
-        if not is_within_5pct_buffer:
-            i += 1
-            continue
-
-        # 🎯 4. REAL VOLUME DRY-UP CHECK (No strict slope required)
-        # Pullback phase ka average volume Mother Candle volume se kam (dry) hona chahiye
+        # 3. Volume Dry-Up Check
         pullback_vols = df.iloc[mother_idx + 1 : swing_low_idx + 1]["Volume"]
         if len(pullback_vols) > 0:
             avg_pullback_vol = pullback_vols.mean()
-            # Dynamic Dry Up: Pullback volume < 70% of Mother Candle Volume
-            is_vol_dry_up = avg_pullback_vol < (0.70 * mother_vol)
+            is_vol_dry_up = avg_pullback_vol < (0.75 * mother_vol)
         else:
             is_vol_dry_up = False
 
@@ -135,18 +104,28 @@ def backtest_single_stock(df, stock_symbol):
             i += 1
             continue
 
-        # 5. Breakout Trigger
+        # 🎯 4. UPSIDE REVERSAL CONFIRMATION TRIGGER
+        # Swing Low banne ke baad candidate candle (i) par bounce dekho
         curr_close = df.iloc[i]["Close"]
-        prev_close = df.iloc[i - 1]["Close"]
+        curr_open = df.iloc[i]["Open"]
+        prev_high = df.iloc[i - 1]["High"]
 
-        is_breakout = (curr_close > mother_high) and (prev_close <= mother_high)
+        # Condition: Green Candle + Breaks Previous Day High (Upside Move Initiated)
+        is_green_candle = curr_close > curr_open
+        is_breaking_prev_high = curr_close > prev_high
+        is_after_swing_low = i > swing_low_idx
 
-        if is_breakout:
-            entry_price = round(mother_high, 2)
+        is_reversal_confirmation = (
+            is_green_candle and is_breaking_prev_high and is_after_swing_low
+        )
+
+        if is_reversal_confirmation:
+            entry_price = round(curr_close, 2)
             stop_loss = round(swing_low_price, 2)
             risk_pct = (entry_price - stop_loss) / entry_price
 
-            if risk_pct > 0.18 or risk_pct <= 0.01:
+            # Valid Risk Sanity (Risk 1% to 12% Max)
+            if risk_pct > 0.12 or risk_pct <= 0.01:
                 i += 1
                 continue
 
@@ -210,7 +189,7 @@ def upload_to_sheet(ws, data_list):
         print(f"Sheet Error: {str(e)}", flush=True)
 
 
-# MAIN EXECUTION
+# ===== MAIN EXECUTION =====
 stocks = get_watchlist_stocks()
 all_trades = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
@@ -224,7 +203,7 @@ for stock in stocks:
             stock, start=START_DATE, end=END_DATE, progress=False
         )
         stock_df = flatten_yf_columns(stock_df)
-        if not stock_df.empty and len(stock_df) >= 120:
+        if not stock_df.empty and len(stock_df) >= 100:
             all_trades.extend(backtest_single_stock(stock_df, symbol_clean))
     except Exception:
         pass
@@ -237,7 +216,7 @@ if all_trades:
     win_rate = round((wins / total_trades) * 100, 2)
 
     print("\n===========================================================")
-    print("      🎯 REAL VOLUME DRY-UP BACKTEST RESULTS               ")
+    print("      🎯 SWING LOW REVERSAL ENTRY BACKTEST RESULTS         ")
     print("===========================================================")
     print(f"Total Quality Trades : {total_trades}")
     print(f"Wins (10%+ Target)   : {wins} ({win_rate}%)")
