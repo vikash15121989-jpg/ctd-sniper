@@ -10,9 +10,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print(
-    "=== V125.0: SWING LOW REVERSAL CONFIRMATION ENTRY BACKTEST ===", flush=True
-)
+print("=== V126.0: FIXED REVERSAL CONFIRMATION ENGINE ===", flush=True)
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
@@ -36,8 +34,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("Confirmation_Entry_Summary")
-ws_trades = get_or_create_sheet("Confirmation_Entry_Trades")
+ws_summary = get_or_create_sheet("Reversal_Fixed_Summary")
+ws_trades = get_or_create_sheet("Reversal_Fixed_Trades")
 
 
 def get_watchlist_stocks():
@@ -69,7 +67,7 @@ def backtest_single_stock(df, stock_symbol):
     trades = []
     total_rows = len(df)
 
-    if total_rows < 100:
+    if total_rows < 120:
         return trades
 
     i = 60
@@ -86,7 +84,7 @@ def backtest_single_stock(df, stock_symbol):
         mother_high = df.iloc[mother_idx]["High"]
         mother_vol = df.iloc[mother_idx]["Volume"]
 
-        # 2. Swing Low Identification (Up to current index i)
+        # 2. Swing Low Identification
         post_mother_zone = df.iloc[mother_idx:i]
         swing_low_idx_loc = post_mother_zone["Low"].idxmin()
         swing_low_idx = df.index.get_loc(swing_low_idx_loc)
@@ -104,28 +102,25 @@ def backtest_single_stock(df, stock_symbol):
             i += 1
             continue
 
-        # 🎯 4. UPSIDE REVERSAL CONFIRMATION TRIGGER
-        # Swing Low banne ke baad candidate candle (i) par bounce dekho
+        # 🎯 4. CONFIRMATION ENTRY (Price near Mother High Range + Reversal)
         curr_close = df.iloc[i]["Close"]
         curr_open = df.iloc[i]["Open"]
-        prev_high = df.iloc[i - 1]["High"]
+        prev_close = df.iloc[i - 1]["Close"]
 
-        # Condition: Green Candle + Breaks Previous Day High (Upside Move Initiated)
-        is_green_candle = curr_close > curr_open
-        is_breaking_prev_high = curr_close > prev_high
-        is_after_swing_low = i > swing_low_idx
-
-        is_reversal_confirmation = (
-            is_green_candle and is_breaking_prev_high and is_after_swing_low
+        # Reversal Confirmation: Swing low ke baad close Mother High ke pass (Breakout Zone) hona chahiye
+        is_breakout_zone = curr_close >= (0.95 * mother_high)
+        is_green_reversal = (curr_close > curr_open) and (
+            curr_close > prev_close
         )
+        is_valid_timing = i > swing_low_idx
 
-        if is_reversal_confirmation:
+        if is_breakout_zone and is_green_reversal and is_valid_timing:
             entry_price = round(curr_close, 2)
             stop_loss = round(swing_low_price, 2)
             risk_pct = (entry_price - stop_loss) / entry_price
 
-            # Valid Risk Sanity (Risk 1% to 12% Max)
-            if risk_pct > 0.12 or risk_pct <= 0.01:
+            # Risk Safety Check
+            if risk_pct > 0.15 or risk_pct <= 0.01:
                 i += 1
                 continue
 
@@ -166,7 +161,7 @@ def backtest_single_stock(df, stock_symbol):
                     else round(-risk_pct * 100, 2),
                     "Risk_Pct": round(risk_pct * 100, 2),
                 })
-                i = j
+                i = j  # Fast forward to exit date
             else:
                 i += 1
         else:
@@ -203,7 +198,7 @@ for stock in stocks:
             stock, start=START_DATE, end=END_DATE, progress=False
         )
         stock_df = flatten_yf_columns(stock_df)
-        if not stock_df.empty and len(stock_df) >= 100:
+        if not stock_df.empty and len(stock_df) >= 120:
             all_trades.extend(backtest_single_stock(stock_df, symbol_clean))
     except Exception:
         pass
@@ -216,7 +211,7 @@ if all_trades:
     win_rate = round((wins / total_trades) * 100, 2)
 
     print("\n===========================================================")
-    print("      🎯 SWING LOW REVERSAL ENTRY BACKTEST RESULTS         ")
+    print("      🎯 FIXED REVERSAL CONFIRMATION RESULTS               ")
     print("===========================================================")
     print(f"Total Quality Trades : {total_trades}")
     print(f"Wins (10%+ Target)   : {wins} ({win_rate}%)")
@@ -228,4 +223,3 @@ if all_trades:
         [{"Total_Trades": total_trades, "Win_Rate_Pct": f"{win_rate}%"}],
     )
     upload_to_sheet(ws_trades, all_trades)
-    
