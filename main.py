@@ -1,8 +1,8 @@
-import warnings
-from datetime import datetime, timedelta
 import json
 import os
 import time
+import warnings
+from datetime import datetime, timedelta
 import gspread
 import numpy as np
 import pandas as pd
@@ -11,18 +11,15 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 print(
-    "=== V118.0: HIGH PROBABILITY BACKTEST ENGINE (TARGET 80%+ WIN RATE) ===",
+    "=== V120.0: MOTHER CANDLE + VOL TRENDLINE + SUPPORT ZONE REVERSAL"
+    " BACKTEST ===",
     flush=True,
 )
 print(f"Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
-# ===== CONFIGURATION =====
 BACKTEST_YEARS = 2
-TARGET_PCT = 0.10  # 10% Minimum Target
-MAX_RISK_PCT = 0.08  # 🎯 Rule: Risk <= 8% (Strict SL Range)
-MIN_VOL_MULTIPLIER = (
-    2.0  # 🎯 Rule: Breakout Volume must be 2.0x of 20-Day Avg Vol
-)
+TARGET_PCT = 0.10  # 10% Target
+ZONE_TOLERANCE = 0.02  # 2% Tolerance for Support Level Test
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=BACKTEST_YEARS * 365)
@@ -41,8 +38,8 @@ def get_or_create_sheet(title):
 
 
 ws_watchlist = sh.worksheet("Watchlist")
-ws_summary = get_or_create_sheet("High_Prob_80_Summary")
-ws_trades = get_or_create_sheet("High_Prob_80_Trades")
+ws_summary = get_or_create_sheet("Support_Zone_Summary")
+ws_trades = get_or_create_sheet("Support_Zone_Trades")
 
 
 def get_watchlist_stocks():
@@ -52,11 +49,10 @@ def get_watchlist_stocks():
         for s in stocks
         if s.strip() and s.strip().upper() not in ["STOCK", "SYMBOL", "NAME"]
     ]
-    stocks = [
+    return [
         s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s
         for s in stocks
     ]
-    return stocks
 
 
 def flatten_yf_columns(df):
@@ -65,29 +61,22 @@ def flatten_yf_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [str(col).strip().capitalize() for col in df.columns]
-    if "Close" not in df.columns:
-        if "Adj close" in df.columns:
-            df["Close"] = df["Adj close"]
-        elif "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
+    if "Close" not in df.columns and "Adj close" in df.columns:
+        df["Close"] = df["Adj close"]
     df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
     return df
 
 
-# ===== 🎯 HIGH PROBABILITY BACKTEST ENGINE 🎯 =====
 def backtest_single_stock(df, stock_symbol):
     trades = []
     total_rows = len(df)
 
-    if total_rows < 100:
+    if total_rows < 120:
         return trades
 
-    # Add 20-Day Average Volume
-    df["Avg_Vol_20"] = df["Volume"].rolling(window=20).mean()
-
-    i = 60
+    i = 100
     while i < total_rows - 5:
-        # 1. Mother Candle (Peak High)
+        # 1. Mother Candle (Pichhle 60 days ka High)
         lookback_window = df.iloc[i - 60 : i]
         mother_idx_loc = lookback_window["High"].idxmax()
         mother_idx = df.index.get_loc(mother_idx_loc)
@@ -98,64 +87,63 @@ def backtest_single_stock(df, stock_symbol):
 
         mother_high = df.iloc[mother_idx]["High"]
 
-        # 2. Swing Low
+        # 2. Swing Low (Mother Candle ke baad ka sabse lower price)
         post_mother_zone = df.iloc[mother_idx:i]
         swing_low_idx_loc = post_mother_zone["Low"].idxmin()
         swing_low_idx = df.index.get_loc(swing_low_idx_loc)
         swing_low_price = df.iloc[swing_low_idx]["Low"]
 
-        # Filter: Exclude Tweezer Bottom Trap
-        if swing_low_idx + 1 < len(df):
-            c0_l = df.iloc[swing_low_idx]["Low"]
-            c1_l = df.iloc[swing_low_idx + 1]["Low"]
-            if (abs(c0_l - c1_l) / c0_l <= 0.003) and (
-                df.iloc[swing_low_idx + 1]["Close"]
-                > df.iloc[swing_low_idx + 1]["Open"]
-            ):
-                i += 1
-                continue
+        # 🎯 3. PREVIOUS SUPPORT ZONE CHECK (Prev Swing High or Prev Swing Low)
+        # Mother Candle se pehle ke 60 days me Key Levels dhundho
+        history_window = df.iloc[
+            max(0, mother_idx - 60) : max(1, mother_idx - 5)
+        ]
 
-        # 3. Volume Trendline Check
+        if len(history_window) < 10:
+            i += 1
+            continue
+
+        prev_swing_high = history_window["High"].max()
+        prev_swing_low = history_window["Low"].min()
+
+        # Check agar Current Swing Low kisi Support Level (Prev High / Low) ke pass hai
+        near_prev_high = (
+            abs(swing_low_price - prev_swing_high) / prev_swing_high
+        ) <= ZONE_TOLERANCE
+        near_prev_low = (
+            abs(swing_low_price - prev_swing_low) / prev_swing_low
+        ) <= ZONE_TOLERANCE
+
+        is_at_support_zone = near_prev_high or near_prev_low
+
+        if not is_at_support_zone:
+            i += 1
+            continue
+
+        # 4. Volume Trendline Check (Mother High se Swing Low tak)
         vol_phase = df.iloc[mother_idx : swing_low_idx + 1]["Volume"]
         if len(vol_phase) >= 3:
-            x = np.arange(len(vol_phase))
-            slope, _ = np.polyfit(x, vol_phase.values, 1)
+            slope, _ = np.polyfit(np.arange(len(vol_phase)), vol_phase.values, 1)
             is_vol_decreasing = slope < 0
         else:
             is_vol_decreasing = False
 
-        # Breakout Candle Metrics
+        if not is_vol_decreasing:
+            i += 1
+            continue
+
+        # 5. Mother Candle Breakout Trigger
         curr_close = df.iloc[i]["Close"]
-        curr_open = df.iloc[i]["Open"]
-        curr_high = df.iloc[i]["High"]
-        curr_low = df.iloc[i]["Low"]
-        curr_vol = df.iloc[i]["Volume"]
-        avg_vol_20 = df.iloc[i]["Avg_Vol_20"]
         prev_close = df.iloc[i - 1]["Close"]
 
-        # Breakout Conditions
         is_breakout = (curr_close > mother_high) and (prev_close <= mother_high)
 
-        if is_breakout and is_vol_decreasing:
+        if is_breakout:
             entry_price = round(mother_high, 2)
             stop_loss = round(swing_low_price, 2)
             risk_pct = (entry_price - stop_loss) / entry_price
 
-            # 🎯 STRICT 80%+ WIN RATE FILTERS 🎯
-            # Filter A: Risk <= 8%
-            if risk_pct > MAX_RISK_PCT or risk_pct <= 0.015:
-                i += 1
-                continue
-
-            # Filter B: Volume Spike >= 2.0x Average Volume
-            if pd.isna(avg_vol_20) or (curr_vol < MIN_VOL_MULTIPLIER * avg_vol_20):
-                i += 1
-                continue
-
-            # Filter C: Strong Green Body (Close in top 25% of candle range)
-            c_range = max(0.001, curr_high - curr_low)
-            close_position = (curr_close - curr_low) / c_range
-            if close_position < 0.75 or curr_close <= curr_open:
+            if risk_pct > 0.18 or risk_pct <= 0.01:
                 i += 1
                 continue
 
@@ -182,11 +170,6 @@ def backtest_single_stock(df, stock_symbol):
                     break
 
             if trade_result:
-                pnl = (
-                    10.0
-                    if trade_result == "WIN"
-                    else round(-risk_pct * 100, 2)
-                )
                 trades.append({
                     "Stock": stock_symbol,
                     "Entry_Date": entry_date,
@@ -196,9 +179,10 @@ def backtest_single_stock(df, stock_symbol):
                     "Exit_Date": exit_date,
                     "Exit_Price": exit_price,
                     "Result": trade_result,
-                    "PnL_Pct": pnl,
+                    "PnL_Pct": 10.0
+                    if trade_result == "WIN"
+                    else round(-risk_pct * 100, 2),
                     "Risk_Pct": round(risk_pct * 100, 2),
-                    "Vol_Spike_x": round(curr_vol / avg_vol_20, 2),
                 })
                 i = j
             else:
@@ -209,74 +193,57 @@ def backtest_single_stock(df, stock_symbol):
     return trades
 
 
-def upload_to_sheet(ws, data_list, default_msg="No Data"):
+def upload_to_sheet(ws, data_list):
     try:
         ws.batch_clear(["A:Z"])
         time.sleep(1)
         if data_list:
             df = pd.DataFrame(data_list)
             df_json = json.loads(df.to_json(orient="split"))
-            values = [df_json["columns"]] + df_json["data"]
-            ws.update(values=values, range_name="A1")
-        else:
-            ws.update(values=[[default_msg]], range_name="A1")
+            ws.update(
+                values=[df_json["columns"]] + df_json["data"], range_name="A1"
+            )
     except Exception as e:
         print(f"Sheet Error: {str(e)}", flush=True)
 
 
-# ===== MAIN EXECUTION =====
+# MAIN EXECUTION
 stocks = get_watchlist_stocks()
 all_trades = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
-print(
-    f"\n=== BACKTESTING {len(stocks)} STOCKS WITH HIGH-PROBABILITY FILTERS ===",
-    flush=True,
-)
-
 for stock in stocks:
     try:
         symbol_clean = stock.replace(".NS", "")
-        if any(keyword in symbol_clean for keyword in REJECT_KEYWORDS):
+        if any(k in symbol_clean for k in REJECT_KEYWORDS):
             continue
-
         stock_df = yf.download(
             stock, start=START_DATE, end=END_DATE, progress=False
         )
         stock_df = flatten_yf_columns(stock_df)
-
-        if stock_df.empty or len(stock_df) < 60:
-            continue
-
-        stock_trades = backtest_single_stock(stock_df, symbol_clean)
-        all_trades.extend(stock_trades)
-        time.sleep(0.05)
-    except Exception as e:
+        if not stock_df.empty and len(stock_df) >= 120:
+            all_trades.extend(backtest_single_stock(stock_df, symbol_clean))
+    except Exception:
         pass
 
 if all_trades:
     trades_df = pd.DataFrame(all_trades)
-
     total_trades = len(trades_df)
     wins = len(trades_df[trades_df["Result"] == "WIN"])
     losses = len(trades_df[trades_df["Result"] == "LOSS"])
     win_rate = round((wins / total_trades) * 100, 2)
 
-    summary_metrics = [{
-        "Total_High_Prob_Trades": total_trades,
-        "10% Target Hits (Wins)": wins,
-        "SL Hits (Losses)": losses,
-        "Win_Rate_Pct": f"{win_rate}%",
-    }]
-
     print("\n===========================================================")
-    print("      🎯 HIGH PROBABILITY BACKTEST RESULTS (TARGET 80%+)    ")
+    print("      🎯 SUPPORT ZONE REVERSAL BACKTEST RESULTS             ")
     print("===========================================================")
     print(f"Total Quality Trades : {total_trades}")
-    print(f"10%+ Target Hits     : {wins} ({win_rate}%)")
-    print(f"Stop Loss Hits       : {losses} ({round(100-win_rate, 2)}%)")
+    print(f"Wins (10%+ Target)   : {wins} ({win_rate}%)")
+    print(f"Losses (SL Hit)      : {losses} ({round(100-win_rate, 2)}%)")
     print("===========================================================\n")
 
-    upload_to_sheet(ws_summary, summary_metrics)
+    upload_to_sheet(
+        ws_summary,
+        [{"Total_Trades": total_trades, "Win_Rate_Pct": f"{win_rate}%"}],
+    )
     upload_to_sheet(ws_trades, all_trades)
     
