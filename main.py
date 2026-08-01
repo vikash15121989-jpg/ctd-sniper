@@ -9,7 +9,9 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: DUAL SCANNER WITH 5% BREAKOUT BUFFER ===", flush=True)
+print(
+    "=== CTD SNIPER: HIGH PROBABILITY QUALITY BREAKOUT SCANNER ===", flush=True
+)
 print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
@@ -98,6 +100,9 @@ def scan_dual_status(df, stock_symbol):
     if not is_vol_dry_up:
         return None, None
 
+    curr_open = df.iloc[i]["Open"]
+    curr_high = df.iloc[i]["High"]
+    curr_low = df.iloc[i]["Low"]
     curr_close = df.iloc[i]["Close"]
     curr_vol = df.iloc[i]["Volume"]
 
@@ -107,8 +112,20 @@ def scan_dual_status(df, stock_symbol):
         round(curr_vol / avg_20_vol, 2) if avg_20_vol > 0 else 1.0
     )
 
-    # 🛑 UPDATED CONDITION: Allows stocks up to 5.0% ABOVE Mother High (Extended Breakout Buffer)
-    upper_threshold = mother_high * 1.05
+    # 🛑 QUALITY FILTER 1: Reject Upper Rejection Wicks (Trap Candles)
+    # Day High se Close kitna gira (Wick Rejection %)
+    wick_rejection_pct = (
+        ((curr_high - curr_close) / curr_high) * 100 if curr_high > 0 else 100
+    )
+
+    # Candle Position: Close must be in upper 65% of the total Day Range
+    day_range = curr_high - curr_low
+    close_location_in_range = (
+        ((curr_close - curr_low) / day_range) if day_range > 0 else 0
+    )
+
+    # 🛑 QUALITY FILTER 2: Allow stocks within 3.5% buffer of Mother High
+    upper_threshold = mother_high * 1.035
 
     if curr_close <= upper_threshold:
         entry_price = round(mother_high, 2)
@@ -119,13 +136,23 @@ def scan_dual_status(df, stock_symbol):
         if risk_pct > 0.18 or risk_pct <= 0.01:
             return None, None
 
-        # Distance calculation (% difference from High)
-        # Negative value means stock is up to 5% above Mother High
         distance_from_high_pct = round(
             ((mother_high - curr_close) / mother_high) * 100, 2
         )
 
         tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "📈 View Chart")'
+
+        # 🔥 STRICT HIGH PROBABILITY CHECK:
+        # 1. Rejection Wick <= 2.2% (Upper Shadow choti honi chahiye)
+        # 2. Close range >= 0.65 (Strong Body Close)
+        # 3. Green Candle (Close > Open)
+        # 4. Solid Volume Spike (>= 1.3x)
+        is_high_quality = (
+            (wick_rejection_pct <= 2.2)
+            and (close_location_in_range >= 0.65)
+            and (curr_close >= curr_open)
+            and (vol_spike_ratio >= 1.3)
+        )
 
         base_info = {
             "Stock": stock_symbol,
@@ -136,10 +163,11 @@ def scan_dual_status(df, stock_symbol):
             "Distance_Pct": distance_from_high_pct,
             "Risk_Pct": round(risk_pct * 100, 2),
             "Vol_Spike_Ratio": vol_spike_ratio,
+            "Is_High_Quality": is_high_quality,
             "Chart": tv_link,
         }
 
-        # Ready for Tomorrow Condition (-5.0% to 2.5% distance)
+        # Ready for Tomorrow Condition (-3.5% to 2.5% distance)
         if distance_from_high_pct <= 2.5:
             return base_info, base_info
         else:
@@ -155,19 +183,30 @@ def upload_ranked_ready_sheet(ws, data_list):
         if data_list:
             df = pd.DataFrame(data_list)
 
-            # High Probability Sorting
-            df["Score"] = df["Vol_Spike_Ratio"] / (
-                abs(df["Distance_Pct"]) + 0.1
+            # High Quality Stocks Get Priority Filtering
+            # Score formula penalizes large wicks & rewards high volume + tight close
+            df["Score"] = (
+                df["Vol_Spike_Ratio"]
+                * df["Is_High_Quality"].astype(int)
+                / (abs(df["Distance_Pct"]) + 0.1)
             )
+
             df = df.sort_values(by="Score", ascending=False).reset_index(
                 drop=True
             )
 
+            # High Probability Tag: ONLY assigned if 'Is_High_Quality' is True
+            tags = []
+            high_prob_count = 0
+            for _, row in df.iterrows():
+                if row["Is_High_Quality"] and high_prob_count < 5:
+                    high_prob_count += 1
+                    tags.append(f"🔥 HIGH PROBABILITY #{high_prob_count}")
+                else:
+                    tags.append("WATCHLIST")
+
+            df["High_Probability_Tag"] = tags
             df["Vol_Spike"] = df["Vol_Spike_Ratio"]
-            df["High_Probability_Tag"] = [
-                f"🔥 HIGH PROBABILITY #{i+1}" if i < 5 else "WATCHLIST"
-                for i in range(len(df))
-            ]
 
             ordered_cols = [
                 "Stock",
@@ -190,7 +229,7 @@ def upload_ranked_ready_sheet(ws, data_list):
                 value_input_option="USER_ENTERED",
             )
             print(
-                f"✅ Uploaded {len(data_list)} stocks with 5% Buffer & Chart Links!",
+                f"✅ Uploaded {len(data_list)} stocks with Quality Wick Filter!",
                 flush=True,
             )
         else:
@@ -208,8 +247,13 @@ def upload_to_sheet(ws, data_list, sheet_name):
         if data_list:
             df = pd.DataFrame(data_list)
 
-            if "Vol_Spike_Ratio" in df.columns:
-                df.drop(columns=["Vol_Spike_Ratio"], inplace=True)
+            cols_to_drop = [
+                col
+                for col in ["Vol_Spike_Ratio", "Is_High_Quality"]
+                if col in df.columns
+            ]
+            if cols_to_drop:
+                df.drop(columns=cols_to_drop, inplace=True)
 
             ordered_cols = [
                 "Stock",
@@ -294,7 +338,7 @@ ready_tomorrow_list = []
 REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
 print(
-    f"Scanning {len(stocks)} stocks for 5% Buffer Breakout Signals...\n",
+    f"Scanning {len(stocks)} stocks with Strict Quality Filtering...\n",
     flush=True,
 )
 
