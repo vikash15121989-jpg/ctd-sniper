@@ -9,13 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print(
-    "=== CTD SNIPER: HIGH PROBABILITY QUALITY BREAKOUT SCANNER ===", flush=True
-)
+print("=== CTD SNIPER: FULL SCANNER SYSTEM ===", flush=True)
 print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
-TARGET_PCT = 0.10  # 10% Profit Target
+TARGET_PCT = 0.10  # 10% Target
 LOOKBACK_DAYS = 180
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
@@ -70,7 +68,7 @@ def scan_dual_status(df, stock_symbol):
     if total_rows < 70:
         return None, None
 
-    i = total_rows - 1  # Latest candle
+    i = total_rows - 1
 
     # 1. Mother Candle Identification
     lookback_window = df.iloc[i - 60 : i]
@@ -106,26 +104,30 @@ def scan_dual_status(df, stock_symbol):
     curr_close = df.iloc[i]["Close"]
     curr_vol = df.iloc[i]["Volume"]
 
-    # 20-Day Average Volume for Spike check
+    # 20-Day Average Volume
     avg_20_vol = df.iloc[i - 20 : i]["Volume"].mean()
     vol_spike_ratio = (
         round(curr_vol / avg_20_vol, 2) if avg_20_vol > 0 else 1.0
     )
 
-    # 🛑 QUALITY FILTER 1: Reject Upper Rejection Wicks (Trap Candles)
-    # Day High se Close kitna gira (Wick Rejection %)
+    # 5-Day Momentum %
+    close_5days_ago = df.iloc[i - 5]["Close"]
+    momentum_5d = (
+        ((curr_close - close_5days_ago) / close_5days_ago) * 100
+        if close_5days_ago > 0
+        else 0
+    )
+
+    # Candle Quality Filters
     wick_rejection_pct = (
         ((curr_high - curr_close) / curr_high) * 100 if curr_high > 0 else 100
     )
-
-    # Candle Position: Close must be in upper 65% of the total Day Range
     day_range = curr_high - curr_low
-    close_location_in_range = (
+    close_location = (
         ((curr_close - curr_low) / day_range) if day_range > 0 else 0
     )
 
-    # 🛑 QUALITY FILTER 2: Allow stocks within 3.5% buffer of Mother High
-    upper_threshold = mother_high * 1.035
+    upper_threshold = mother_high * 1.05
 
     if curr_close <= upper_threshold:
         entry_price = round(mother_high, 2)
@@ -142,14 +144,9 @@ def scan_dual_status(df, stock_symbol):
 
         tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "📈 View Chart")'
 
-        # 🔥 STRICT HIGH PROBABILITY CHECK:
-        # 1. Rejection Wick <= 2.2% (Upper Shadow choti honi chahiye)
-        # 2. Close range >= 0.65 (Strong Body Close)
-        # 3. Green Candle (Close > Open)
-        # 4. Solid Volume Spike (>= 1.3x)
         is_high_quality = (
             (wick_rejection_pct <= 2.2)
-            and (close_location_in_range >= 0.65)
+            and (close_location >= 0.65)
             and (curr_close >= curr_open)
             and (vol_spike_ratio >= 1.3)
         )
@@ -163,12 +160,13 @@ def scan_dual_status(df, stock_symbol):
             "Distance_Pct": distance_from_high_pct,
             "Risk_Pct": round(risk_pct * 100, 2),
             "Vol_Spike_Ratio": vol_spike_ratio,
+            "Momentum_5D": round(momentum_5d, 2),
             "Is_High_Quality": is_high_quality,
             "Chart": tv_link,
         }
 
-        # Ready for Tomorrow Condition (-3.5% to 2.5% distance)
-        if distance_from_high_pct <= 2.5:
+        # 5% Distance Cutoff for Ready_For_Tomorrow
+        if distance_from_high_pct <= 5.0:
             return base_info, base_info
         else:
             return base_info, None
@@ -183,19 +181,17 @@ def upload_ranked_ready_sheet(ws, data_list):
         if data_list:
             df = pd.DataFrame(data_list)
 
-            # High Quality Stocks Get Priority Filtering
-            # Score formula penalizes large wicks & rewards high volume + tight close
+            df["Capped_Vol_Spike"] = df["Vol_Spike_Ratio"].clip(upper=5.0)
             df["Score"] = (
-                df["Vol_Spike_Ratio"]
+                df["Capped_Vol_Spike"]
+                * (df["Momentum_5D"].clip(lower=0.1))
                 * df["Is_High_Quality"].astype(int)
-                / (abs(df["Distance_Pct"]) + 0.1)
             )
 
             df = df.sort_values(by="Score", ascending=False).reset_index(
                 drop=True
             )
 
-            # High Probability Tag: ONLY assigned if 'Is_High_Quality' is True
             tags = []
             high_prob_count = 0
             for _, row in df.iterrows():
@@ -229,7 +225,7 @@ def upload_ranked_ready_sheet(ws, data_list):
                 value_input_option="USER_ENTERED",
             )
             print(
-                f"✅ Uploaded {len(data_list)} stocks with Quality Wick Filter!",
+                f"✅ Uploaded {len(data_list)} stocks to [Ready_For_Tomorrow]!",
                 flush=True,
             )
         else:
@@ -249,7 +245,11 @@ def upload_to_sheet(ws, data_list, sheet_name):
 
             cols_to_drop = [
                 col
-                for col in ["Vol_Spike_Ratio", "Is_High_Quality"]
+                for col in [
+                    "Vol_Spike_Ratio",
+                    "Is_High_Quality",
+                    "Momentum_5D",
+                ]
                 if col in df.columns
             ]
             if cols_to_drop:
@@ -286,7 +286,6 @@ def upload_to_sheet(ws, data_list, sheet_name):
 
 
 def setup_position_sizing_tab(ws):
-    """Configures Position Calculator with Case-Insensitive Lookup (UPPER + TRIM)"""
     try:
         ws.clear()
         time.sleep(1)
@@ -323,10 +322,7 @@ def setup_position_sizing_tab(ws):
         ws.update(
             values=layout, range_name="A1", value_input_option="USER_ENTERED"
         )
-        print(
-            "✅ Position Sizing Tab refreshed with Uppercase support!",
-            flush=True,
-        )
+        print("✅ Position Sizing Tab refreshed!", flush=True)
     except Exception as e:
         print(f"Sheet Error [Position_Sizing]: {str(e)}", flush=True)
 
@@ -335,12 +331,25 @@ def setup_position_sizing_tab(ws):
 stocks = get_watchlist_stocks()
 mother_watchlist = []
 ready_tomorrow_list = []
-REJECT_KEYWORDS = ["LIQUID", "ETF", "CPSE", "NETF", "GILT", "GOLD", "SILVER"]
 
-print(
-    f"Scanning {len(stocks)} stocks with Strict Quality Filtering...\n",
-    flush=True,
-)
+# Exclude Non-Stock Keywords
+REJECT_KEYWORDS = [
+    "LIQUID",
+    "ETF",
+    "CPSE",
+    "NETF",
+    "GILT",
+    "GOLD",
+    "SILVER",
+    "BEES",
+    "NEXT50",
+    "BETA",
+    "INDEX",
+    "IADD",
+    "CASE",
+    "MOQUALITY",
+    "MOLOWVOL",
+]
 
 for stock in stocks:
     try:
@@ -362,7 +371,7 @@ for stock in stocks:
     except Exception:
         pass
 
-# Upload Sheets & Setup Sizing Calculator Tab
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
 upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
 setup_position_sizing_tab(ws_pos_sizing)
+    
