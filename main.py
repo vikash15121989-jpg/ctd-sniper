@@ -16,6 +16,10 @@ print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 TARGET_PCT = 0.10  # 10% Target
 LOOKBACK_DAYS = 180
 
+# Volume / Turnover Thresholds
+MIN_VOLUME = 5_000_000       # 50 Lakh
+MIN_TURNOVER = 20_000_000    # 2 Crore (₹ 2,00,00,000)
+
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=LOOKBACK_DAYS)
 
@@ -70,6 +74,16 @@ def scan_dual_status(df, stock_symbol):
 
     i = total_rows - 1
 
+    curr_close = df.iloc[i]["Close"]
+    curr_vol = df.iloc[i]["Volume"]
+
+    # ----------------------------------------------------
+    # NEW FILTER: Volume (50 Lakh) OR Turnover (2 Crore)
+    # ----------------------------------------------------
+    curr_turnover = curr_vol * curr_close
+    if curr_vol < MIN_VOLUME and curr_turnover < MIN_TURNOVER:
+        return None, None
+
     # 1. Mother Candle Identification
     lookback_window = df.iloc[i - 60 : i]
     mother_idx_loc = lookback_window["High"].idxmax()
@@ -101,8 +115,6 @@ def scan_dual_status(df, stock_symbol):
     curr_open = df.iloc[i]["Open"]
     curr_high = df.iloc[i]["High"]
     curr_low = df.iloc[i]["Low"]
-    curr_close = df.iloc[i]["Close"]
-    curr_vol = df.iloc[i]["Volume"]
 
     # 20-Day Average Volume
     avg_20_vol = df.iloc[i - 20 : i]["Volume"].mean()
@@ -290,6 +302,9 @@ def setup_position_sizing_tab(ws):
         ws.clear()
         time.sleep(1)
 
+        # ---------------------------------------------------------------------
+        # UPDATED: XLOOKUP now points to 'Mother_Candle_Watchlist' instead of 'Ready_For_Tomorrow'
+        # ---------------------------------------------------------------------
         layout = [
             [100000, "⬅️ Enter Your Total Capital (A1)"],
             ["TCS", "⬅️ Enter Stock Symbol (A2)"],
@@ -298,11 +313,11 @@ def setup_position_sizing_tab(ws):
             ["Max Allowed Risk (2% of Capital)", "=A1*0.02"],
             [
                 "Entry Price (₹)",
-                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Ready_For_Tomorrow!A:A, Ready_For_Tomorrow!B:B), "Stock Not Found")',
+                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Mother_Candle_Watchlist!A:A, Mother_Candle_Watchlist!B:B), "Stock Not Found")',
             ],
             [
                 "Stop Loss (₹)",
-                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Ready_For_Tomorrow!A:A, Ready_For_Tomorrow!C:C), "Stock Not Found")',
+                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Mother_Candle_Watchlist!A:A, Mother_Candle_Watchlist!C:C), "Stock Not Found")',
             ],
             ["Risk Per Share (₹)", '=IF(ISNUMBER(B6), B6-B7, "-")'],
             [
@@ -374,4 +389,3 @@ for stock in stocks:
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
 upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
 setup_position_sizing_tab(ws_pos_sizing)
-    
