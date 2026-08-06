@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: FULL SCANNER SYSTEM ===", flush=True)
+print("=== CTD SNIPER: MULTI-RESISTANCE SCANNER SYSTEM ===", flush=True)
 print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 # ===== CONFIGURATION =====
@@ -65,6 +65,22 @@ def flatten_yf_columns(df):
         df["Close"] = df["Adj close"]
     df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
     return df
+
+
+def find_swing_high_resistances(df, window=5):
+    """
+    Chart ke saare major Resistance / Swing Highs points dhoondhta hai.
+    """
+    highs = df["High"].values
+    resistance_levels = []
+
+    for idx in range(window, len(highs) - window):
+        current_high = highs[idx]
+        # Agar ye candle apne pichhle aur agle 'window' candles se badi hai, to ye ek Swing High / Resistance hai
+        if all(current_high > highs[idx - window : idx]) and all(current_high > highs[idx + 1 : idx + window + 1]):
+            resistance_levels.append(current_high)
+
+    return resistance_levels
 
 
 def scan_dual_status(df, stock_symbol):
@@ -177,25 +193,38 @@ def scan_dual_status(df, stock_symbol):
             "Chart": tv_link,
         }
 
-        # ----------------------------------------------------
-        # NEW FILTER: LONG-TERM RESISTANCE CHECK (>= 10% Clearance)
-        # ----------------------------------------------------
-        # Lookback Period (180 days) me Mother High se alawa koi bada resistance na ho
-        # Mother candle se pehle ki history track karte hain:
-        pre_mother_history = df.iloc[:mother_idx]
+        # ------------------------------------------------------------------
+        # MULTI-RESISTANCE SCANNER: Finding Nearest Resistance Level
+        # ------------------------------------------------------------------
+        # 1. Chart ke saare Swing Highs extract karo
+        all_resistances = find_swing_high_resistances(df, window=5)
         
-        has_clear_runway = True
-        if not pre_mother_history.empty:
-            major_resistance = pre_mother_history["High"].max()
-            # Agar purana resistance mother high se bada hai, to check karein ki price level kam se kam 10% dur ho
-            if major_resistance > mother_high:
-                upside_room_pct = ((major_resistance - curr_close) / curr_close) * 100
-                if upside_room_pct < 10.0:
-                    has_clear_runway = False
+        # 2. Daily Highs ka Absolute Peak bhi include kar lo
+        all_resistances.append(df["High"].max())
 
-        # Condition 1: Distance Mother High se 5% ke under ho
-        # Condition 2: Agla major resistance price se minimum 10% dur ho
-        if distance_from_high_pct <= 5.0 and has_clear_runway:
+        # 3. Filter resistances strictly above current close & Mother High
+        # Mother High ko ignore karo kyunki hum usi ke breakout ka wait kar rahe hain
+        overhead_resistances = [
+            r for r in all_resistances 
+            if r > curr_close and abs(r - mother_high) > (mother_high * 0.01)
+        ]
+
+        has_10pct_runway = True
+        if overhead_resistances:
+            # Sabse paas wala Resistance Level
+            nearest_resistance = min(overhead_resistances)
+            
+            # Distance from Current Close to Nearest Resistance
+            dist_to_nearest_res_pct = ((nearest_resistance - curr_close) / curr_close) * 100
+            
+            # Agar Nearest Resistance 10% se kam duri par hai, to reject ho jayega
+            if dist_to_nearest_res_pct < 10.0:
+                has_10pct_runway = False
+
+        # Ready_For_Tomorrow Conditions:
+        # 1. Price is within 5% of Mother High Breakout
+        # 2. Nearest Resistance is AT LEAST 10% AWAY
+        if distance_from_high_pct <= 5.0 and has_10pct_runway:
             return base_info, base_info
         else:
             return base_info, None
@@ -403,4 +432,3 @@ for stock in stocks:
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
 upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
 setup_position_sizing_tab(ws_pos_sizing)
-        
