@@ -78,13 +78,13 @@ def scan_dual_status(df, stock_symbol):
     curr_vol = df.iloc[i]["Volume"]
 
     # ----------------------------------------------------
-    # NEW FILTER: Volume (50 Lakh) OR Turnover (2 Crore)
+    # Volume (50 Lakh) OR Turnover (2 Crore) Filter
     # ----------------------------------------------------
     curr_turnover = curr_vol * curr_close
     if curr_vol < MIN_VOLUME and curr_turnover < MIN_TURNOVER:
         return None, None
 
-    # 1. Mother Candle Identification
+    # 1. Mother Candle Identification (Last 60 Days)
     lookback_window = df.iloc[i - 60 : i]
     mother_idx_loc = lookback_window["High"].idxmax()
     mother_idx = df.index.get_loc(mother_idx_loc)
@@ -177,8 +177,25 @@ def scan_dual_status(df, stock_symbol):
             "Chart": tv_link,
         }
 
-        # 5% Distance Cutoff for Ready_For_Tomorrow
-        if distance_from_high_pct <= 5.0:
+        # ----------------------------------------------------
+        # NEW FILTER: LONG-TERM RESISTANCE CHECK (>= 10% Clearance)
+        # ----------------------------------------------------
+        # Lookback Period (180 days) me Mother High se alawa koi bada resistance na ho
+        # Mother candle se pehle ki history track karte hain:
+        pre_mother_history = df.iloc[:mother_idx]
+        
+        has_clear_runway = True
+        if not pre_mother_history.empty:
+            major_resistance = pre_mother_history["High"].max()
+            # Agar purana resistance mother high se bada hai, to check karein ki price level kam se kam 10% dur ho
+            if major_resistance > mother_high:
+                upside_room_pct = ((major_resistance - curr_close) / curr_close) * 100
+                if upside_room_pct < 10.0:
+                    has_clear_runway = False
+
+        # Condition 1: Distance Mother High se 5% ke under ho
+        # Condition 2: Agla major resistance price se minimum 10% dur ho
+        if distance_from_high_pct <= 5.0 and has_clear_runway:
             return base_info, base_info
         else:
             return base_info, None
@@ -302,9 +319,6 @@ def setup_position_sizing_tab(ws):
         ws.clear()
         time.sleep(1)
 
-        # ---------------------------------------------------------------------
-        # UPDATED: XLOOKUP now points to 'Mother_Candle_Watchlist' instead of 'Ready_For_Tomorrow'
-        # ---------------------------------------------------------------------
         layout = [
             [100000, "⬅️ Enter Your Total Capital (A1)"],
             ["TCS", "⬅️ Enter Stock Symbol (A2)"],
@@ -389,3 +403,4 @@ for stock in stocks:
 upload_to_sheet(ws_mother_list, mother_watchlist, "Mother_Candle_Watchlist")
 upload_ranked_ready_sheet(ws_ready_tomorrow, ready_tomorrow_list)
 setup_position_sizing_tab(ws_pos_sizing)
+        
