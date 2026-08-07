@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: EXACT PULLBACK SL & DYNAMIC POSITION SIZING ENGINE ===", flush=True)
+print("=== CTD SNIPER: VOLUME DRYNESS + EXACT PULLBACK SL + DYNAMIC POSITION SIZING ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 DEFAULT_CAPITAL = 100000.0         # Agar A1 khali ho toh fallback capital
@@ -196,7 +196,14 @@ for stock in stocks:
             prev_vol_avg = df.iloc[spike_idx - 1]["Vol_Avg20"]
             current_vol = row["Volume"]
 
-            if prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg):
+            # 1. VOLUME DRYNESS CHECK: Spike se pehle ke 5 din mein kam se kam 3 din Volume <= 70% of 20-Day Avg
+            prior_5_days_vol = df.iloc[spike_idx - 5 : spike_idx]["Volume"]
+            is_volume_dry = (prior_5_days_vol <= 0.70 * prev_vol_avg).sum() >= 3
+
+            # 2. VOLUME SURGE CHECK: Spike wale din Volume >= 2.5x of 20-Day Avg
+            is_volume_surge = prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg)
+
+            if is_volume_dry and is_volume_surge:
                 df_until_spike = df.iloc[: spike_idx + 1]
                 sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
 
@@ -297,7 +304,7 @@ if position_sizing_data:
     json_ps = json.loads(df_ps.to_json(orient="split"))
     
     ws_position_sizing.update(values=json_ps["data"], range_name="A4", value_input_option="USER_ENTERED")
-    print("✅ All Sheets Updated Successfully with Pullback Stop Loss!", flush=True)
+    print("✅ All Sheets Updated Successfully with Volume Dryness & Pullback SL!", flush=True)
 else:
     ws_position_sizing.batch_clear(["A4:Z500"])
     ws_position_sizing.update(values=[["No Active Candidates Found"]], range_name="A4")
