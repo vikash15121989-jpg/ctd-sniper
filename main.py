@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: UPDATED SCANNER WITH POSITION SIZING ===", flush=True)
+print("=== CTD SNIPER: UPDATED SCANNER WITH EXACT ENTRY PRICE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_GAP_PCT = 10.0  # Minimum 10% Gap to Resistance
@@ -76,62 +76,71 @@ def find_swing_points(df, window=5):
 # ===== STEP 1: MAX VOLUME & VOLUME DAY HIGH BELOW SWING HIGH =====
 def check_volume_and_spike_day_high(df):
     if len(df) < 30:
-        return False, None, None
+        return False, None, None, None
 
     last_10_df = df.iloc[-10:]
     prev_10_max_vol = df.iloc[-20:-10]["Volume"].max()
 
     swing_highs, _ = find_swing_points(df, window=5)
     if not swing_highs:
-        return False, None, None
+        return False, None, None, None
 
     latest_swing_high_price = swing_highs[-1][1]
 
     volume_spike_found = False
     spike_date = None
     spike_day_high = None
+    spike_idx = None
 
     for idx, row in last_10_df.iterrows():
         if prev_10_max_vol > 0 and row["Volume"] > prev_10_max_vol:
             volume_spike_found = True
             spike_date = idx.strftime("%Y-%m-%d")
             spike_day_high = row["High"]
+            spike_idx = df.index.get_loc(idx)
             break
 
     if not volume_spike_found:
-        return False, None, None
+        return False, None, None, None
 
+    # Volume Spike Candle High Price < Nearest Swing High
     if spike_day_high < latest_swing_high_price:
-        return True, spike_date, latest_swing_high_price
+        return True, spike_date, latest_swing_high_price, spike_idx
 
-    return False, None, None
+    return False, None, None, None
 
 
-# ===== STEP 2: RESISTANCE SPACE FILTER =====
-def check_ready_for_breakout(df, stock_symbol, spike_date):
+# ===== STEP 2: RESISTANCE SPACE & ENTRY PRICE FROM VOLUME DATE =====
+def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
     swing_highs, swing_lows = find_swing_points(df, window=5)
 
     if not swing_highs or not swing_lows:
         return None
 
-    recent_swing_high_price = swing_highs[-1][1]
-    recent_swing_low_price = swing_lows[-1][1]
+    # Volume Date ke paas/baad ka Nearest Swing High Entry hoga
+    valid_highs = [sh for sh in swing_highs if sh[0] >= spike_idx - 10]
+    if not valid_highs:
+        valid_highs = swing_highs
 
-    entry_price = round(recent_swing_high_price, 2)
-    stop_loss = round(recent_swing_low_price, 2)
+    entry_swing_high = valid_highs[-1][1]
+    recent_swing_low = swing_lows[-1][1]
+
+    entry_price = round(entry_swing_high, 2)
+    stop_loss = round(recent_swing_low, 2)
 
     if stop_loss >= entry_price:
         return None
 
+    # Check Overhead Resistance Gap
     all_highs = [sh[1] for sh in swing_highs]
-    larger_previous_highs = [p for p in all_highs[:-1] if p > recent_swing_high_price]
+    larger_previous_highs = [p for p in all_highs[:-1] if p > entry_swing_high]
 
     has_10pct_resistance_space = False
 
     if larger_previous_highs:
         nearest_larger_high = min(larger_previous_highs)
         gap_pct = (
-            (nearest_larger_high - recent_swing_high_price) / recent_swing_high_price
+            (nearest_larger_high - entry_swing_high) / entry_swing_high
         ) * 100
         if gap_pct >= MIN_GAP_PCT:
             has_10pct_resistance_space = True
@@ -145,7 +154,7 @@ def check_ready_for_breakout(df, stock_symbol, spike_date):
 
     return {
         "Date": spike_date,
-        "Stock": stock_symbol,  # Normal Text (Hyperlink removed)
+        "Stock": stock_symbol,  # Normal text
         "Entry_Price": entry_price,
         "Stoploss_Price": stop_loss,
         "View_Chart": view_chart_link,
@@ -211,7 +220,7 @@ for stock in stocks:
             stock_df.columns = stock_df.columns.get_level_values(0)
 
         if not stock_df.empty:
-            is_step1_valid, spike_date, _ = check_volume_and_spike_day_high(stock_df)
+            is_step1_valid, spike_date, _, spike_idx = check_volume_and_spike_day_high(stock_df)
 
             if is_step1_valid:
                 view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
@@ -223,14 +232,14 @@ for stock in stocks:
                     "View_Chart": view_chart_link,
                 })
 
-                breakout_res = check_ready_for_breakout(stock_df, symbol_clean, spike_date)
+                breakout_res = check_ready_for_breakout(stock_df, symbol_clean, spike_date, spike_idx)
                 if breakout_res:
                     step2_results.append(breakout_res)
 
     except Exception:
         pass
 
-# Upload Step 1 Data (Sorted Latest Date First)
+# Upload Step 1 Data (Recent Date First)
 ws_vol_filtered.clear()
 if step1_results:
     df_step1 = pd.DataFrame(step1_results)
@@ -244,7 +253,7 @@ if step1_results:
 else:
     ws_vol_filtered.update(values=[["No Volume Breakout Candidates"]], range_name="A1")
 
-# Upload Step 2 Data (Sorted Latest Date First)
+# Upload Step 2 Data (Recent Date First)
 ws_ready_for_breakout.clear()
 if step2_results:
     df_step2 = pd.DataFrame(step2_results)
