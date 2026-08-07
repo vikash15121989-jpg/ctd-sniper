@@ -9,10 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: UPDATED SCANNER WITH EXACT ENTRY PRICE ===", flush=True)
+print("=== CTD SNIPER: ENTRY TRIGGERED & NEAR ENTRY SCANNER ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_GAP_PCT = 10.0  # Minimum 10% Gap to Resistance
+NEAR_ENTRY_THRESHOLD = 0.03  # Within 3% of Entry Price
 LOOKBACK_DAYS = 365  # 1 Year Data
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
@@ -34,6 +35,7 @@ def get_or_create_sheet(title):
 ws_watchlist = sh.worksheet("Watchlist")
 ws_vol_filtered = get_or_create_sheet("Volume_Breakout_Watchlist")
 ws_ready_for_breakout = get_or_create_sheet("Ready_For_Breakout")
+ws_active_breakouts = get_or_create_sheet("Active_Breakouts")
 ws_pos_sizing = get_or_create_sheet("Position_Sizing")
 
 
@@ -103,21 +105,19 @@ def check_volume_and_spike_day_high(df):
     if not volume_spike_found:
         return False, None, None, None
 
-    # Volume Spike Candle High Price < Nearest Swing High
     if spike_day_high < latest_swing_high_price:
         return True, spike_date, latest_swing_high_price, spike_idx
 
     return False, None, None, None
 
 
-# ===== STEP 2: RESISTANCE SPACE & ENTRY PRICE FROM VOLUME DATE =====
+# ===== STEP 2: READY FOR BREAKOUT FILTER =====
 def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
     swing_highs, swing_lows = find_swing_points(df, window=5)
 
     if not swing_highs or not swing_lows:
-        return None
+        return None, None, None, None
 
-    # Volume Date ke paas/baad ka Nearest Swing High Entry hoga
     valid_highs = [sh for sh in swing_highs if sh[0] >= spike_idx - 10]
     if not valid_highs:
         valid_highs = swing_highs
@@ -129,9 +129,8 @@ def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
     stop_loss = round(recent_swing_low, 2)
 
     if stop_loss >= entry_price:
-        return None
+        return None, None, None, None
 
-    # Check Overhead Resistance Gap
     all_highs = [sh[1] for sh in swing_highs]
     larger_previous_highs = [p for p in all_highs[:-1] if p > entry_swing_high]
 
@@ -148,17 +147,19 @@ def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
         has_10pct_resistance_space = True
 
     if not has_10pct_resistance_space:
-        return None
+        return None, None, None, None
 
     view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "📈 View Chart")'
 
-    return {
+    res_dict = {
         "Date": spike_date,
-        "Stock": stock_symbol,  # Normal text
+        "Stock": stock_symbol,
         "Entry_Price": entry_price,
         "Stoploss_Price": stop_loss,
         "View_Chart": view_chart_link,
     }
+
+    return res_dict, entry_price, stop_loss, spike_idx
 
 
 # ===== POSITION SIZING TAB SETUP =====
@@ -208,6 +209,7 @@ def setup_position_sizing_tab(ws):
 stocks = get_watchlist_stocks()
 step1_results = []
 step2_results = []
+active_breakout_results = []
 
 for stock in stocks:
     try:
@@ -232,41 +234,75 @@ for stock in stocks:
                     "View_Chart": view_chart_link,
                 })
 
-                breakout_res = check_ready_for_breakout(stock_df, symbol_clean, spike_date, spike_idx)
+                breakout_res, entry_price, stop_loss, s_idx = check_ready_for_breakout(
+                    stock_df, symbol_clean, spike_date, spike_idx
+                )
+                
                 if breakout_res:
                     step2_results.append(breakout_res)
+
+                    # --- NEW ENTRY FILTER LOGIC ---
+                    post_spike_df = stock_df.iloc[s_idx:]
+                    current_close = stock_df.iloc[-1]["Close"]
+                    max_high_after_spike = post_spike_df["High"].max()
+
+                    status = None
+                    # 1. Volume Date ke baad Entry Mil Gayi (Touch / Cross kar diya)
+                    if max_high_after_spike >= entry_price:
+                        status = "🔥 Entry Triggered"
+                    # 2. Entry Najdik Hai (Current Price within 3% range of Entry)
+                    elif current_close >= entry_price * (1 - NEAR_ENTRY_THRESHOLD) and current_close < entry_price:
+                        status = "🎯 Near Entry (Within 3%)"
+
+                    if status:
+                        active_breakout_results.append({
+                            "Spike_Date": spike_date,
+                            "Stock": symbol_clean,
+                            "Status": status,
+                            "Entry_Price": entry_price,
+                            "Current_Price": round(current_close, 2),
+                            "Stoploss_Price": stop_loss,
+                            "View_Chart": view_chart_link,
+                        })
 
     except Exception:
         pass
 
-# Upload Step 1 Data (Recent Date First)
+# Upload Step 1 Data
 ws_vol_filtered.clear()
 if step1_results:
-    df_step1 = pd.DataFrame(step1_results)
-    df_step1 = df_step1.sort_values(by="Volume_Spike_Date", ascending=False).reset_index(drop=True)
+    df_step1 = pd.DataFrame(step1_results).sort_values(by="Volume_Spike_Date", ascending=False).reset_index(drop=True)
     json_s1 = json.loads(df_step1.to_json(orient="split"))
     ws_vol_filtered.update(
         values=[json_s1["columns"]] + json_s1["data"],
         range_name="A1",
         value_input_option="USER_ENTERED",
     )
-else:
-    ws_vol_filtered.update(values=[["No Volume Breakout Candidates"]], range_name="A1")
 
-# Upload Step 2 Data (Recent Date First)
+# Upload Step 2 Data
 ws_ready_for_breakout.clear()
 if step2_results:
-    df_step2 = pd.DataFrame(step2_results)
-    df_step2 = df_step2.sort_values(by="Date", ascending=False).reset_index(drop=True)
+    df_step2 = pd.DataFrame(step2_results).sort_values(by="Date", ascending=False).reset_index(drop=True)
     json_s2 = json.loads(df_step2.to_json(orient="split"))
     ws_ready_for_breakout.update(
         values=[json_s2["columns"]] + json_s2["data"],
         range_name="A1",
         value_input_option="USER_ENTERED",
     )
-    print(f"✅ Filtered {len(step1_results)} stocks in Step 1, {len(step2_results)} stocks in Ready_For_Breakout!")
-else:
-    ws_ready_for_breakout.update(values=[["No Ready For Breakout Candidates"]], range_name="A1")
 
-# Position Sizing Tab Refresh
+# Upload Active Breakouts Data
+ws_active_breakouts.clear()
+if active_breakout_results:
+    df_active = pd.DataFrame(active_breakout_results).sort_values(by="Spike_Date", ascending=False).reset_index(drop=True)
+    json_active = json.loads(df_active.to_json(orient="split"))
+    ws_active_breakouts.update(
+        values=[json_active["columns"]] + json_active["data"],
+        range_name="A1",
+        value_input_option="USER_ENTERED",
+    )
+    print(f"✅ Active Breakouts: {len(active_breakout_results)} stocks filtered in [Active_Breakouts] sheet!", flush=True)
+else:
+    ws_active_breakouts.update(values=[["No Active Breakout or Near-Entry Candidates Found"]], range_name="A1")
+
+# Refresh Position Sizing
 setup_position_sizing_tab(ws_pos_sizing)
