@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: DYNAMIC POSITION SIZING ENGINE ===", flush=True)
+print("=== CTD SNIPER: EXACT PULLBACK SL & DYNAMIC POSITION SIZING ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 DEFAULT_CAPITAL = 100000.0         # Agar A1 khali ho toh fallback capital
@@ -18,7 +18,7 @@ DEFAULT_RISK_PCT = 1.0            # 1% Risk Per Trade
 MIN_VOLUME_UNITS = 100_000         # 1 Lakh Shares
 MIN_TURNOVER_VALUE = 5_000_000     # ₹50 Lakh Turnover
 ZIGZAG_DEPTH = 10                  # TradingView Default Depth
-VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x
+VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x of 20-Day Avg
 MIN_ROOM_TO_RES_PCT = 5.0          # 5% Overhead Gap
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
@@ -46,7 +46,6 @@ ws_position_sizing = get_or_create_sheet("Position_Sizing")
 try:
     user_capital_val = ws_position_sizing.acell("A1").value
     if user_capital_val:
-        # Clean currency symbols or commas if typed by user (e.g., "₹1,00,000" -> 100000)
         clean_val = str(user_capital_val).replace("₹", "").replace(",", "").strip()
         TOTAL_CAPITAL = float(clean_val)
     else:
@@ -168,18 +167,25 @@ for stock in stocks:
         all_highs, all_lows = get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH)
         is_valid_res, entry_h1, res_hprev, gap_pct = evaluate_overhead_resistance(all_highs)
 
-        if is_valid_res and all_lows:
+        # H1 Date se lekar aaj tak ka Minimum Low = Exact Pullback Stop Loss
+        if all_highs:
+            h1_idx = all_highs[-1][0]
+            pullback_sl = round(df.iloc[h1_idx:]["Low"].min(), 2)
+        else:
+            pullback_sl = round(df.iloc[-10:]["Low"].min(), 2)
+
+        if is_valid_res:
             sheet1_data.append({
                 "Stock": symbol_clean,
                 "Current_Close": round(df.iloc[-1]["Close"], 2),
                 "Recent_Swing_High_H1": round(entry_h1, 2),
                 "Overhead_Resistance_Hprev": round(res_hprev, 2) if res_hprev else "Open Sky",
                 "Gap_%": round(gap_pct, 2) if res_hprev else "Open Sky",
-                "Stop_Loss": round(all_lows[-1][1], 2),
+                "Stop_Loss": pullback_sl,
                 "View_Chart": view_chart_link
             })
 
-        # Scan Last 10 Days
+        # Scan Last 10 Days For 1-Day Before Volume Spike
         last_10_df = df.iloc[-10:]
 
         for idx, row in last_10_df.iterrows():
@@ -194,7 +200,7 @@ for stock in stocks:
                 df_until_spike = df.iloc[: spike_idx + 1]
                 sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
 
-                if not sp_highs or not sp_lows:
+                if not sp_highs:
                     continue
 
                 sp_valid, sp_h1, sp_hprev, sp_gap_pct = evaluate_overhead_resistance(sp_highs)
@@ -202,20 +208,23 @@ for stock in stocks:
                 if sp_valid and row["High"] < sp_h1:
                     spike_date = idx.strftime("%Y-%m-%d")
 
+                    # EXACT STOP LOSS: H1 Banne Ke Baad Ka Pullback Low
+                    sp_h1_idx = sp_highs[-1][0]
+                    exact_stop_loss = round(df.iloc[sp_h1_idx : spike_idx + 1]["Low"].min(), 2)
+
                     sheet2_data.append({
                         "Spike_Date": spike_date,
                         "Stock": symbol_clean,
                         "Recent_Swing_High_H1": round(sp_h1, 2),
                         "Overhead_Resistance_Hprev": round(sp_hprev, 2) if sp_hprev else "Open Sky",
                         "Gap_%": round(sp_gap_pct, 2) if sp_hprev else "Open Sky",
-                        "Stop_Loss": round(sp_lows[-1][1], 2),
+                        "Stop_Loss": exact_stop_loss,
                         "View_Chart": view_chart_link
                     })
 
                     post_spike_df = df.iloc[spike_idx:]
                     current_close = df.iloc[-1]["Close"]
                     dist_to_h1_pct = round(((sp_h1 - current_close) / current_close) * 100, 2)
-                    stop_loss_price = round(sp_lows[-1][1], 2)
 
                     if post_spike_df["High"].max() >= sp_h1:
                         status = "🔥 Entry Triggered"
@@ -231,12 +240,12 @@ for stock in stocks:
                         "Current_Price": round(current_close, 2),
                         "Recent_Swing_High_H1": round(sp_h1, 2),
                         "Distance_To_Entry": dist_str,
-                        "Stop_Loss": stop_loss_price,
+                        "Stop_Loss": exact_stop_loss,
                         "View_Chart": view_chart_link
                     })
 
                     # Position Sizing Calculation
-                    risk_per_share = sp_h1 - stop_loss_price
+                    risk_per_share = sp_h1 - exact_stop_loss
                     if risk_per_share > 0:
                         qty = int(MAX_RISK_AMOUNT / risk_per_share)
                         total_inv = round(qty * sp_h1, 2)
@@ -246,7 +255,7 @@ for stock in stocks:
                             "Stock": symbol_clean,
                             "Status": status,
                             "Entry_Price_H1": round(sp_h1, 2),
-                            "Stop_Loss": stop_loss_price,
+                            "Stop_Loss": exact_stop_loss,
                             "Risk_Per_Share": round(risk_per_share, 2),
                             "Qty_To_Buy": qty,
                             "Total_Investment": f"₹{total_inv:,.2f}",
@@ -259,7 +268,7 @@ for stock in stocks:
         pass
 
 
-# ===== UPLOAD DATA WITHOUT OVERWRITING A1/A2 CAPITAL CELLS =====
+# ===== UPLOAD DATA TO GOOGLE SHEETS =====
 ws_zigzag_filtered.clear()
 if sheet1_data:
     df_s1 = pd.DataFrame(sheet1_data)
@@ -280,19 +289,15 @@ if sheet3_data:
 
 # Position_Sizing Tab Data Upload Starting from Row 4 (Preserving A1, A2 Header Zone)
 if position_sizing_data:
-    # Clear table area below Row 3 only
     ws_position_sizing.batch_clear(["A4:Z500"])
-    
-    # Ensure Header row is intact
     headers = [["Spike_Date", "Stock", "Status", "Entry_Price_H1", "Stop_Loss", "Risk_Per_Share", "Qty_To_Buy", "Total_Investment", "Max_Risk_1%", "View_Chart"]]
     ws_position_sizing.update(values=headers, range_name="A3", value_input_option="USER_ENTERED")
 
     df_ps = pd.DataFrame(position_sizing_data).sort_values(by="Spike_Date", ascending=False)
     json_ps = json.loads(df_ps.to_json(orient="split"))
     
-    # Update Data from A4
     ws_position_sizing.update(values=json_ps["data"], range_name="A4", value_input_option="USER_ENTERED")
-    print("✅ Successfully Updated Position_Sizing Using Cell A1 Capital!", flush=True)
+    print("✅ All Sheets Updated Successfully with Pullback Stop Loss!", flush=True)
 else:
     ws_position_sizing.batch_clear(["A4:Z500"])
     ws_position_sizing.update(values=[["No Active Candidates Found"]], range_name="A4")
