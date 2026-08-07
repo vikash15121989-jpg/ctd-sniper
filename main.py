@@ -9,20 +9,20 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: EXACT RESISTANCE & VOLUME INTACT FILTER ===", flush=True)
+print("=== CTD SNIPER: EXACT LOGIC EXECUTION ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_VOLUME_UNITS = 5_000_000       # Minimum 50 Lakh Volume
 MIN_TURNOVER_VALUE = 20_000_000    # Minimum ₹2 Crore Trading Value
 ZIGZAG_DEV_PCT = 0.05              # 5% Reversal
-PIVOT_LEGS = 10                    # 10 Legs
+PIVOT_LEGS = 10                    # 10 Legs Depth
 MIN_ROOM_TO_RES_PCT = 10.0         # Minimum 10% Distance to Overhead Resistance
 LOOKBACK_DAYS = 365
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=LOOKBACK_DAYS)
 
-# ===== GOOGLE SHEETS SETUP =====
+# ===== GOOGLE SHEETS SETUP (AUTO-CREATE SHEETS IF NOT EXISTS) =====
 gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
@@ -45,7 +45,7 @@ def get_watchlist_stocks():
     return [s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s for s in stocks]
 
 
-# ===== TRADINGVIEW ZIG ZAG ALGORITHM =====
+# ===== ZIGZAG SWINGS ALGORITHM =====
 def get_zigzag_swings(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS):
     highs = df["High"].values
     lows = df["Low"].values
@@ -56,9 +56,15 @@ def get_zigzag_swings(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS):
 
     pivots = []
     for i in range(legs, n - legs):
-        if all(highs[i] >= highs[i - legs : i]) and all(highs[i] >= highs[i + 1 : i + legs + 1]):
+        is_pivot_high = all(highs[i] > highs[i - j] for j in range(1, legs + 1)) and \
+                        all(highs[i] >= highs[i + j] for j in range(1, legs + 1))
+        
+        is_pivot_low = all(lows[i] < lows[i - j] for j in range(1, legs + 1)) and \
+                       all(lows[i] <= lows[i + j] for j in range(1, legs + 1))
+
+        if is_pivot_high:
             pivots.append((i, highs[i], 'H'))
-        if all(lows[i] <= lows[i - legs : i]) and all(lows[i] <= lows[i + 1 : i + legs + 1]):
+        if is_pivot_low:
             pivots.append((i, lows[i], 'L'))
 
     if not pivots:
@@ -66,38 +72,51 @@ def get_zigzag_swings(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS):
 
     swing_highs = []
     swing_lows = []
-    last_type, last_price, last_idx = None, None, None
+    
+    dir_state = 0
+    last_high_price, last_high_idx = 0.0, -1
+    last_low_price, last_low_idx = float('inf'), -1
 
     for idx, price, p_type in pivots:
-        if last_type is None:
-            last_type, last_price, last_idx = p_type, price, idx
-            if p_type == 'H': swing_highs.append((idx, price))
-            else: swing_lows.append((idx, price))
+        if dir_state == 0:
+            if p_type == 'H':
+                dir_state = 1
+                last_high_price, last_high_idx = price, idx
+                swing_highs.append((idx, price))
+            elif p_type == 'L':
+                dir_state = -1
+                last_low_price, last_low_idx = price, idx
+                swing_lows.append((idx, price))
             continue
 
-        if p_type == 'H' and last_type == 'L':
-            if price >= last_price * (1 + dev_pct):
-                swing_highs.append((idx, price))
-                last_type, last_price, last_idx = 'H', price, idx
-        elif p_type == 'L' and last_type == 'H':
-            if price <= last_price * (1 - dev_pct):
-                swing_lows.append((idx, price))
-                last_type, last_price, last_idx = 'L', price, idx
-        elif p_type == 'H' and last_type == 'H':
-            if price > last_price:
-                if swing_highs and swing_highs[-1][0] == last_idx: swing_highs.pop()
-                swing_highs.append((idx, price))
-                last_price, last_idx = price, idx
-        elif p_type == 'L' and last_type == 'L':
-            if price < last_price:
-                if swing_lows and swing_lows[-1][0] == last_idx: swing_lows.pop()
-                swing_lows.append((idx, price))
-                last_price, last_idx = price, idx
+        if dir_state == 1:
+            if p_type == 'H':
+                if price > last_high_price:
+                    if swing_highs: swing_highs.pop()
+                    swing_highs.append((idx, price))
+                    last_high_price, last_high_idx = price, idx
+            elif p_type == 'L':
+                if price <= last_high_price * (1 - dev_pct):
+                    dir_state = -1
+                    last_low_price, last_low_idx = price, idx
+                    swing_lows.append((idx, price))
+
+        elif dir_state == -1:
+            if p_type == 'L':
+                if price < last_low_price:
+                    if swing_lows: swing_lows.pop()
+                    swing_lows.append((idx, price))
+                    last_low_price, last_low_idx = price, idx
+            elif p_type == 'H':
+                if price >= last_low_price * (1 + dev_pct):
+                    dir_state = 1
+                    last_high_price, last_high_idx = price, idx
+                    swing_highs.append((idx, price))
 
     return swing_highs, swing_lows
 
 
-# ===== STEP 1: LIQUIDITY CHECK =====
+# ===== STEP 1: LIQUIDITY FILTER =====
 def is_liquid_stock(df):
     latest_bar = df.iloc[-1]
     latest_vol = latest_bar["Volume"]
@@ -106,38 +125,40 @@ def is_liquid_stock(df):
 
 
 # ===== OVERHEAD RESISTANCE FINDER (AAPKA EXACT LOGIC) =====
-def check_resistance_distance(swing_highs):
+def find_overhead_resistance_level(swing_highs):
     """
-    Recent Swing High (Entry) se peeche BADA Swing High (Resistance) dhundta hai.
-    Agar Recent Swing = 100 aur prev = 90, toh code 100 se BADA pichla high (jaise 115) pakdega.
+    1. Recent Swing High ko Entry ($H_1$) maanega.
+    2. Recent Swing High se pehle ke waise Swing Highs dhundega jo $H_1$ se BADE hain.
+    3. Unme sabse paas wala BADA Swing High 'Overhead Resistance' hoga.
+    4. Dono ka diff >= 10% check karega.
     """
     if not swing_highs:
         return False, None, None
 
     recent_swing_high = swing_highs[-1][1]
 
-    # Recent Swing High se bade saare previous swing highs
-    overhead_resistances = [sh[1] for sh in swing_highs[:-1] if sh[1] > recent_swing_high]
+    # Recent Swing High se BADE pichle swing highs (Sache Resistances)
+    higher_past_highs = [sh[1] for sh in swing_highs[:-1] if sh[1] > recent_swing_high]
 
-    if not overhead_resistances:
-        # Open Sky / All-Time High -> Condition Pass
+    if not higher_past_highs:
+        # All-Time High / Open Sky -> Passed
         return True, recent_swing_high, None
 
-    nearest_overhead_resistance = min(overhead_resistances)
-    diff_pct = ((nearest_overhead_resistance - recent_swing_high) / recent_swing_high) * 100
+    nearest_overhead_res = min(higher_past_highs)
+    diff_pct = ((nearest_overhead_res - recent_swing_high) / recent_swing_high) * 100
 
     if diff_pct >= MIN_ROOM_TO_RES_PCT:
-        return True, recent_swing_high, nearest_overhead_resistance
+        return True, recent_swing_high, nearest_overhead_res
 
-    return False, recent_swing_high, nearest_overhead_resistance
+    return False, recent_swing_high, nearest_overhead_res
 
 
-# ===== MAIN RUNNER =====
+# ===== MAIN PIPELINE =====
 stocks = get_watchlist_stocks()
 
-sheet1_data = []  # Step 1 & 2: Liquid + Valid Resistance Distance Stocks
-sheet2_data = []  # Step 3: Volume Spike Intact Candidates
-sheet3_data = []  # Step 4: Active Status & Entry Distance Tracker
+sheet1_data = []  # Step 1 & 2: Liquid + Valid 10% Overhead Resistance
+sheet2_data = []  # Step 3: Volume Spike with Intact Swing High
+sheet3_data = []  # Step 4: Active Breakouts & Pending Distance Tracker
 
 for stock in stocks:
     try:
@@ -151,7 +172,7 @@ for stock in stocks:
             continue
 
         # ----------------------------------------------------
-        # STEP 1: LIQUIDITY FILTER
+        # 1. LIQUIDITY FILTER
         # ----------------------------------------------------
         if not is_liquid_stock(df):
             continue
@@ -159,10 +180,10 @@ for stock in stocks:
         view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
 
         # ----------------------------------------------------
-        # STEP 2: ZIGZAG SWINGS & Overhead Resistance >= 10%
+        # 2. ZIGZAG SWINGS & OVERHEAD RESISTANCE (SHEET 1)
         # ----------------------------------------------------
         curr_highs, curr_lows = get_zigzag_swings(df)
-        is_res_valid, recent_entry, overhead_res = check_resistance_distance(curr_highs)
+        is_res_valid, recent_entry, overhead_res = find_overhead_resistance_level(curr_highs)
 
         if is_res_valid and curr_lows:
             recent_sl = curr_lows[-1][1]
@@ -176,7 +197,7 @@ for stock in stocks:
             })
 
         # ----------------------------------------------------
-        # STEP 3: PREVIOUS 10 DAYS VOLUME SPIKE & INTACT SWING
+        # 3. VOLUME SPIKE & INTACT SWING HIGH (SHEET 2)
         # ----------------------------------------------------
         last_10_df = df.iloc[-10:]
 
@@ -185,24 +206,24 @@ for stock in stocks:
             if spike_idx < 20:
                 continue
 
-            # Historical Cut-off (Volume Spike day tak ke swings)
+            # Historical Cut-off (Volume Spike wale din tak ka chart)
             df_until_spike = df.iloc[:spike_idx]
             pre_highs, pre_lows = get_zigzag_swings(df_until_spike)
 
             if not pre_highs or not pre_lows:
                 continue
 
-            spike_res_valid, spike_entry_price, _ = check_resistance_distance(pre_highs)
+            spike_res_valid, spike_entry_price, _ = find_overhead_resistance_level(pre_highs)
             if not spike_res_valid:
                 continue
 
             spike_sl_price = pre_lows[-1][1]
 
-            # Volume Spike Check (Previous 10 Days Max Volume)
+            # Volume Spike Check (Pichle 10 dino ke max volume se bada volume)
             prev_10_max_vol = df.iloc[spike_idx - 10 : spike_idx]["Volume"].max()
             current_vol = row["Volume"]
 
-            # Volume Spike + Swing High Intact (Spike High < Recent Swing High)
+            # Volume Spike Tabhi Valid Hoga Jab Volume Spike Day Ka High < Recent Swing High Ho
             if prev_10_max_vol > 0 and current_vol > prev_10_max_vol and row["High"] < spike_entry_price:
                 
                 spike_date = idx.strftime("%Y-%m-%d")
@@ -216,7 +237,7 @@ for stock in stocks:
                 })
 
                 # ----------------------------------------------------
-                # STEP 4: VOLUME SPIKE KE BAAD ENTRY STATUS & DISTANCE
+                # 4. ENTRY TRIGGERED VS DISTANCE TRACKER (SHEET 3)
                 # ----------------------------------------------------
                 post_spike_df = df.iloc[spike_idx:]
                 max_high_post_spike = post_spike_df["High"].max()
@@ -265,7 +286,7 @@ if sheet3_data:
     df_s3 = pd.DataFrame(sheet3_data).sort_values(by="Spike_Date", ascending=False)
     json_s3 = json.loads(df_s3.to_json(orient="split"))
     ws_active_breakouts.update(values=[json_s3["columns"]] + json_s3["data"], range_name="A1", value_input_option="USER_ENTERED")
-    print("✅ System Run Complete! Exact Resistance & Volume Intact Filter Active.", flush=True)
+    print("✅ System Run Complete! Exact User Logic Applied Successfully.", flush=True)
 else:
     ws_active_breakouts.update(values=[["No Active Candidates Found"]], range_name="A1")
     
