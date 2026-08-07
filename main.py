@@ -9,18 +9,17 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: FULL TRADINGVIEW ENGINE WITH POSITION SIZING ===", flush=True)
+print("=== CTD SNIPER: DYNAMIC POSITION SIZING ENGINE ===", flush=True)
 
-# ===== CONFIGURATION & RISK SETTINGS =====
-TOTAL_CAPITAL = 100000.0           # Aapka total account balance (₹1 Lakh)
-RISK_PER_TRADE_PCT = 1.0          # Risk 1% per trade (₹1,000 max loss per trade)
-MAX_RISK_AMOUNT = TOTAL_CAPITAL * (RISK_PER_TRADE_PCT / 100.0)
+# ===== CONFIGURATION =====
+DEFAULT_CAPITAL = 100000.0         # Agar A1 khali ho toh fallback capital
+DEFAULT_RISK_PCT = 1.0            # 1% Risk Per Trade
 
-MIN_VOLUME_UNITS = 100_000         # 1 Lakh Minimum Shares (Small/Mid-caps filter)
-MIN_TURNOVER_VALUE = 5_000_000     # ₹50 Lakh Minimum Turnover
+MIN_VOLUME_UNITS = 100_000         # 1 Lakh Shares
+MIN_TURNOVER_VALUE = 5_000_000     # ₹50 Lakh Turnover
 ZIGZAG_DEPTH = 10                  # TradingView Default Depth
-VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x of 20-Day Avg
-MIN_ROOM_TO_RES_PCT = 5.0          # Minimum 5% Overhead Gap
+VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x
+MIN_ROOM_TO_RES_PCT = 5.0          # 5% Overhead Gap
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
@@ -42,6 +41,23 @@ ws_vol_breakout = get_or_create_sheet("Volume_Breakout_Watchlist")
 ws_active_breakouts = get_or_create_sheet("Active_Breakouts")
 ws_position_sizing = get_or_create_sheet("Position_Sizing")
 
+
+# ===== 1. READ TOTAL CAPITAL FROM SHEET CELL A1 =====
+try:
+    user_capital_val = ws_position_sizing.acell("A1").value
+    if user_capital_val:
+        # Clean currency symbols or commas if typed by user (e.g., "₹1,00,000" -> 100000)
+        clean_val = str(user_capital_val).replace("₹", "").replace(",", "").strip()
+        TOTAL_CAPITAL = float(clean_val)
+    else:
+        TOTAL_CAPITAL = DEFAULT_CAPITAL
+except Exception:
+    TOTAL_CAPITAL = DEFAULT_CAPITAL
+
+MAX_RISK_AMOUNT = TOTAL_CAPITAL * (DEFAULT_RISK_PCT / 100.0)
+print(f"💰 Active Capital Read From Sheet (A1): ₹{TOTAL_CAPITAL:,.2f} | Max Risk Per Trade (1%): ₹{MAX_RISK_AMOUNT:,.2f}")
+
+
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
     stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ["STOCK", "SYMBOL", "NAME"]]
@@ -61,7 +77,6 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     pivot_highs = []
     pivot_lows = []
 
-    # Pivot High / Pivot Low Matching (ta.pivothigh / ta.pivotlow)
     for i in range(depth, n - depth):
         current_high = highs[i]
         current_low = lows[i]
@@ -89,7 +104,6 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     clean_swings = [all_pivots[0]]
     for curr in all_pivots[1:]:
         last = clean_swings[-1]
-        
         if curr[3] == 'H' and last[3] == 'H':
             if curr[1] > last[1]:
                 clean_swings[-1] = curr
@@ -105,7 +119,6 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     return final_highs, final_lows
 
 
-# ===== OVERHEAD RESISTANCE EVALUATOR =====
 def evaluate_overhead_resistance(swing_highs):
     if not swing_highs:
         return False, None, None, 0.0
@@ -152,7 +165,6 @@ for stock in stocks:
         df["Vol_Avg20"] = df["Volume"].rolling(window=20).mean()
         view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
 
-        # Current Chart Structure
         all_highs, all_lows = get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH)
         is_valid_res, entry_h1, res_hprev, gap_pct = evaluate_overhead_resistance(all_highs)
 
@@ -167,7 +179,7 @@ for stock in stocks:
                 "View_Chart": view_chart_link
             })
 
-        # Scan Last 10 Days For 1-Day Before Volume Spike
+        # Scan Last 10 Days
         last_10_df = df.iloc[-10:]
 
         for idx, row in last_10_df.iterrows():
@@ -223,7 +235,7 @@ for stock in stocks:
                         "View_Chart": view_chart_link
                     })
 
-                    # Position Sizing Logic Calculation
+                    # Position Sizing Calculation
                     risk_per_share = sp_h1 - stop_loss_price
                     if risk_per_share > 0:
                         qty = int(MAX_RISK_AMOUNT / risk_per_share)
@@ -233,12 +245,12 @@ for stock in stocks:
                             "Spike_Date": spike_date,
                             "Stock": symbol_clean,
                             "Status": status,
-                            "Buy_Trigger_Price": round(sp_h1, 2),
+                            "Entry_Price_H1": round(sp_h1, 2),
                             "Stop_Loss": stop_loss_price,
                             "Risk_Per_Share": round(risk_per_share, 2),
-                            "Recommended_Qty": qty,
-                            "Total_Investment": f"₹{total_inv}",
-                            "Max_Risk": f"₹{int(MAX_RISK_AMOUNT)}",
+                            "Qty_To_Buy": qty,
+                            "Total_Investment": f"₹{total_inv:,.2f}",
+                            "Max_Risk_1%": f"₹{int(MAX_RISK_AMOUNT):,}",
                             "View_Chart": view_chart_link
                         })
                     break
@@ -247,7 +259,7 @@ for stock in stocks:
         pass
 
 
-# ===== UPLOAD ALL TABS TO GOOGLE SHEETS =====
+# ===== UPLOAD DATA WITHOUT OVERWRITING A1/A2 CAPITAL CELLS =====
 ws_zigzag_filtered.clear()
 if sheet1_data:
     df_s1 = pd.DataFrame(sheet1_data)
@@ -266,13 +278,22 @@ if sheet3_data:
     json_s3 = json.loads(df_s3.to_json(orient="split"))
     ws_active_breakouts.update(values=[json_s3["columns"]] + json_s3["data"], range_name="A1", value_input_option="USER_ENTERED")
 
-# Position_Sizing Tab Data Sync
-ws_position_sizing.clear()
+# Position_Sizing Tab Data Upload Starting from Row 4 (Preserving A1, A2 Header Zone)
 if position_sizing_data:
+    # Clear table area below Row 3 only
+    ws_position_sizing.batch_clear(["A4:Z500"])
+    
+    # Ensure Header row is intact
+    headers = [["Spike_Date", "Stock", "Status", "Entry_Price_H1", "Stop_Loss", "Risk_Per_Share", "Qty_To_Buy", "Total_Investment", "Max_Risk_1%", "View_Chart"]]
+    ws_position_sizing.update(values=headers, range_name="A3", value_input_option="USER_ENTERED")
+
     df_ps = pd.DataFrame(position_sizing_data).sort_values(by="Spike_Date", ascending=False)
     json_ps = json.loads(df_ps.to_json(orient="split"))
-    ws_position_sizing.update(values=[json_ps["columns"]] + json_ps["data"], range_name="A1", value_input_option="USER_ENTERED")
-    print("✅ All tabs updated including Position_Sizing successfully!", flush=True)
+    
+    # Update Data from A4
+    ws_position_sizing.update(values=json_ps["data"], range_name="A4", value_input_option="USER_ENTERED")
+    print("✅ Successfully Updated Position_Sizing Using Cell A1 Capital!", flush=True)
 else:
-    ws_position_sizing.update(values=[["No Active Candidates For Position Sizing"]], range_name="A1")
+    ws_position_sizing.batch_clear(["A4:Z500"])
+    ws_position_sizing.update(values=[["No Active Candidates Found"]], range_name="A4")
     
