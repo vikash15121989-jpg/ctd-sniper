@@ -9,14 +9,18 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: TRADINGVIEW EXACT ZIGZAG ENGINE ===", flush=True)
+print("=== CTD SNIPER: FULL TRADINGVIEW ENGINE WITH POSITION SIZING ===", flush=True)
 
-# ===== CONFIGURATION =====
-MIN_VOLUME_UNITS = 5_000_000       # Minimum 50 Lakh Volume OR
-MIN_TURNOVER_VALUE = 20_000_000    # Minimum ₹2 Crore Turnover
-ZIGZAG_DEPTH = 10                  # TradingView Default Pivot Depth
+# ===== CONFIGURATION & RISK SETTINGS =====
+TOTAL_CAPITAL = 100000.0           # Aapka total account balance (₹1 Lakh)
+RISK_PER_TRADE_PCT = 1.0          # Risk 1% per trade (₹1,000 max loss per trade)
+MAX_RISK_AMOUNT = TOTAL_CAPITAL * (RISK_PER_TRADE_PCT / 100.0)
+
+MIN_VOLUME_UNITS = 100_000         # 1 Lakh Minimum Shares (Small/Mid-caps filter)
+MIN_TURNOVER_VALUE = 5_000_000     # ₹50 Lakh Minimum Turnover
+ZIGZAG_DEPTH = 10                  # TradingView Default Depth
 VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x of 20-Day Avg
-MIN_ROOM_TO_RES_PCT = 10.0         # Minimum 10% Overhead Distance
+MIN_ROOM_TO_RES_PCT = 5.0          # Minimum 5% Overhead Gap
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
@@ -36,6 +40,7 @@ ws_watchlist = sh.worksheet("Watchlist")
 ws_zigzag_filtered = get_or_create_sheet("ZigZag_10pct_Filtered")
 ws_vol_breakout = get_or_create_sheet("Volume_Breakout_Watchlist")
 ws_active_breakouts = get_or_create_sheet("Active_Breakouts")
+ws_position_sizing = get_or_create_sheet("Position_Sizing")
 
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
@@ -43,7 +48,7 @@ def get_watchlist_stocks():
     return [s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s for s in stocks]
 
 
-# ===== EXACT TRADINGVIEW ZIGZAG ALGORITHM =====
+# ===== TRADINGVIEW EXACT ZIGZAG ALGORITHM =====
 def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     highs = df["High"].values
     lows = df["Low"].values
@@ -56,7 +61,7 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     pivot_highs = []
     pivot_lows = []
 
-    # 1. Exact Pivot Identification (ta.pivothigh / ta.pivotlow)
+    # Pivot High / Pivot Low Matching (ta.pivothigh / ta.pivotlow)
     for i in range(depth, n - depth):
         current_high = highs[i]
         current_low = lows[i]
@@ -72,7 +77,6 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
         if is_low:
             pivot_lows.append((i, current_low, dates[i]))
 
-    # 2. Alternating ZigZag Leg Generator
     all_pivots = sorted(
         [(idx, price, dt, 'H') for idx, price, dt in pivot_highs] + 
         [(idx, price, dt, 'L') for idx, price, dt in pivot_lows],
@@ -106,17 +110,13 @@ def evaluate_overhead_resistance(swing_highs):
     if not swing_highs:
         return False, None, None, 0.0
 
-    # Recent Major Swing High = H1
     h1_price = swing_highs[-1][1]
-
-    # H1 se strictly bade resistance levels
     higher_swings = [sh[1] for sh in swing_highs[:-1] if sh[1] > h1_price]
 
     if not higher_swings:
-        # Open Sky / All-Time High
         return True, h1_price, None, 999.0
 
-    hprev_price = higher_swings[-1] # Paas ka major high
+    hprev_price = higher_swings[-1]
     gap_pct = ((hprev_price - h1_price) / h1_price) * 100.0
 
     if gap_pct >= MIN_ROOM_TO_RES_PCT:
@@ -131,6 +131,7 @@ stocks = get_watchlist_stocks()
 sheet1_data = []
 sheet2_data = []
 sheet3_data = []
+position_sizing_data = []
 
 for stock in stocks:
     try:
@@ -143,22 +144,18 @@ for stock in stocks:
         if df.empty or len(df) < 50:
             continue
 
-        # Liquidity Check
         latest_vol = df.iloc[-1]["Volume"]
         latest_turnover = latest_vol * df.iloc[-1]["Close"]
         if not ((latest_vol >= MIN_VOLUME_UNITS) or (latest_turnover >= MIN_TURNOVER_VALUE)):
             continue
 
-        # 20-Day Moving Average Volume Calculation
         df["Vol_Avg20"] = df["Volume"].rolling(window=20).mean()
-
         view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
 
-        # Overall Chart ZigZag
+        # Current Chart Structure
         all_highs, all_lows = get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH)
         is_valid_res, entry_h1, res_hprev, gap_pct = evaluate_overhead_resistance(all_highs)
 
-        # 1. SHEET 1: CURRENT VALID STRUCTURE
         if is_valid_res and all_lows:
             sheet1_data.append({
                 "Stock": symbol_clean,
@@ -170,7 +167,7 @@ for stock in stocks:
                 "View_Chart": view_chart_link
             })
 
-        # 2. SHEET 2 & 3: SCAN LAST 10 DAYS FOR VOLUME SPIKE (1-DAY BEFORE DETECTOR)
+        # Scan Last 10 Days For 1-Day Before Volume Spike
         last_10_df = df.iloc[-10:]
 
         for idx, row in last_10_df.iterrows():
@@ -181,10 +178,7 @@ for stock in stocks:
             prev_vol_avg = df.iloc[spike_idx - 1]["Vol_Avg20"]
             current_vol = row["Volume"]
 
-            # Volume Surge Condition (>= 2.5x 20-Day Average)
             if prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg):
-
-                # Swings Slice Up to Spike Day
                 df_until_spike = df.iloc[: spike_idx + 1]
                 sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
 
@@ -193,7 +187,6 @@ for stock in stocks:
 
                 sp_valid, sp_h1, sp_hprev, sp_gap_pct = evaluate_overhead_resistance(sp_highs)
 
-                # Strict Checks: Overhead Gap >= 10% AND Spike High < H1 (Intact Level)
                 if sp_valid and row["High"] < sp_h1:
                     spike_date = idx.strftime("%Y-%m-%d")
 
@@ -207,10 +200,10 @@ for stock in stocks:
                         "View_Chart": view_chart_link
                     })
 
-                    # Tracker Status
                     post_spike_df = df.iloc[spike_idx:]
                     current_close = df.iloc[-1]["Close"]
                     dist_to_h1_pct = round(((sp_h1 - current_close) / current_close) * 100, 2)
+                    stop_loss_price = round(sp_lows[-1][1], 2)
 
                     if post_spike_df["High"].max() >= sp_h1:
                         status = "🔥 Entry Triggered"
@@ -226,16 +219,35 @@ for stock in stocks:
                         "Current_Price": round(current_close, 2),
                         "Recent_Swing_High_H1": round(sp_h1, 2),
                         "Distance_To_Entry": dist_str,
-                        "Stop_Loss": round(sp_lows[-1][1], 2),
+                        "Stop_Loss": stop_loss_price,
                         "View_Chart": view_chart_link
                     })
+
+                    # Position Sizing Logic Calculation
+                    risk_per_share = sp_h1 - stop_loss_price
+                    if risk_per_share > 0:
+                        qty = int(MAX_RISK_AMOUNT / risk_per_share)
+                        total_inv = round(qty * sp_h1, 2)
+
+                        position_sizing_data.append({
+                            "Spike_Date": spike_date,
+                            "Stock": symbol_clean,
+                            "Status": status,
+                            "Buy_Trigger_Price": round(sp_h1, 2),
+                            "Stop_Loss": stop_loss_price,
+                            "Risk_Per_Share": round(risk_per_share, 2),
+                            "Recommended_Qty": qty,
+                            "Total_Investment": f"₹{total_inv}",
+                            "Max_Risk": f"₹{int(MAX_RISK_AMOUNT)}",
+                            "View_Chart": view_chart_link
+                        })
                     break
 
     except Exception:
         pass
 
 
-# ===== UPLOAD TO GOOGLE SHEETS =====
+# ===== UPLOAD ALL TABS TO GOOGLE SHEETS =====
 ws_zigzag_filtered.clear()
 if sheet1_data:
     df_s1 = pd.DataFrame(sheet1_data)
@@ -253,7 +265,14 @@ if sheet3_data:
     df_s3 = pd.DataFrame(sheet3_data).sort_values(by="Spike_Date", ascending=False)
     json_s3 = json.loads(df_s3.to_json(orient="split"))
     ws_active_breakouts.update(values=[json_s3["columns"]] + json_s3["data"], range_name="A1", value_input_option="USER_ENTERED")
-    print("✅ High-Precision Execution Complete!", flush=True)
+
+# Position_Sizing Tab Data Sync
+ws_position_sizing.clear()
+if position_sizing_data:
+    df_ps = pd.DataFrame(position_sizing_data).sort_values(by="Spike_Date", ascending=False)
+    json_ps = json.loads(df_ps.to_json(orient="split"))
+    ws_position_sizing.update(values=[json_ps["columns"]] + json_ps["data"], range_name="A1", value_input_option="USER_ENTERED")
+    print("✅ All tabs updated including Position_Sizing successfully!", flush=True)
 else:
-    ws_active_breakouts.update(values=[["No Active Candidates Found"]], range_name="A1")
+    ws_position_sizing.update(values=[["No Active Candidates For Position Sizing"]], range_name="A1")
     
