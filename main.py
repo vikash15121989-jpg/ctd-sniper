@@ -3,17 +3,20 @@ import os
 import warnings
 from datetime import datetime, timedelta
 import gspread
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
+print("=== CTD SNIPER: TRADINGVIEW EXACT ZIGZAG ENGINE ===", flush=True)
+
 # ===== CONFIGURATION =====
-MIN_VOLUME_UNITS = 5_000_000       # Minimum 50 Lakh Volume
-MIN_TURNOVER_VALUE = 20_000_000    # Minimum ₹2 Crore Trading Value
-ZIGZAG_DEV_PCT = 0.05              # 5% Reversal
-PIVOT_LEGS = 10                    # 10 Legs Depth
-MIN_DIFF_PCT = 10.0                # Minimum 10% Gap
+MIN_VOLUME_UNITS = 5_000_000       # Minimum 50 Lakh Volume OR
+MIN_TURNOVER_VALUE = 20_000_000    # Minimum ₹2 Crore Turnover
+ZIGZAG_DEPTH = 10                  # TradingView Default Pivot Depth
+VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x of 20-Day Avg
+MIN_ROOM_TO_RES_PCT = 10.0         # Minimum 10% Overhead Distance
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
@@ -40,69 +43,89 @@ def get_watchlist_stocks():
     return [s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s for s in stocks]
 
 
-# ===== STEP 1: PURE ZIGZAG SWING EXTENSION =====
-def get_zigzag_swings(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS):
+# ===== EXACT TRADINGVIEW ZIGZAG ALGORITHM =====
+def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
     highs = df["High"].values
     lows = df["Low"].values
+    dates = df.index
     n = len(df)
-    
-    if n < (legs * 2 + 1):
+
+    if n < (depth * 2 + 1):
         return [], []
 
-    pivots = []
-    for i in range(legs, n - legs):
-        if all(highs[i] > highs[i - j] for j in range(1, legs + 1)) and all(highs[i] >= highs[i + j] for j in range(1, legs + 1)):
-            pivots.append((i, highs[i], 'H'))
-        if all(lows[i] < lows[i - j] for j in range(1, legs + 1)) and all(lows[i] <= lows[i + j] for j in range(1, legs + 1)):
-            pivots.append((i, lows[i], 'L'))
+    pivot_highs = []
+    pivot_lows = []
 
-    if not pivots:
+    # 1. Exact Pivot Identification (ta.pivothigh / ta.pivotlow)
+    for i in range(depth, n - depth):
+        current_high = highs[i]
+        current_low = lows[i]
+
+        is_high = all(current_high > highs[i - j] for j in range(1, depth + 1)) and \
+                  all(current_high >= highs[i + j] for j in range(1, depth + 1))
+
+        is_low = all(current_low < lows[i - j] for j in range(1, depth + 1)) and \
+                 all(current_low <= lows[i + j] for j in range(1, depth + 1))
+
+        if is_high:
+            pivot_highs.append((i, current_high, dates[i]))
+        if is_low:
+            pivot_lows.append((i, current_low, dates[i]))
+
+    # 2. Alternating ZigZag Leg Generator
+    all_pivots = sorted(
+        [(idx, price, dt, 'H') for idx, price, dt in pivot_highs] + 
+        [(idx, price, dt, 'L') for idx, price, dt in pivot_lows],
+        key=lambda x: x[0]
+    )
+
+    if not all_pivots:
         return [], []
 
-    swing_highs = []
-    swing_lows = []
-    
-    for idx, price, p_type in pivots:
-        if p_type == 'H':
-            swing_highs.append((idx, price))
+    clean_swings = [all_pivots[0]]
+    for curr in all_pivots[1:]:
+        last = clean_swings[-1]
+        
+        if curr[3] == 'H' and last[3] == 'H':
+            if curr[1] > last[1]:
+                clean_swings[-1] = curr
+        elif curr[3] == 'L' and last[3] == 'L':
+            if curr[1] < last[1]:
+                clean_swings[-1] = curr
         else:
-            swing_lows.append((idx, price))
+            clean_swings.append(curr)
 
-    return swing_highs, swing_lows
+    final_highs = [p for p in clean_swings if p[3] == 'H']
+    final_lows = [p for p in clean_swings if p[3] == 'L']
+
+    return final_highs, final_lows
 
 
-# ===== STEP 2: AAPKA EXACT RESISTANCE FILTER LOGIC =====
-def process_user_resistance_logic(swing_highs):
-    """
-    1. Recent Swing High ko entry ($H_1$) maano.
-    2. Uske pehle wahi Swing High dekho jo $H_1$ se BADA ho ($H_{prev} > H_1$).
-    3. Gap >= 10% calculate karo.
-    """
+# ===== OVERHEAD RESISTANCE EVALUATOR =====
+def evaluate_overhead_resistance(swing_highs):
     if not swing_highs:
-        return False, None, None
+        return False, None, None, 0.0
 
-    recent_swing_high = swing_highs[-1][1]
+    # Recent Major Swing High = H1
+    h1_price = swing_highs[-1][1]
 
-    # $H_1$ se BADE pichle saare Swing Highs (True Resistance Levels)
-    past_higher_swings = [sh[1] for sh in swing_highs[:-1] if sh[1] > recent_swing_high]
+    # H1 se strictly bade resistance levels
+    higher_swings = [sh[1] for sh in swing_highs[:-1] if sh[1] > h1_price]
 
-    if not past_higher_swings:
-        # Piche koi bada high nahi mila (Open Sky / ATH)
-        return True, recent_swing_high, None
+    if not higher_swings:
+        # Open Sky / All-Time High
+        return True, h1_price, None, 999.0
 
-    # $H_1$ se pehla/sabse paas bada resistance high
-    true_resistance_high = min(past_higher_swings)
+    hprev_price = higher_swings[-1] # Paas ka major high
+    gap_pct = ((hprev_price - h1_price) / h1_price) * 100.0
 
-    # Difference Calculation
-    diff_pct = ((true_resistance_high - recent_swing_high) / recent_swing_high) * 100.0
+    if gap_pct >= MIN_ROOM_TO_RES_PCT:
+        return True, h1_price, hprev_price, gap_pct
 
-    if diff_pct >= MIN_DIFF_PCT:
-        return True, recent_swing_high, true_resistance_high
-
-    return False, recent_swing_high, true_resistance_high
+    return False, h1_price, hprev_price, gap_pct
 
 
-# ===== MAIN RUNNER =====
+# ===== MAIN EXECUTION PIPELINE =====
 stocks = get_watchlist_stocks()
 
 sheet1_data = []
@@ -120,65 +143,71 @@ for stock in stocks:
         if df.empty or len(df) < 50:
             continue
 
-        # 1. LIQUIDITY FILTER
+        # Liquidity Check
         latest_vol = df.iloc[-1]["Volume"]
         latest_turnover = latest_vol * df.iloc[-1]["Close"]
         if not ((latest_vol >= MIN_VOLUME_UNITS) or (latest_turnover >= MIN_TURNOVER_VALUE)):
             continue
 
+        # 20-Day Moving Average Volume Calculation
+        df["Vol_Avg20"] = df["Volume"].rolling(window=20).mean()
+
         view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
 
-        # 2. SHEET 1: RESISTANCE FILTER
-        curr_highs, curr_lows = get_zigzag_swings(df)
-        is_valid_res, h1_price, h_prev_price = process_user_resistance_logic(curr_highs)
+        # Overall Chart ZigZag
+        all_highs, all_lows = get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH)
+        is_valid_res, entry_h1, res_hprev, gap_pct = evaluate_overhead_resistance(all_highs)
 
-        if is_valid_res and curr_lows:
+        # 1. SHEET 1: CURRENT VALID STRUCTURE
+        if is_valid_res and all_lows:
             sheet1_data.append({
                 "Stock": symbol_clean,
                 "Current_Close": round(df.iloc[-1]["Close"], 2),
-                "Recent_Swing_High_H1": round(h1_price, 2),
-                "Resistance_High_Hprev": round(h_prev_price, 2) if h_prev_price else "Open Sky",
-                "Stop_Loss": round(curr_lows[-1][1], 2),
+                "Recent_Swing_High_H1": round(entry_h1, 2),
+                "Overhead_Resistance_Hprev": round(res_hprev, 2) if res_hprev else "Open Sky",
+                "Gap_%": round(gap_pct, 2) if res_hprev else "Open Sky",
+                "Stop_Loss": round(all_lows[-1][1], 2),
                 "View_Chart": view_chart_link
             })
 
-        # 3. SHEET 2 & 3: VOLUME SPIKE + SWING INTACT LOGIC
+        # 2. SHEET 2 & 3: SCAN LAST 10 DAYS FOR VOLUME SPIKE (1-DAY BEFORE DETECTOR)
         last_10_df = df.iloc[-10:]
 
         for idx, row in last_10_df.iterrows():
             spike_idx = df.index.get_loc(idx)
-            if spike_idx < 20:
+            if spike_idx < 30:
                 continue
 
-            prev_10_max_vol = df.iloc[spike_idx - 10 : spike_idx]["Volume"].max()
+            prev_vol_avg = df.iloc[spike_idx - 1]["Vol_Avg20"]
             current_vol = row["Volume"]
 
-            # Condition A: Volume > Prev 10 Days Max Volume
-            if prev_10_max_vol > 0 and current_vol > prev_10_max_vol:
-                
-                df_until_spike = df.iloc[:spike_idx]
-                sp_highs, sp_lows = get_zigzag_swings(df_until_spike)
+            # Volume Surge Condition (>= 2.5x 20-Day Average)
+            if prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg):
+
+                # Swings Slice Up to Spike Day
+                df_until_spike = df.iloc[: spike_idx + 1]
+                sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
 
                 if not sp_highs or not sp_lows:
                     continue
 
-                sp_valid, sp_h1, sp_hprev = process_user_resistance_logic(sp_highs)
+                sp_valid, sp_h1, sp_hprev, sp_gap_pct = evaluate_overhead_resistance(sp_highs)
 
-                # Condition B: Resistance Gap >= 10% AND Spike Day High < H1 (Swing High Intact)
+                # Strict Checks: Overhead Gap >= 10% AND Spike High < H1 (Intact Level)
                 if sp_valid and row["High"] < sp_h1:
                     spike_date = idx.strftime("%Y-%m-%d")
 
-                    # SHEET 2 ENTRY
                     sheet2_data.append({
                         "Spike_Date": spike_date,
                         "Stock": symbol_clean,
                         "Recent_Swing_High_H1": round(sp_h1, 2),
-                        "Resistance_High_Hprev": round(sp_hprev, 2) if sp_hprev else "Open Sky",
+                        "Overhead_Resistance_Hprev": round(sp_hprev, 2) if sp_hprev else "Open Sky",
+                        "Gap_%": round(sp_gap_pct, 2) if sp_hprev else "Open Sky",
                         "Stop_Loss": round(sp_lows[-1][1], 2),
                         "View_Chart": view_chart_link
                     })
 
-                    # SHEET 3 ENTRY (STATUS & ENTRY DISTANCE)
+                    # Tracker Status
                     post_spike_df = df.iloc[spike_idx:]
                     current_close = df.iloc[-1]["Close"]
                     dist_to_h1_pct = round(((sp_h1 - current_close) / current_close) * 100, 2)
@@ -224,7 +253,7 @@ if sheet3_data:
     df_s3 = pd.DataFrame(sheet3_data).sort_values(by="Spike_Date", ascending=False)
     json_s3 = json.loads(df_s3.to_json(orient="split"))
     ws_active_breakouts.update(values=[json_s3["columns"]] + json_s3["data"], range_name="A1", value_input_option="USER_ENTERED")
-    print("✅ Logic Execution Complete!", flush=True)
+    print("✅ High-Precision Execution Complete!", flush=True)
 else:
     ws_active_breakouts.update(values=[["No Active Candidates Found"]], range_name="A1")
     
