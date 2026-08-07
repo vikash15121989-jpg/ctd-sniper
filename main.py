@@ -9,12 +9,14 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: ENTRY TRIGGERED & NEAR ENTRY SCANNER ===", flush=True)
+print("=== CTD SNIPER: TRADINGVIEW EXACT ZIG ZAG (DEV % + PIVOT LEGS) ===", flush=True)
 
-# ===== CONFIGURATION =====
-MIN_GAP_PCT = 10.0  # Minimum 10% Gap to Resistance
-NEAR_ENTRY_THRESHOLD = 0.03  # Within 3% of Entry Price
-LOOKBACK_DAYS = 365  # 1 Year Data
+# ===== TRADINGVIEW EXACT INPUTS (FROM YOUR SCREENSHOT) =====
+ZIGZAG_DEV_PCT = 0.05   # 5% Reversal
+PIVOT_LEGS = 10         # 10 Bars Pivot Legs
+MIN_GAP_PCT = 10.0      # Minimum 10% Gap to Resistance
+NEAR_ENTRY_THRESHOLD = 0.03 # Within 3% of Entry Price
+LOOKBACK_DAYS = 365
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=LOOKBACK_DAYS)
@@ -24,13 +26,11 @@ gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
 gc = gspread.service_account_from_dict(gcp_json_creds)
 sh = gc.open("CTD_Sniper")
 
-
 def get_or_create_sheet(title):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows="500", cols="15")
-
 
 ws_watchlist = sh.worksheet("Watchlist")
 ws_vol_filtered = get_or_create_sheet("Volume_Breakout_Watchlist")
@@ -38,41 +38,99 @@ ws_ready_for_breakout = get_or_create_sheet("Ready_For_Breakout")
 ws_active_breakouts = get_or_create_sheet("Active_Breakouts")
 ws_pos_sizing = get_or_create_sheet("Position_Sizing")
 
-
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
-    stocks = [
-        s.strip().upper()
-        for s in stocks
-        if s.strip() and s.strip().upper() not in ["STOCK", "SYMBOL", "NAME"]
-    ]
-    return [
-        s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s
-        for s in stocks
-    ]
+    stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ["STOCK", "SYMBOL", "NAME"]]
+    return [s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s for s in stocks]
 
-
-def find_swing_points(df, window=5):
+# ===== TRADINGVIEW EXACT ZIG ZAG ALGORITHM =====
+def get_tv_exact_zigzag(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS):
     highs = df["High"].values
     lows = df["Low"].values
+    n = len(df)
+    
+    # Step 1: Pivot Highs & Pivot Lows (Pivot Legs = 10)
+    pivots = [] # List of tuples: (index, price, 'H' or 'L')
+    for i in range(legs, n - legs):
+        # Pivot High Check
+        if all(highs[i] >= highs[i - legs : i]) and all(highs[i] >= highs[i + 1 : i + legs + 1]):
+            pivots.append((i, highs[i], 'H'))
+        # Pivot Low Check
+        if all(lows[i] <= lows[i - legs : i]) and all(lows[i] <= lows[i + 1 : i + legs + 1]):
+            pivots.append((i, lows[i], 'L'))
 
+    if not pivots:
+        return [], []
+
+    # Step 2: Filter Pivots based on Price Reversal (%)
     swing_highs = []
     swing_lows = []
+    
+    last_type = None
+    last_price = None
+    last_idx = None
 
-    for idx in range(window, len(df) - window):
-        # Swing High
-        if all(highs[idx] > highs[idx - window : idx]) and all(
-            highs[idx] > highs[idx + 1 : idx + window + 1]
-        ):
-            swing_highs.append((idx, highs[idx]))
+    for idx, price, p_type in pivots:
+        if last_type is None:
+            last_type = p_type
+            last_price = price
+            last_idx = idx
+            if p_type == 'H':
+                swing_highs.append((idx, price))
+            else:
+                swing_lows.append((idx, price))
+            continue
 
-        # Swing Low
-        if all(lows[idx] < lows[idx - window : idx]) and all(
-            lows[idx] < lows[idx + 1 : idx + window + 1]
-        ):
-            swing_lows.append((idx, lows[idx]))
+        if p_type == 'H' and last_type == 'L':
+            # Check 5% reversal up from last low
+            if price >= last_price * (1 + dev_pct):
+                swing_highs.append((idx, price))
+                last_type = 'H'
+                last_price = price
+                last_idx = idx
+        elif p_type == 'L' and last_type == 'H':
+            # Check 5% reversal down from last high
+            if price <= last_price * (1 - dev_pct):
+                swing_lows.append((idx, price))
+                last_type = 'L'
+                last_price = price
+                last_idx = idx
+        elif p_type == 'H' and last_type == 'H':
+            # If consecutive Highs, update if higher
+            if price > last_price:
+                if swing_highs and swing_highs[-1][0] == last_idx:
+                    swing_highs.pop()
+                swing_highs.append((idx, price))
+                last_price = price
+                last_idx = idx
+        elif p_type == 'L' and last_type == 'L':
+            # If consecutive Lows, update if lower
+            if price < last_price:
+                if swing_lows and swing_lows[-1][0] == last_idx:
+                    swing_lows.pop()
+                swing_lows.append((idx, price))
+                last_price = price
+                last_idx = idx
 
     return swing_highs, swing_lows
+
+
+# ===== HYBRID COMBINATION (FALLBACK TO PIVOT LEGS IF REVERSAL TOO STRICT) =====
+def get_combined_swings(df):
+    tv_highs, tv_lows = get_tv_exact_zigzag(df, dev_pct=ZIGZAG_DEV_PCT, legs=PIVOT_LEGS)
+    
+    # Fallback to Pivot Legs (10) if deviation criteria excludes recent local peak
+    if not tv_highs:
+        highs = df["High"].values
+        lows = df["Low"].values
+        legs = PIVOT_LEGS
+        for i in range(legs, len(df) - legs):
+            if all(highs[i] >= highs[i - legs : i]) and all(highs[i] >= highs[i + 1 : i + legs + 1]):
+                tv_highs.append((i, highs[i]))
+            if all(lows[i] <= lows[i - legs : i]) and all(lows[i] <= lows[i + 1 : i + legs + 1]):
+                tv_lows.append((i, lows[i]))
+
+    return sorted(tv_highs, key=lambda x: x[0]), sorted(tv_lows, key=lambda x: x[0])
 
 
 # ===== STEP 1: MAX VOLUME & VOLUME DAY HIGH BELOW SWING HIGH =====
@@ -83,11 +141,12 @@ def check_volume_and_spike_day_high(df):
     last_10_df = df.iloc[-10:]
     prev_10_max_vol = df.iloc[-20:-10]["Volume"].max()
 
-    swing_highs, _ = find_swing_points(df, window=5)
+    swing_highs, _ = get_combined_swings(df)
     if not swing_highs:
         return False, None, None, None
 
-    latest_swing_high_price = swing_highs[-1][1]
+    recent_30_highs = [sh[1] for sh in swing_highs if sh[0] >= len(df) - 40]
+    latest_swing_high_price = max(recent_30_highs) if recent_30_highs else swing_highs[-1][1]
 
     volume_spike_found = False
     spike_date = None
@@ -113,17 +172,16 @@ def check_volume_and_spike_day_high(df):
 
 # ===== STEP 2: READY FOR BREAKOUT FILTER =====
 def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
-    swing_highs, swing_lows = find_swing_points(df, window=5)
+    swing_highs, swing_lows = get_combined_swings(df)
 
     if not swing_highs or not swing_lows:
         return None, None, None, None
 
-    valid_highs = [sh for sh in swing_highs if sh[0] >= spike_idx - 10]
-    if not valid_highs:
-        valid_highs = swing_highs
+    recent_peaks = [sh[1] for sh in swing_highs if sh[0] >= len(df) - 40]
+    entry_swing_high = max(recent_peaks) if recent_peaks else swing_highs[-1][1]
 
-    entry_swing_high = valid_highs[-1][1]
-    recent_swing_low = swing_lows[-1][1]
+    recent_troughs = [sl[1] for sl in swing_lows if sl[0] >= len(df) - 40]
+    recent_swing_low = min(recent_troughs) if recent_troughs else swing_lows[-1][1]
 
     entry_price = round(entry_swing_high, 2)
     stop_loss = round(recent_swing_low, 2)
@@ -132,15 +190,13 @@ def check_ready_for_breakout(df, stock_symbol, spike_date, spike_idx):
         return None, None, None, None
 
     all_highs = [sh[1] for sh in swing_highs]
-    larger_previous_highs = [p for p in all_highs[:-1] if p > entry_swing_high]
+    larger_previous_highs = [p for p in all_highs if p > entry_swing_high]
 
     has_10pct_resistance_space = False
 
     if larger_previous_highs:
         nearest_larger_high = min(larger_previous_highs)
-        gap_pct = (
-            (nearest_larger_high - entry_swing_high) / entry_swing_high
-        ) * 100
+        gap_pct = ((nearest_larger_high - entry_swing_high) / entry_swing_high) * 100
         if gap_pct >= MIN_GAP_PCT:
             has_10pct_resistance_space = True
     else:
@@ -170,7 +226,7 @@ def setup_position_sizing_tab(ws):
 
         layout = [
             [100000, "⬅️ Enter Your Total Capital (A1)"],
-            ["TCS", "⬅️ Enter Stock Symbol (A2)"],
+            ["APLLTD", "⬅️ Enter Stock Symbol (A2)"],
             ["", ""],
             ["Metric / Detail", "Value / Calculation"],
             ["Max Allowed Risk (2% of Capital)", "=A1*0.02"],
@@ -197,9 +253,7 @@ def setup_position_sizing_tab(ws):
             ],
         ]
 
-        ws.update(
-            values=layout, range_name="A1", value_input_option="USER_ENTERED"
-        )
+        ws.update(values=layout, range_name="A1", value_input_option="USER_ENTERED")
         print("✅ Position Sizing Tab refreshed!", flush=True)
     except Exception as e:
         print(f"Sheet Error [Position_Sizing]: {str(e)}", flush=True)
@@ -214,9 +268,7 @@ active_breakout_results = []
 for stock in stocks:
     try:
         symbol_clean = stock.replace(".NS", "")
-        stock_df = yf.download(
-            stock, start=START_DATE, end=END_DATE, progress=False
-        )
+        stock_df = yf.download(stock, start=START_DATE, end=END_DATE, progress=False)
 
         if isinstance(stock_df.columns, pd.MultiIndex):
             stock_df.columns = stock_df.columns.get_level_values(0)
@@ -237,20 +289,17 @@ for stock in stocks:
                 breakout_res, entry_price, stop_loss, s_idx = check_ready_for_breakout(
                     stock_df, symbol_clean, spike_date, spike_idx
                 )
-                
+
                 if breakout_res:
                     step2_results.append(breakout_res)
 
-                    # --- NEW ENTRY FILTER LOGIC ---
                     post_spike_df = stock_df.iloc[s_idx:]
                     current_close = stock_df.iloc[-1]["Close"]
                     max_high_after_spike = post_spike_df["High"].max()
 
                     status = None
-                    # 1. Volume Date ke baad Entry Mil Gayi (Touch / Cross kar diya)
                     if max_high_after_spike >= entry_price:
                         status = "🔥 Entry Triggered"
-                    # 2. Entry Najdik Hai (Current Price within 3% range of Entry)
                     elif current_close >= entry_price * (1 - NEAR_ENTRY_THRESHOLD) and current_close < entry_price:
                         status = "🎯 Near Entry (Within 3%)"
 
@@ -300,9 +349,10 @@ if active_breakout_results:
         range_name="A1",
         value_input_option="USER_ENTERED",
     )
-    print(f"✅ Active Breakouts: {len(active_breakout_results)} stocks filtered in [Active_Breakouts] sheet!", flush=True)
+    print("✅ Exact TradingView ZigZag Calculation Complete!", flush=True)
 else:
-    ws_active_breakouts.update(values=[["No Active Breakout or Near-Entry Candidates Found"]], range_name="A1")
+    ws_active_breakouts.update(values=[["No Active Breakout Candidates"]], range_name="A1")
 
 # Refresh Position Sizing
 setup_position_sizing_tab(ws_pos_sizing)
+        
