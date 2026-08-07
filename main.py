@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: VOLUME SPIKE CANDLE HIGH SCANNER ===", flush=True)
+print("=== CTD SNIPER: UPDATED SCANNER WITH POSITION SIZING ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_GAP_PCT = 10.0  # Minimum 10% Gap to Resistance
@@ -34,6 +34,7 @@ def get_or_create_sheet(title):
 ws_watchlist = sh.worksheet("Watchlist")
 ws_vol_filtered = get_or_create_sheet("Volume_Breakout_Watchlist")
 ws_ready_for_breakout = get_or_create_sheet("Ready_For_Breakout")
+ws_pos_sizing = get_or_create_sheet("Position_Sizing")
 
 
 def get_watchlist_stocks():
@@ -78,7 +79,6 @@ def check_volume_and_spike_day_high(df):
         return False, None, None
 
     last_10_df = df.iloc[-10:]
-    # Previous 10 Days MAX Volume
     prev_10_max_vol = df.iloc[-20:-10]["Volume"].max()
 
     swing_highs, _ = find_swing_points(df, window=5)
@@ -91,18 +91,16 @@ def check_volume_and_spike_day_high(df):
     spike_date = None
     spike_day_high = None
 
-    # Check if any day in last 10 days had volume > previous 10 days max volume
     for idx, row in last_10_df.iterrows():
         if prev_10_max_vol > 0 and row["Volume"] > prev_10_max_vol:
             volume_spike_found = True
             spike_date = idx.strftime("%Y-%m-%d")
-            spike_day_high = row["High"]  # Jis din volume aaya us din ka HIGH
+            spike_day_high = row["High"]
             break
 
     if not volume_spike_found:
         return False, None, None
 
-    # PRICE CONDITION: Jis din volume aaya us din ka High Price Swing High se niche hona chahiye
     if spike_day_high < latest_swing_high_price:
         return True, spike_date, latest_swing_high_price
 
@@ -119,14 +117,12 @@ def check_ready_for_breakout(df, stock_symbol, spike_date):
     recent_swing_high_price = swing_highs[-1][1]
     recent_swing_low_price = swing_lows[-1][1]
 
-    # Entry = Nearest Swing High, Stop Loss = Nearest Swing Low
     entry_price = round(recent_swing_high_price, 2)
     stop_loss = round(recent_swing_low_price, 2)
 
     if stop_loss >= entry_price:
         return None
 
-    # Previous Swing Highs for Resistance Check
     all_highs = [sh[1] for sh in swing_highs]
     larger_previous_highs = [p for p in all_highs[:-1] if p > recent_swing_high_price]
 
@@ -140,22 +136,63 @@ def check_ready_for_breakout(df, stock_symbol, spike_date):
         if gap_pct >= MIN_GAP_PCT:
             has_10pct_resistance_space = True
     else:
-        # Overhead Resistance Hi Nahi Hai (Open Sky / ATH Zone)
         has_10pct_resistance_space = True
 
     if not has_10pct_resistance_space:
         return None
 
-    stock_hyperlink = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "{stock_symbol}")'
     view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{stock_symbol}", "📈 View Chart")'
 
     return {
         "Date": spike_date,
-        "Stock": stock_hyperlink,
+        "Stock": stock_symbol,  # Normal Text (Hyperlink removed)
         "Entry_Price": entry_price,
         "Stoploss_Price": stop_loss,
         "View_Chart": view_chart_link,
     }
+
+
+# ===== POSITION SIZING TAB SETUP =====
+def setup_position_sizing_tab(ws):
+    try:
+        ws.clear()
+        time.sleep(1)
+
+        layout = [
+            [100000, "⬅️ Enter Your Total Capital (A1)"],
+            ["TCS", "⬅️ Enter Stock Symbol (A2)"],
+            ["", ""],
+            ["Metric / Detail", "Value / Calculation"],
+            ["Max Allowed Risk (2% of Capital)", "=A1*0.02"],
+            [
+                "Entry Price (₹)",
+                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Ready_For_Breakout!B:B, Ready_For_Breakout!C:C), "Stock Not Found")',
+            ],
+            [
+                "Stop Loss (₹)",
+                '=IFERROR(XLOOKUP(UPPER(TRIM(A2)), Ready_For_Breakout!B:B, Ready_For_Breakout!D:D), "Stock Not Found")',
+            ],
+            ["Risk Per Share (₹)", '=IF(ISNUMBER(B6), B6-B7, "-")'],
+            [
+                "🎯 BUY POSITION SIZE (QUANTITY)",
+                '=IF(AND(ISNUMBER(B8), B8>0), INT(B5/B8), "Invalid Entry/SL")',
+            ],
+            [
+                "Total Investment Amount Needed (₹)",
+                '=IF(ISNUMBER(B9), B9*B6, "-")',
+            ],
+            [
+                "Actual Risk Amount (₹)",
+                '=IF(ISNUMBER(B9), B9*B8, "-")',
+            ],
+        ]
+
+        ws.update(
+            values=layout, range_name="A1", value_input_option="USER_ENTERED"
+        )
+        print("✅ Position Sizing Tab refreshed!", flush=True)
+    except Exception as e:
+        print(f"Sheet Error [Position_Sizing]: {str(e)}", flush=True)
 
 
 # ===== MAIN RUNNER =====
@@ -174,21 +211,18 @@ for stock in stocks:
             stock_df.columns = stock_df.columns.get_level_values(0)
 
         if not stock_df.empty:
-            # Step 1 Check
             is_step1_valid, spike_date, _ = check_volume_and_spike_day_high(stock_df)
 
             if is_step1_valid:
                 view_chart_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "📈 View Chart")'
-                stock_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol_clean}", "{symbol_clean}")'
 
                 step1_results.append({
                     "Volume_Spike_Date": spike_date,
-                    "Stock": stock_link,
+                    "Stock": symbol_clean,
                     "Current_Close": round(stock_df.iloc[-1]["Close"], 2),
                     "View_Chart": view_chart_link,
                 })
 
-                # Step 2 Check (Filter from Step 1)
                 breakout_res = check_ready_for_breakout(stock_df, symbol_clean, spike_date)
                 if breakout_res:
                     step2_results.append(breakout_res)
@@ -196,10 +230,11 @@ for stock in stocks:
     except Exception:
         pass
 
-# Upload Step 1 Data to [Volume_Breakout_Watchlist]
+# Upload Step 1 Data (Sorted Latest Date First)
 ws_vol_filtered.clear()
 if step1_results:
     df_step1 = pd.DataFrame(step1_results)
+    df_step1 = df_step1.sort_values(by="Volume_Spike_Date", ascending=False).reset_index(drop=True)
     json_s1 = json.loads(df_step1.to_json(orient="split"))
     ws_vol_filtered.update(
         values=[json_s1["columns"]] + json_s1["data"],
@@ -209,10 +244,11 @@ if step1_results:
 else:
     ws_vol_filtered.update(values=[["No Volume Breakout Candidates"]], range_name="A1")
 
-# Upload Step 2 Data to [Ready_For_Breakout]
+# Upload Step 2 Data (Sorted Latest Date First)
 ws_ready_for_breakout.clear()
 if step2_results:
     df_step2 = pd.DataFrame(step2_results)
+    df_step2 = df_step2.sort_values(by="Date", ascending=False).reset_index(drop=True)
     json_s2 = json.loads(df_step2.to_json(orient="split"))
     ws_ready_for_breakout.update(
         values=[json_s2["columns"]] + json_s2["data"],
@@ -222,4 +258,6 @@ if step2_results:
     print(f"✅ Filtered {len(step1_results)} stocks in Step 1, {len(step2_results)} stocks in Ready_For_Breakout!")
 else:
     ws_ready_for_breakout.update(values=[["No Ready For Breakout Candidates"]], range_name="A1")
-    
+
+# Position Sizing Tab Refresh
+setup_position_sizing_tab(ws_pos_sizing)
