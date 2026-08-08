@@ -9,17 +9,17 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: DOWNWARD VOLUME TRENDLINE (VCP) + EXACT PULLBACK SL ENGINE ===", flush=True)
+print("=== CTD SNIPER: STRICT VCP VOLUME SLOPE & PULLBACK SL ENGINE ===", flush=True)
 
-# ===== CONFIGURATION =====
-DEFAULT_CAPITAL = 100000.0         # Agar A1 khali ho toh fallback capital
-DEFAULT_RISK_PCT = 1.0            # 1% Risk Per Trade
+# ===== CONFIGURATION (STRICT FILTERS) =====
+DEFAULT_CAPITAL = 100000.0         
+DEFAULT_RISK_PCT = 1.0            
 
 MIN_VOLUME_UNITS = 100_000         # 1 Lakh Shares
 MIN_TURNOVER_VALUE = 5_000_000     # ₹50 Lakh Turnover
-ZIGZAG_DEPTH = 10                  # TradingView Default Depth
-VOL_SURGE_MULTIPLIER = 2.5         # Volume >= 2.5x of 20-Day Avg
-MIN_ROOM_TO_RES_PCT = 5.0          # 5% Overhead Gap
+ZIGZAG_DEPTH = 10                  
+VOL_SURGE_MULTIPLIER = 3.0         # TIGHTENED: 2.5x -> 3.0x Surge Required
+MIN_ROOM_TO_RES_PCT = 5.0          
 
 END_DATE = (datetime.now() + timedelta(days=1)).date()
 START_DATE = END_DATE - timedelta(days=365)
@@ -41,8 +41,7 @@ ws_vol_breakout = get_or_create_sheet("Volume_Breakout_Watchlist")
 ws_active_breakouts = get_or_create_sheet("Active_Breakouts")
 ws_position_sizing = get_or_create_sheet("Position_Sizing")
 
-
-# ===== 1. READ TOTAL CAPITAL FROM SHEET CELL A1 =====
+# ===== READ TOTAL CAPITAL FROM SHEET CELL A1 =====
 try:
     user_capital_val = ws_position_sizing.acell("A1").value
     if user_capital_val:
@@ -56,12 +55,10 @@ except Exception:
 MAX_RISK_AMOUNT = TOTAL_CAPITAL * (DEFAULT_RISK_PCT / 100.0)
 print(f"💰 Active Capital Read From Sheet (A1): ₹{TOTAL_CAPITAL:,.2f} | Max Risk Per Trade (1%): ₹{MAX_RISK_AMOUNT:,.2f}")
 
-
 def get_watchlist_stocks():
     stocks = ws_watchlist.col_values(1)
     stocks = [s.strip().upper() for s in stocks if s.strip() and s.strip().upper() not in ["STOCK", "SYMBOL", "NAME"]]
     return [s + ".NS" if not s.endswith(".NS") and not s.startswith("^") else s for s in stocks]
-
 
 # ===== TRADINGVIEW EXACT ZIGZAG ALGORITHM =====
 def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
@@ -117,7 +114,6 @@ def get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH):
 
     return final_highs, final_lows
 
-
 def evaluate_overhead_resistance(swing_highs):
     if not swing_highs:
         return False, None, None, 0.0
@@ -135,7 +131,6 @@ def evaluate_overhead_resistance(swing_highs):
         return True, h1_price, hprev_price, gap_pct
 
     return False, h1_price, hprev_price, gap_pct
-
 
 # ===== MAIN EXECUTION PIPELINE =====
 stocks = get_watchlist_stocks()
@@ -167,7 +162,6 @@ for stock in stocks:
         all_highs, all_lows = get_tradingview_exact_zigzag(df, depth=ZIGZAG_DEPTH)
         is_valid_res, entry_h1, res_hprev, gap_pct = evaluate_overhead_resistance(all_highs)
 
-        # H1 Date se lekar aaj tak ka Minimum Low = Exact Pullback Stop Loss
         if all_highs:
             h1_idx = all_highs[-1][0]
             pullback_sl = round(df.iloc[h1_idx:]["Low"].min(), 2)
@@ -202,28 +196,27 @@ for stock in stocks:
             if not sp_highs:
                 continue
 
-            # --- DOWNWARD VOLUME TRENDLINE (SLOPE) LOGIC ---
-            sp_h1_idx = sp_highs[-1][0]  # H1 Swing High Bar Index
-            
-            # Linear Regression for Volume Trendline (H1 se leke spike ke 1 din pehle tak)
+            # --- STRICT VOLUME CONTRACTION & SLOPE LOGIC ---
+            sp_h1_idx = sp_highs[-1][0]
             vol_pullback_series = df.iloc[sp_h1_idx : spike_idx]["Volume"].values
-            days_series = np.arange(len(vol_pullback_series))
 
             is_vol_trendline_down = False
+            
+            # Require minimum 3 days of pullback to validate contraction slope
             if len(vol_pullback_series) >= 3:
-                slope, _ = np.polyfit(days_series, vol_pullback_series, 1)
-                # Slope < 0 matlab H1 ke baad se Volume Trendline niche ki taraf sloped/contracting hai
-                if slope < 0:
-                    is_vol_trendline_down = True
-            else:
-                # Agar pullback period chhota (2-3 days) ho toh fallback dry check
-                prior_vols = df.iloc[spike_idx - 3 : spike_idx]["Volume"]
-                is_vol_trendline_down = (prior_vols <= 0.80 * prev_vol_avg).all()
+                # Normalize Volume by Avg to prevent scaling issues
+                norm_vols = vol_pullback_series / prev_vol_avg
+                days_series = np.arange(len(norm_vols))
+                slope, _ = np.polyfit(days_series, norm_vols, 1)
 
-            # Volume Spike Check (Standard Surge)
+                # Slope must be strictly negative AND last 2 days prior to spike must be Dry (< 70% of Avg)
+                prior_2_vols = df.iloc[spike_idx - 2 : spike_idx]["Volume"]
+                if slope < -0.02 and (prior_2_vols <= 0.70 * prev_vol_avg).all():
+                    is_vol_trendline_down = True
+
+            # Volume Surge Check (3x Volume Surge)
             is_volume_surge = prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg)
 
-            # Combined Validation: Downward Volume Trendline + Strong Spike
             if is_vol_trendline_down and is_volume_surge:
                 sp_valid, sp_h1, sp_hprev, sp_gap_pct = evaluate_overhead_resistance(sp_highs)
 
@@ -288,7 +281,6 @@ for stock in stocks:
     except Exception:
         pass
 
-
 # ===== UPLOAD DATA TO GOOGLE SHEETS =====
 ws_zigzag_filtered.clear()
 if sheet1_data:
@@ -308,7 +300,7 @@ if sheet3_data:
     json_s3 = json.loads(df_s3.to_json(orient="split"))
     ws_active_breakouts.update(values=[json_s3["columns"]] + json_s3["data"], range_name="A1", value_input_option="USER_ENTERED")
 
-# Position_Sizing Tab Data Upload Starting from Row 4 (Preserving A1, A2 Header Zone)
+# Position_Sizing Tab Data Upload
 if position_sizing_data:
     ws_position_sizing.batch_clear(["A4:Z500"])
     headers = [["Spike_Date", "Stock", "Status", "Entry_Price_H1", "Stop_Loss", "Risk_Per_Share", "Qty_To_Buy", "Total_Investment", "Max_Risk_1%", "View_Chart"]]
@@ -318,8 +310,8 @@ if position_sizing_data:
     json_ps = json.loads(df_ps.to_json(orient="split"))
     
     ws_position_sizing.update(values=json_ps["data"], range_name="A4", value_input_option="USER_ENTERED")
-    print("✅ All Sheets Updated Successfully with Volume Slope & Pullback SL!", flush=True)
+    print("✅ Strict Filter Applied! Excess Stocks Filtered Out.", flush=True)
 else:
     ws_position_sizing.batch_clear(["A4:Z500"])
     ws_position_sizing.update(values=[["No Active Candidates Found"]], range_name="A4")
-    
+            
