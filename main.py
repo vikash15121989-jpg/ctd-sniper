@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== CTD SNIPER: VOLUME DRYNESS + EXACT PULLBACK SL + DYNAMIC POSITION SIZING ENGINE ===", flush=True)
+print("=== CTD SNIPER: DOWNWARD VOLUME TRENDLINE (VCP) + EXACT PULLBACK SL ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 DEFAULT_CAPITAL = 100000.0         # Agar A1 khali ho toh fallback capital
@@ -185,7 +185,7 @@ for stock in stocks:
                 "View_Chart": view_chart_link
             })
 
-        # Scan Last 10 Days For 1-Day Before Volume Spike
+        # Scan Last 10 Days For Volume Spike
         last_10_df = df.iloc[-10:]
 
         for idx, row in last_10_df.iterrows():
@@ -196,27 +196,41 @@ for stock in stocks:
             prev_vol_avg = df.iloc[spike_idx - 1]["Vol_Avg20"]
             current_vol = row["Volume"]
 
-            # 1. VOLUME DRYNESS CHECK: Spike se pehle ke 5 din mein kam se kam 3 din Volume <= 70% of 20-Day Avg
-            prior_5_days_vol = df.iloc[spike_idx - 5 : spike_idx]["Volume"]
-            is_volume_dry = (prior_5_days_vol <= 0.70 * prev_vol_avg).sum() >= 3
+            df_until_spike = df.iloc[: spike_idx + 1]
+            sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
 
-            # 2. VOLUME SURGE CHECK: Spike wale din Volume >= 2.5x of 20-Day Avg
+            if not sp_highs:
+                continue
+
+            # --- DOWNWARD VOLUME TRENDLINE (SLOPE) LOGIC ---
+            sp_h1_idx = sp_highs[-1][0]  # H1 Swing High Bar Index
+            
+            # Linear Regression for Volume Trendline (H1 se leke spike ke 1 din pehle tak)
+            vol_pullback_series = df.iloc[sp_h1_idx : spike_idx]["Volume"].values
+            days_series = np.arange(len(vol_pullback_series))
+
+            is_vol_trendline_down = False
+            if len(vol_pullback_series) >= 3:
+                slope, _ = np.polyfit(days_series, vol_pullback_series, 1)
+                # Slope < 0 matlab H1 ke baad se Volume Trendline niche ki taraf sloped/contracting hai
+                if slope < 0:
+                    is_vol_trendline_down = True
+            else:
+                # Agar pullback period chhota (2-3 days) ho toh fallback dry check
+                prior_vols = df.iloc[spike_idx - 3 : spike_idx]["Volume"]
+                is_vol_trendline_down = (prior_vols <= 0.80 * prev_vol_avg).all()
+
+            # Volume Spike Check (Standard Surge)
             is_volume_surge = prev_vol_avg > 0 and current_vol >= (VOL_SURGE_MULTIPLIER * prev_vol_avg)
 
-            if is_volume_dry and is_volume_surge:
-                df_until_spike = df.iloc[: spike_idx + 1]
-                sp_highs, sp_lows = get_tradingview_exact_zigzag(df_until_spike, depth=ZIGZAG_DEPTH)
-
-                if not sp_highs:
-                    continue
-
+            # Combined Validation: Downward Volume Trendline + Strong Spike
+            if is_vol_trendline_down and is_volume_surge:
                 sp_valid, sp_h1, sp_hprev, sp_gap_pct = evaluate_overhead_resistance(sp_highs)
 
                 if sp_valid and row["High"] < sp_h1:
                     spike_date = idx.strftime("%Y-%m-%d")
 
                     # EXACT STOP LOSS: H1 Banne Ke Baad Ka Pullback Low
-                    sp_h1_idx = sp_highs[-1][0]
                     exact_stop_loss = round(df.iloc[sp_h1_idx : spike_idx + 1]["Low"].min(), 2)
 
                     sheet2_data.append({
@@ -304,7 +318,7 @@ if position_sizing_data:
     json_ps = json.loads(df_ps.to_json(orient="split"))
     
     ws_position_sizing.update(values=json_ps["data"], range_name="A4", value_input_option="USER_ENTERED")
-    print("✅ All Sheets Updated Successfully with Volume Dryness & Pullback SL!", flush=True)
+    print("✅ All Sheets Updated Successfully with Volume Slope & Pullback SL!", flush=True)
 else:
     ws_position_sizing.batch_clear(["A4:Z500"])
     ws_position_sizing.update(values=[["No Active Candidates Found"]], range_name="A4")
