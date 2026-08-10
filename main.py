@@ -1,22 +1,24 @@
-import os
 import json
+import os
 import warnings
-import pandas as pd
-import numpy as np
-import yfinance as yf
 from datetime import datetime, timedelta
 import gspread
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== WEEKLY BULLISH + DRY VOLUME RETEST SCANNER & BACKTEST ===", flush=True)
+print("=== WEEKLY MOTHER CANDLE DRY VOLUME BREAKOUT BACKTEST ===", flush=True)
 
-# CONFIGURATION
-MIN_TURNOVER = 20_000_000  # Min ₹2 Crore Turnover
+# ===== CONFIGURATION =====
+MIN_TURNOVER = 20_000_000   # ₹2 Crore Daily Trading Value
+MAX_HOLDING_DAYS = 60       # Positional Holding up to 60 Trading Days
+
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
 
-# 1. READ WATCHLIST FROM GOOGLE SHEET
+# ===== 1. FETCH WATCHLIST FROM GOOGLE SHEET =====
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -33,101 +35,117 @@ try:
             STOCKS.append(clean_s)
 
     STOCKS = sorted(list(set(STOCKS)))
-    print(f"✅ Watchlist Loaded: {len(STOCKS)} Stocks", flush=True)
+    print(f"✅ Total Stocks Loaded: {len(STOCKS)}", flush=True)
 
 except Exception as e:
     print(f"❌ Error Reading Watchlist: {e}")
     exit(1)
 
 
-# 2. EXACT RETEST LOGIC ENGINE
-def run_custom_retest_strategy(df_daily):
-    # Resample to Weekly Data
-    df_weekly = df_daily.resample('W').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+# ===== 2. MOTHER CANDLE & DRY VOLUME BACKTEST ENGINE =====
+def backtest_mother_candle_breakout(df_daily):
+    trades = []
+    df_d = df_daily.copy()
+
+    # Calculate Daily Turnover
+    df_d['Turnover'] = df_d['Close'] * df_d['Volume']
+    df_d['Turnover_MA20'] = df_d['Turnover'].rolling(20).mean()
+
+    # Resample Daily to Weekly Data
+    df_w = df_d.resample('W').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
     }).dropna()
 
-    if len(df_weekly) < 30:
+    if len(df_w) < 30:
         return None
 
-    # Condition 1: Weekly Bullish Filter
-    df_weekly['W_SMA20'] = df_weekly['Close'].rolling(20).mean()
-    df_weekly['Weekly_Bullish'] = df_weekly['Close'] > df_weekly['W_SMA20']
+    # Weekly Metrics
+    df_w['Range'] = df_w['High'] - df_w['Low']
+    df_w['Range_MA10'] = df_w['Range'].rolling(10).mean()
+    df_w['Vol_MA10'] = df_w['Volume'].rolling(10).mean()
 
-    # Map Weekly Trend to Daily Data
-    df = df_daily.copy()
-    df['Weekly_Trend'] = df_weekly['Weekly_Bullish'].reindex(df.index, method='ffill')
+    # 1. Mother Candle Identification Condition (Green + High Range + High Volume)
+    df_w['Is_Mother_Candle'] = (df_w['Close'] > df_w['Open']) & \
+                               (df_w['Range'] > df_w['Range_MA10'] * 1.3) & \
+                               (df_w['Volume'] > df_w['Vol_MA10'] * 1.5)
 
-    # Daily Indicators
-    df['Turnover'] = df['Close'] * df['Volume']
-    df['Turnover_MA20'] = df['Turnover'].rolling(20).mean()
-    df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-    
-    # Expansion Day: Green Candle with High Volume (>1.5x Avg Vol)
-    df['High_Vol_Expansion'] = (df['Close'] > df['Open']) & (df['Volume'] > df['Vol_MA20'] * 1.5)
+    n_d = len(df_d)
+    n_w = len(df_w)
 
-    # Dry Volume Day: Volume < 60% of Avg Vol
-    df['Is_Dry_Volume'] = df['Volume'] < (df['Vol_MA20'] * 0.60)
+    for w_idx in range(15, n_w - 8):
+        if df_w['Is_Mother_Candle'].iloc[w_idx]:
+            mother_high = df_w['High'].iloc[w_idx]
+            mother_low = df_w['Low'].iloc[w_idx]
+            mother_vol = df_w['Volume'].iloc[w_idx]
+            mother_date_end = df_w.index[w_idx]
 
-    # Reversal Bullish Candle (Green Close)
-    df['Is_Bullish_Candle'] = df['Close'] > df['Open']
+            # 2. Check subsequent 1-3 weeks for Volume Dry Phase
+            dry_phase_valid = False
+            min_dry_vol = float('inf')
 
-    trades = []
-    n = len(df)
-    i = 200
+            for k in range(1, 4):
+                if w_idx + k < n_w:
+                    next_vol = df_w['Volume'].iloc[w_idx + k]
+                    next_high = df_w['High'].iloc[w_idx + k]
+                    next_low = df_w['Low'].iloc[w_idx + k]
 
-    while i < n - 30:
-        # Step 1: Weekly Trend must be Bullish
-        if df['Weekly_Trend'].iloc[i] and df['Turnover_MA20'].iloc[i] >= MIN_TURNOVER:
-            
-            # Step 2: Check if High-Volume Expansion occurred in last 10 days
-            expansion_window = df.iloc[i-10 : i]
-            if expansion_window['High_Vol_Expansion'].any():
-                
-                # High Volume Candle Reference Level (Support Zone)
-                exp_idx = expansion_window[expansion_window['High_Vol_Expansion']].index[-1]
-                support_level = df.loc[exp_idx, 'Low']
+                    # Price inside Mother Candle Range & Volume Squeezed (<50% of Mother Vol)
+                    if next_vol < (mother_vol * 0.50) and next_high <= mother_high * 1.02 and next_low >= mother_low * 0.98:
+                        dry_phase_valid = True
+                        if next_vol < min_dry_vol:
+                            min_dry_vol = next_vol
 
-                # Step 3: Dry Volume Retest Check
-                current_close = df['Close'].iloc[i]
-                current_low = df['Low'].iloc[i]
-                is_dry = df['Is_Dry_Volume'].iloc[i]
-                is_bullish = df['Is_Bullish_Candle'].iloc[i]
+            if dry_phase_valid:
+                # 3. Switch to Daily Chart post Mother Candle
+                daily_sub = df_d[df_d.index > mother_date_end]
 
-                # Price near Support (within 2% range above Support)
-                near_support = (current_low >= support_level * 0.98) and (current_close <= support_level * 1.03)
+                if len(daily_sub) < 10:
+                    continue
 
-                # Step 4: Final Trigger Condition
-                if is_dry and near_support and is_bullish:
-                    entry_price = df['Close'].iloc[i]
-                    
-                    # Stop-loss = Lowest Point of Retest/Pullback Phase
-                    stop_loss = df['Low'].iloc[i-3 : i+1].min()
-                    risk = entry_price - stop_loss
+                for d_i in range(1, min(40, len(daily_sub) - MAX_HOLDING_DAYS)):
+                    curr_row = daily_sub.iloc[d_i]
+                    prev_row = daily_sub.iloc[d_i - 1]
 
-                    if risk > 0 and (risk / entry_price) <= 0.035: # Max 3.5% Risk Cap
-                        future_df = df.iloc[i + 1 : i + 1 + 30]
+                    # Watchlist Condition: Daily Volume starts expanding above dry volume level
+                    vol_expanding = curr_row['Volume'] > (min_dry_vol / 5.0)
 
-                        win = False
-                        exit_price = entry_price
-                        trail_sl = stop_loss
+                    # Trigger: Daily Close breaks Weekly Mother Candle High
+                    if vol_expanding and curr_row['Close'] > mother_high and prev_row['Close'] <= mother_high:
+                        
+                        # Liquidity Filter Check
+                        if curr_row['Turnover_MA20'] < MIN_TURNOVER:
+                            break
 
-                        for idx, row in future_df.iterrows():
-                            # Trail Stop Loss with EMA20 once trade moves 1.5R in profit
-                            if row['Close'] > entry_price + (risk * 1.5):
-                                trail_sl = max(trail_sl, row['Low'])
+                        entry_price = curr_row['Close']
+                        
+                        # Stop Loss = Lowest point of Mother Candle Range
+                        stop_loss = mother_low
+                        risk = entry_price - stop_loss
 
-                            if row['Low'] <= trail_sl:
-                                exit_price = trail_sl
-                                win = exit_price > entry_price
-                                break
+                        if risk > 0 and (risk / entry_price) <= 0.08: # Max 8% Risk Cap
+                            future_df = daily_sub.iloc[d_i + 1 : d_i + 1 + MAX_HOLDING_DAYS]
 
-                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                        trades.append({"Win": win, "PnL_%": pnl_pct})
+                            win = False
+                            exit_price = entry_price
+                            trail_sl = stop_loss
 
-                        i += 5 # Skip few days to avoid duplicate signals
-                        continue
-        i += 1
+                            for _, f_row in future_df.iterrows():
+                                # Trailing Stop Loss once price moves > 1.5R in profit
+                                if f_row['Close'] > entry_price + (risk * 1.5):
+                                    trail_sl = max(trail_sl, f_row['Low'])
+
+                                if f_row['Low'] <= trail_sl:
+                                    exit_price = trail_sl
+                                    win = exit_price > entry_price
+                                    break
+
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            trades.append({"Win": win, "PnL_%": pnl_pct})
+                            break # Move to next mother candle event
 
     if not trades:
         return None
@@ -151,13 +169,13 @@ def run_custom_retest_strategy(df_daily):
     }
 
 
-# 3. RUN TESTING
+# ===== 3. EXECUTE BACKTEST =====
 all_trades = 0
 all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Backtest on Exact Setup...", flush=True)
+print("\nRunning Mother Candle Dry Volume Breakout Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -168,7 +186,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 200:
             continue
 
-        res = run_custom_retest_strategy(df)
+        res = backtest_mother_candle_breakout(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -182,12 +200,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: WEEKLY BULLISH + DAILY DRY VOLUME RETEST")
+    print("🏆 RESULTS: WEEKLY MOTHER CANDLE DRY VOLUME BREAKOUT")
     print("==================================================================")
-    print(f"Total Trades Executed           : {all_trades}")
+    print(f"Total Quality Trades Executed : {all_trades}")
     print(f"Average Win-Rate                : {round(avg_winrate, 2)}%")
     print(f"Profit Factor                   : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the exact criteria.")
+    print("\nNo mother candle trades met the exact criteria.")
     
