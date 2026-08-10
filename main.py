@@ -9,14 +9,14 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== DAILY MULTI-RESISTANCE (BUFFERED) MAX RESISTANCE BREAKOUT BACKTEST ===", flush=True)
+print("=== WYCKOFF ACCUMULATION -> MARKUP MOTHER CANDLE DRY VOLUME BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
-MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Turnover
-MAX_HOLDING_DAYS = 40             # Positional Holding up to 40 Trading Days
+MIN_DAILY_TURNOVER = 50_000_000   # Min ₹5 Crore Daily Liquidity
+MAX_HOLDING_DAYS = 40             # Positional Holding Period up to 40 Days
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
+START_DATE = END_DATE - timedelta(days=1095) # 3 Years Historical Data
 
 # ===== 1. READ WATCHLIST FROM GOOGLE SHEET =====
 try:
@@ -43,38 +43,39 @@ except Exception as e:
 
 
 # ===== 2. STRATEGY ENGINE =====
-def backtest_buffered_resistance_setup(df_daily):
+def backtest_wyckoff_markup_squeeze(df_daily):
     trades = []
     df = df_daily.copy()
 
-    # Calculate Daily Indicators
+    # Calculate Moving Averages & Volume Indicators
     df['Turnover'] = df['Close'] * df['Volume']
     df['Turnover_MA20'] = df['Turnover'].rolling(20).mean()
     df['SMA20'] = df['Close'].rolling(20).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
-    df['Vol_Max10'] = df['Volume'].shift(1).rolling(10).max()
 
     n = len(df)
-    i = 100 # Start after sufficient historical data
+    i = 80 # Warmup window for Accumulation & Moving Averages
 
     while i < n - MAX_HOLDING_DAYS:
         # Liquidity Check
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
             
-            # Step 1: Detect Multi-Resistance with 1.5% Buffer
-            recent_window = df.iloc[i-60 : i]
-            max_resistance_price = recent_window['High'].max()
-            
-            # Touchpoints within 1.5% buffer of peak high
-            touchpoints = (recent_window['High'] >= max_resistance_price * 0.985).sum()
+            # Step 1: Wyckoff Accumulation Check (Past 40-60 days Volatility Squeeze / Range)
+            past_accum = df.iloc[i-50 : i-10]
+            accum_high = past_accum['High'].max()
+            accum_low = past_accum['Low'].min()
+            accum_range_pct = (accum_high - accum_low) / accum_low
 
-            if touchpoints >= 2: # At least 2 touches in 1.5% buffer band
+            # Accumulation Range should be relatively tight (<= 25% price height over 40 days)
+            if accum_range_pct <= 0.25:
                 
-                # Step 2: Proximity to 20 SMA (Price within 3% of 20 SMA)
+                # Step 2: Markup Phase Confirmation (Stock trading above 20 SMA, 50 EMA & breaking accum high)
                 curr_close = df['Close'].iloc[i]
                 sma20_val = df['SMA20'].iloc[i]
+                ema50_val = df['EMA50'].iloc[i]
 
-                if abs(curr_close - sma20_val) / sma20_val <= 0.03:
+                if curr_close > sma20_val and curr_close > ema50_val and curr_close >= accum_high * 0.95:
                     
                     # Step 3: High Volume Mother Candle near 20 MA
                     curr_vol = df['Volume'].iloc[i]
@@ -82,54 +83,62 @@ def backtest_buffered_resistance_setup(df_daily):
                     is_green = df['Close'].iloc[i] > df['Open'].iloc[i]
 
                     if is_green and curr_vol >= avg_vol * 1.5:
+                        mother_high = df['High'].iloc[i]
                         mother_vol = curr_vol
+                        mother_low = df['Low'].iloc[i]
 
-                        # Lookahead 2-6 days for Squeeze + Low Vol Green Candle + Volume Surge
-                        for d in range(1, 6):
+                        # Lookahead 1-4 days for Dry Volume (< 60% of Mother Candle) + Breakout
+                        for d in range(1, 5):
                             if i + d < n:
                                 dry_vol = df['Volume'].iloc[i + d]
-                                is_low_vol_green = (df['Close'].iloc[i + d] > df['Open'].iloc[i + d]) and (dry_vol < mother_vol * 0.50)
 
-                                # Step 4 & 5: Check for Low Vol Green Candle followed by High Volume Surge (> 10-day Max Vol)
-                                if is_low_vol_green and (i + d + 1 < n):
-                                    surge_day = i + d + 1
-                                    surge_vol = df['Volume'].iloc[surge_day]
-                                    vol_max_10 = df['Vol_Max10'].iloc[surge_day]
+                                # Step 4: Volume Drop Condition (< 60% of Mother Candle Volume)
+                                if dry_vol < mother_vol * 0.60:
+                                    
+                                    # Look for Entry Trigger: Price Closing above Mother Candle High
+                                    for entry_d in range(d + 1, d + 5):
+                                        if i + entry_d < n:
+                                            trig_close = df['Close'].iloc[i + entry_d]
+                                            prev_close = df['Close'].iloc[i + entry_d - 1]
 
-                                    if surge_vol > vol_max_10:
-                                        
-                                        # Step 6: Buy directly on Breakout of MAX Resistance Price
-                                        surge_close = df['Close'].iloc[surge_day]
+                                            if trig_close > mother_high and prev_close <= mother_high:
+                                                entry_price = trig_close
+                                                squeeze_low = df['Low'].iloc[i : i + entry_d].min()
+                                                stop_loss = squeeze_low
+                                                risk = entry_price - stop_loss
 
-                                        if surge_close >= max_resistance_price:
-                                            entry_price = surge_close
-                                            squeeze_low = df['Low'].iloc[i : surge_day].min()
-                                            stop_loss = squeeze_low
-                                            risk = entry_price - stop_loss
+                                                # Risk Cap (2% to 8% max risk per trade)
+                                                if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
+                                                    target_price = entry_price + (risk * 2.0) # 1:2 RR Target
+                                                    future_df = df.iloc[i + entry_d + 1 : i + entry_d + 1 + MAX_HOLDING_DAYS]
 
-                                            # Risk Filter (Max 8% Risk Cap)
-                                            if risk > 0 and (risk / entry_price) <= 0.08:
-                                                future_df = df.iloc[surge_day + 1 : surge_day + 1 + MAX_HOLDING_DAYS]
+                                                    win = False
+                                                    exit_price = entry_price
 
-                                                win = False
-                                                exit_price = entry_price
-                                                trail_sl = stop_loss
+                                                    for _, f_row in future_df.iterrows():
+                                                        # Hit Target
+                                                        if f_row['High'] >= target_price:
+                                                            exit_price = target_price
+                                                            win = True
+                                                            break
+                                                        # Hit Stop Loss
+                                                        if f_row['Low'] <= stop_loss:
+                                                            exit_price = stop_loss
+                                                            win = False
+                                                            break
+                                                        # Exit on 20 SMA Closing Breakdown
+                                                        if f_row['Close'] < f_row['SMA20']:
+                                                            exit_price = f_row['Close']
+                                                            win = exit_price > entry_price
+                                                            break
 
-                                                for _, f_row in future_df.iterrows():
-                                                    # Trailing Stop Loss when trade moves > 1.5R in profit
-                                                    if f_row['Close'] > entry_price + (risk * 1.5):
-                                                        trail_sl = max(trail_sl, f_row['Low'])
+                                                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                                                    trades.append({"Win": win, "PnL_%": pnl_pct})
 
-                                                    if f_row['Low'] <= trail_sl:
-                                                        exit_price = trail_sl
-                                                        win = exit_price > entry_price
-                                                        break
-
-                                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                                                trades.append({"Win": win, "PnL_%": pnl_pct})
-
-                                                i = surge_day + 5 # Move index forward
-                                                break
+                                                    i += entry_d + 5 # Fast-forward index
+                                                    break
+                                            break
+                                    break
         i += 1
 
     if not trades:
@@ -160,7 +169,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Buffered Resistance Engine...", flush=True)
+print("\nRunning Wyckoff Accumulation -> Markup Squeeze Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -168,10 +177,10 @@ for stock in STOCKS:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 150:
             continue
 
-        res = backtest_buffered_resistance_setup(df)
+        res = backtest_wyckoff_markup_squeeze(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -185,12 +194,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: DAILY MULTI-RESISTANCE (BUFFERED MAX PRICE)")
+    print("🏆 RESULTS: WYCKOFF ACCUMULATION + MOTHER CANDLE DRY SQUEEZE")
     print("==================================================================")
-    print(f"Total Quality Trades Executed   : {all_trades}")
-    print(f"Average Win-Rate                : {round(avg_winrate, 2)}%")
-    print(f"Profit Factor                   : {round(overall_pf, 2)}")
+    print(f"Total Executed Trades          : {all_trades}")
+    print(f"Average Win-Rate               : {round(avg_winrate, 2)}%")
+    print(f"Profit Factor                  : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the exact criteria.")
+    print("\nNo trades met the exact Wyckoff criteria.")
     
