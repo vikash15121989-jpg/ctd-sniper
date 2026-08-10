@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== WYCKOFF BREAKOUT RETEST (PULLBACK BUY) BACKTEST ===", flush=True)
+print("=== STRICT WYCKOFF RETEST (HIGH PROBABILITY) BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Liquidity
@@ -42,8 +42,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. STRATEGY ENGINE (BREAKOUT RETEST MODEL) =====
-def backtest_wyckoff_retest_engine(df_daily):
+# ===== 2. STRATEGY ENGINE (STRICT QUALITY RETEST) =====
+def backtest_strict_retest_engine(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -60,13 +60,13 @@ def backtest_wyckoff_retest_engine(df_daily):
     while i < n - MAX_HOLDING_DAYS:
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
             
-            # Step 1: Wyckoff Accumulation Check (30-50 days tight base)
+            # Step 1: Wyckoff Base (40 days tight accumulation)
             past_accum = df.iloc[i-40 : i-10]
             accum_high = past_accum['High'].max()
             accum_low = past_accum['Low'].min()
             accum_range_pct = (accum_high - accum_low) / accum_low
 
-            if accum_range_pct <= 0.25:
+            if accum_range_pct <= 0.22: # Tight range <= 22%
                 
                 # Step 2: High Volume Breakout Identification
                 breakout_window = df.iloc[i-10 : i]
@@ -74,32 +74,30 @@ def backtest_wyckoff_retest_engine(df_daily):
                 bo_vol = 0
 
                 for idx, bo_row in breakout_window.iterrows():
-                    if bo_row['Close'] > accum_high and bo_row['Volume'] >= df.loc[idx, 'Vol_SMA20'] * 1.5:
+                    # Strong breakout (> 1.8x Avg Volume)
+                    if bo_row['Close'] > accum_high and bo_row['Volume'] >= df.loc[idx, 'Vol_SMA20'] * 1.8:
                         has_breakout = True
                         bo_vol = bo_row['Volume']
                         break
 
                 if has_breakout:
-                    # Step 3: Retest / Pullback near Breakout Level or 20 SMA with Dry Volume
                     curr_close = df['Close'].iloc[i]
                     sma20_val = df['SMA20'].iloc[i]
                     curr_vol = df['Volume'].iloc[i]
 
-                    # Price pulled back near 20 SMA or Accumulation High
-                    is_retesting = abs(curr_close - accum_high) / accum_high <= 0.03 or abs(curr_close - sma20_val) / sma20_val <= 0.02
-                    is_dry_vol = curr_vol <= bo_vol * 0.50 # Volume dried up during pullback
-
-                    # Step 4: Bullish Reversal Signal on Retest
+                    # Step 3: Strict Retest at 20 SMA / Breakout Level + Ultra Dry Volume (< 35% of BO Vol)
+                    near_support = (abs(curr_close - accum_high) / accum_high <= 0.02) or (abs(curr_close - sma20_val) / sma20_val <= 0.015)
+                    ultra_dry_vol = curr_vol <= bo_vol * 0.35
                     is_green_reversal = df['Close'].iloc[i] > df['Open'].iloc[i]
 
-                    if is_retesting and is_dry_vol and is_green_reversal:
+                    if near_support and ultra_dry_vol and is_green_reversal:
                         entry_price = curr_close
-                        stop_loss = min(df['Low'].iloc[i-2 : i+1].min(), sma20_val * 0.98)
+                        stop_loss = min(df['Low'].iloc[i-2 : i+1].min(), sma20_val * 0.985)
                         risk = entry_price - stop_loss
 
-                        # Risk Cap Check (2% to 6% Risk)
-                        if risk > 0 and 0.02 <= (risk / entry_price) <= 0.06:
-                            target_price = entry_price + (risk * 2.5) # 1:2.5 Risk Reward Target
+                        # Strict Risk Cap (1.5% to 5% Max Risk)
+                        if risk > 0 and 0.015 <= (risk / entry_price) <= 0.05:
+                            target_price = entry_price + (risk * 2.0) # Fixed 1:2 Target
                             future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
 
                             win = False
@@ -116,7 +114,7 @@ def backtest_wyckoff_retest_engine(df_daily):
                                     exit_price = stop_loss
                                     win = False
                                     break
-                                # Trend Exit on 20 SMA Close Breakdown
+                                # Trend Breakdown on 20 SMA Close
                                 if f_row['Close'] < f_row['SMA20']:
                                     exit_price = f_row['Close']
                                     win = exit_price > entry_price
@@ -125,7 +123,7 @@ def backtest_wyckoff_retest_engine(df_daily):
                             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                             trades.append({"Win": win, "PnL_%": pnl_pct})
 
-                            i += 5 # Skip forward
+                            i += 6 # Skip ahead
                             continue
         i += 1
 
@@ -157,7 +155,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Wyckoff Retest Pullback Engine...", flush=True)
+print("\nRunning High-Probability Retest Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -168,7 +166,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 150:
             continue
 
-        res = backtest_wyckoff_retest_engine(df)
+        res = backtest_strict_retest_engine(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -182,12 +180,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: WYCKOFF BREAKOUT RETEST (PULLBACK BUY)")
+    print("🏆 RESULTS: STRICT HIGH-PROBABILITY WYCKOFF RETEST")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {all_trades}")
     print(f"Average Win-Rate               : {round(avg_winrate, 2)}%")
     print(f"Profit Factor                  : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the Retest criteria.")
+    print("\nNo trades met the Strict Retest criteria.")
     
