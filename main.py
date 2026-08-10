@@ -9,11 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== WEEKLY RESISTANCE + DAILY 20MA MOTHER CANDLE DRY VOLUME BACKTEST ===", flush=True)
+print("=== DAILY MULTI-RESISTANCE 20MA VOLUME EXPANSION BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Turnover
-MAX_HOLDING_DAYS = 40             # Holding period up to 40 trading days
+MAX_HOLDING_DAYS = 40             # Positional Holding up to 40 Trading Days
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
@@ -43,7 +43,7 @@ except Exception as e:
 
 
 # ===== 2. STRATEGY ENGINE =====
-def backtest_resistance_20ma_mother_candle(df_daily):
+def backtest_multi_resistance_setup(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -52,92 +52,87 @@ def backtest_resistance_20ma_mother_candle(df_daily):
     df['Turnover_MA20'] = df['Turnover'].rolling(20).mean()
     df['SMA20'] = df['Close'].rolling(20).mean()
     df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
-
-    # Resample Daily to Weekly to calculate Weekly Resistance
-    df_w = df.resample('W').agg({'High': 'max', 'Close': 'last'}).dropna()
-    if len(df_w) < 30:
-        return None
-
-    # Weekly Resistance = Rolling 30-week Maximum High
-    df_w['Weekly_Resistance'] = df_w['High'].shift(1).rolling(30).max()
-
-    # Map Weekly Resistance back to Daily Data
-    df['Weekly_Resistance'] = df_w['Weekly_Resistance'].reindex(df.index, method='ffill')
+    df['Vol_Max10'] = df['Volume'].shift(1).rolling(10).max()
+    df['Price_Max10'] = df['High'].shift(1).rolling(10).max()
 
     n = len(df)
-    i = 200 # Start after sufficient indicator warm-up
+    i = 100 # Start after sufficient historical data
 
     while i < n - MAX_HOLDING_DAYS:
-        # Check Liquidity
+        # Liquidity Check
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
-            weekly_res = df['Weekly_Resistance'].iloc[i]
+            
+            # Step 1: Detect Multi-Resistance (Check if Highs hit a common level at least 2-3 times in last 60 days)
+            recent_window = df.iloc[i-60 : i]
+            peak_high = recent_window['High'].max()
+            
+            # Count touchpoints within 1.5% of peak high
+            touchpoints = (recent_window['High'] >= peak_high * 0.985).sum()
 
-            # Step 1: Check if Price is near/approaching Weekly Resistance
-            if pd.notnull(weekly_res) and df['High'].iloc[i] >= weekly_res * 0.88:
+            if touchpoints >= 2: # At least Multi-Resistance (2+ touches)
                 
-                # Step 2: Check Daily 20 MA Proximity (Price within 3.5% of 20 SMA)
+                # Step 2: Proximity to 20 SMA (Price within 3% of 20 SMA)
                 curr_close = df['Close'].iloc[i]
                 sma20_val = df['SMA20'].iloc[i]
 
-                if abs(curr_close - sma20_val) / sma20_val <= 0.035:
+                if abs(curr_close - sma20_val) / sma20_val <= 0.03:
                     
-                    # Step 3: Identify High Volume Mother Candle near 20 MA
+                    # Step 3: High Volume Mother Candle near 20 MA
                     curr_vol = df['Volume'].iloc[i]
                     avg_vol = df['Vol_SMA20'].iloc[i]
                     is_green = df['Close'].iloc[i] > df['Open'].iloc[i]
-                    is_high_vol = curr_vol >= avg_vol * 1.5
 
-                    if is_green and is_high_vol:
-                        mother_high = df['High'].iloc[i]
-                        mother_low = df['Low'].iloc[i]
+                    if is_green and curr_vol >= avg_vol * 1.5:
                         mother_vol = curr_vol
+                        mother_low = df['Low'].iloc[i]
 
-                        # Step 4: Look for Dry Volume in the next 1-4 days
-                        dry_found = False
-                        dry_lowest_point = mother_low
-
-                        for d in range(1, 5):
+                        # Lookahead 2-6 days for Squeeze + Low Vol Green Candle + Volume Surge
+                        for d in range(1, 6):
                             if i + d < n:
-                                next_vol = df['Volume'].iloc[i + d]
-                                next_low = df['Low'].iloc[i + d]
-                                dry_lowest_point = min(dry_lowest_point, next_low)
+                                dry_vol = df['Volume'].iloc[i + d]
+                                is_low_vol_green = (df['Close'].iloc[i + d] > df['Open'].iloc[i + d]) and (dry_vol < mother_vol * 0.50)
 
-                                # Volume drops to < 60% of Mother Candle Volume
-                                if next_vol <= mother_vol * 0.60:
-                                    dry_found = True
+                                # Step 4 & 5: Check for Low Vol Green Candle followed by High Volume Surge (> 10-day Max Vol)
+                                if is_low_vol_green and (i + d + 1 < n):
+                                    surge_day = i + d + 1
+                                    surge_vol = df['Volume'].iloc[surge_day]
+                                    vol_max_10 = df['Vol_Max10'].iloc[surge_day]
 
-                                # Step 5: Trigger Entry when Price Breaks Mother Candle High
-                                trigger_close = df['Close'].iloc[i + d]
-                                prev_close = df['Close'].iloc[i + d - 1]
+                                    if surge_vol > vol_max_10:
+                                        
+                                        # Step 6: Breakout Entry above 10-Day Max High Price
+                                        trigger_price = df['Price_Max10'].iloc[surge_day]
+                                        surge_close = df['Close'].iloc[surge_day]
 
-                                if dry_found and trigger_close > mother_high and prev_close <= mother_high:
-                                    entry_price = trigger_close
-                                    stop_loss = dry_lowest_point
-                                    risk = entry_price - stop_loss
+                                        if surge_close > trigger_price:
+                                            entry_price = surge_close
+                                            squeeze_low = df['Low'].iloc[i : surge_day].min()
+                                            stop_loss = squeeze_low
+                                            risk = entry_price - stop_loss
 
-                                    # Risk Cap Check (Max 7% per trade)
-                                    if risk > 0 and (risk / entry_price) <= 0.07:
-                                        future_df = df.iloc[i + d + 1 : i + d + 1 + MAX_HOLDING_DAYS]
+                                            # Risk Filter (Max 8% Risk Cap)
+                                            if risk > 0 and (risk / entry_price) <= 0.08:
+                                                future_df = df.iloc[surge_day + 1 : surge_day + 1 + MAX_HOLDING_DAYS]
 
-                                        win = False
-                                        exit_price = entry_price
-                                        trail_sl = stop_loss
+                                                win = False
+                                                exit_price = entry_price
+                                                trail_sl = stop_loss
 
-                                        for _, f_row in future_df.iterrows():
-                                            # Trail Stop Loss once trade moves > 1.5R in profit
-                                            if f_row['Close'] > entry_price + (risk * 1.5):
-                                                trail_sl = max(trail_sl, f_row['Low'])
+                                                for _, f_row in future_df.iterrows():
+                                                    # Trailing Stop Loss when trade moves > 1.5R in profit
+                                                    if f_row['Close'] > entry_price + (risk * 1.5):
+                                                        trail_sl = max(trail_sl, f_row['Low'])
 
-                                            if f_row['Low'] <= trail_sl:
-                                                exit_price = trail_sl
-                                                win = exit_price > entry_price
+                                                    if f_row['Low'] <= trail_sl:
+                                                        exit_price = trail_sl
+                                                        win = exit_price > entry_price
+                                                        break
+
+                                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                                                trades.append({"Win": win, "PnL_%": pnl_pct})
+
+                                                i = surge_day + 5 # Move index forward
                                                 break
-
-                                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                                        trades.append({"Win": win, "PnL_%": pnl_pct})
-
-                                        i += d + 5 # Skip forward to prevent duplicate triggers
-                                        break
         i += 1
 
     if not trades:
@@ -168,7 +163,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Weekly Resistance + Daily 20MA Mother Candle Engine...", flush=True)
+print("\nRunning Multi-Resistance Volume Expansion Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -179,7 +174,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 200:
             continue
 
-        res = backtest_resistance_20ma_mother_candle(df)
+        res = backtest_multi_resistance_setup(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -193,7 +188,7 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: WEEKLY RESISTANCE + DAILY 20MA MOTHER CANDLE")
+    print("🏆 RESULTS: DAILY MULTI-RESISTANCE VOLUME EXPANSION")
     print("==================================================================")
     print(f"Total Quality Trades Executed   : {all_trades}")
     print(f"Average Win-Rate                : {round(avg_winrate, 2)}%")
@@ -201,4 +196,4 @@ if all_trades > 0:
     print("==================================================================")
 else:
     print("\nNo trades met the exact criteria.")
-    
+                                                
