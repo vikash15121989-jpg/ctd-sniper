@@ -9,16 +9,16 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== ANNA COULLING RETEST & CONFIRMATION VPA BACKTEST ===", flush=True)
+print("=== ANNA COULLING VPA BACKTEST (STRICT MIN TURNOVER ₹2 CRORE) ===", flush=True)
 
 # ===== CONFIGURATION =====
-RISK_REWARD_RATIO = 2.0  # 1:2 R:R
-MAX_HOLDING_DAYS = 20    # Holding limit
+MIN_TURNOVER_VALUE = 20_000_000   # Strictly ₹2 Crore Daily Turnover Filter
+MAX_HOLDING_DAYS = 30              # Max 30 Trading Days Holding
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=730)
+START_DATE = END_DATE - timedelta(days=1095) # 3 Years Historical Data
 
-# ===== 1. READ WATCHLIST =====
+# ===== 1. FETCH WATCHLIST FROM GOOGLE SHEET =====
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -35,17 +35,21 @@ try:
             STOCKS.append(clean_s)
 
     STOCKS = sorted(list(set(STOCKS)))
-    print(f"✅ Total Stocks Loaded: {len(STOCKS)}", flush=True)
+    print(f"✅ Total Stocks Loaded from Google Sheet: {len(STOCKS)}", flush=True)
 
 except Exception as e:
     print(f"❌ Error Reading Google Sheet: {e}")
     exit(1)
 
 
-# ===== 2. TRUE VPA RETEST BACKTEST ENGINE =====
-def backtest_vpa_retest(df):
+# ===== 2. LIQUIDITY + VPA RETEST ENGINE =====
+def backtest_liquid_vpa(df_daily):
     trades = []
-    df = df.copy()
+    df = df_daily.copy()
+
+    # Daily Turnover (Trading Value = Close * Volume)
+    df['Turnover'] = df['Close'] * df['Volume']
+    df['Turnover_MA20'] = df['Turnover'].rolling(20).mean()
 
     df['SMA_50'] = df['Close'].rolling(50).mean()
     df['SMA_200'] = df['Close'].rolling(200).mean()
@@ -53,47 +57,51 @@ def backtest_vpa_retest(df):
     df['Spread'] = df['High'] - df['Low']
     df['Spread_MA'] = df['Spread'].rolling(20).mean()
 
-    # Trend & Volume Conditions
+    # Filters: Liquid Stock (> ₹2 Cr) + Uptrend + High Volume Breakout
+    df['Is_Liquid'] = df['Turnover_MA20'] >= MIN_TURNOVER_VALUE
     df['In_Uptrend'] = (df['Close'] > df['SMA_50']) & (df['SMA_50'] > df['SMA_200'])
-    df['Is_Breakout_Bar'] = df['In_Uptrend'] & (df['Close'] > df['Open']) & \
-                            (df['Spread'] > df['Spread_MA'] * 1.3) & \
-                            (df['Volume'] > df['Vol_MA'] * 1.8)
+    
+    df['Is_Breakout'] = df['Is_Liquid'] & df['In_Uptrend'] & \
+                        (df['Close'] > df['Open']) & \
+                        (df['Spread'] > df['Spread_MA'] * 1.2) & \
+                        (df['Volume'] > df['Vol_MA'] * 1.8)
 
     n = len(df)
     i = 200
+
     while i < n - MAX_HOLDING_DAYS - 10:
-        if df['Is_Breakout_Bar'].iloc[i]:
+        if df['Is_Breakout'].iloc[i]:
             bo_high = df['High'].iloc[i]
             bo_low = df['Low'].iloc[i]
             bo_vol_ma = df['Vol_MA'].iloc[i]
 
-            # Retest Window: Next 2 to 8 Days
-            retest_found = False
+            entry_found = False
             entry_idx = -1
 
+            # Retest Phase (2 to 8 Days)
             for j in range(i + 1, min(i + 9, n - MAX_HOLDING_DAYS)):
-                current_low = df['Low'].iloc[j]
-                current_vol = df['Volume'].iloc[j]
+                c_low = df['Low'].iloc[j]
+                c_vol = df['Volume'].iloc[j]
 
-                # Retest Condition: Price drops near Breakout zone with Low Volume (< 75% of Vol_MA)
-                if (current_low <= bo_high * 1.01) and (current_low >= bo_low) and (current_vol < bo_vol_ma * 0.75):
-                    retest_found = True
+                # Low-Volume Retest Near Breakout Level
+                if (c_low <= bo_high * 1.015) and (c_low >= bo_low * 0.98) and (c_vol < bo_vol_ma * 0.75):
+                    entry_found = True
                     entry_idx = j
                     break
 
-            if retest_found and entry_idx != -1:
+            if entry_found and entry_idx != -1:
                 entry_price = df['Close'].iloc[entry_idx]
-                stop_loss = df['Low'].iloc[entry_idx - 2 : entry_idx + 1].min() # Retest Swing Low
+                stop_loss = df['Low'].iloc[entry_idx - 3 : entry_idx + 1].min()
                 risk = entry_price - stop_loss
 
-                if risk > 0 and (risk / entry_price) <= 0.05: # Max 5% Risk Cap
-                    target_price = entry_price + (risk * RISK_REWARD_RATIO)
+                if risk > 0 and (risk / entry_price) <= 0.05: # Max 5% Risk per trade
+                    target_price = entry_price + (risk * 2.0) # 1:2 Risk-Reward Target
                     future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
 
                     win = False
                     exit_price = entry_price
 
-                    for _, row in future_df.iterrows():
+                    for idx, row in future_df.iterrows():
                         if row['Low'] <= stop_loss:
                             exit_price = stop_loss
                             win = False
@@ -106,7 +114,6 @@ def backtest_vpa_retest(df):
                     pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                     trades.append({"Win": win, "PnL_%": pnl_pct})
 
-                # Skip ahead past retest window
                 i = entry_idx + 1
                 continue
         i += 1
@@ -132,13 +139,14 @@ def backtest_vpa_retest(df):
         "Profit_Factor": profit_factor
     }
 
+
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = 0
 all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Multi-Bar Retest & Low-Volume Confirmation Backtest...", flush=True)
+print("\nRunning Backtest on Liquid Stocks (> ₹2 Crore Turnover)...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -146,10 +154,10 @@ for stock in STOCKS:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 250:
+        if df.empty or len(df) < 200:
             continue
 
-        res = backtest_vpa_retest(df)
+        res = backtest_liquid_vpa(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -163,12 +171,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🎯 TRUE ANNA COULLING RETEST BACKTEST RESULTS")
+    print("🏆 BACKTEST RESULTS (STRICT MIN TURNOVER ≥ ₹2 CRORE)")
     print("==================================================================")
-    print(f"Total Quality Trades Executed : {all_trades}")
+    print(f"Total Liquid Trades Executed : {all_trades}")
     print(f"Average Win-Rate              : {round(avg_winrate, 2)}%")
     print(f"Profit Factor                 : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the strict Retest + Low Vol criteria.")
+    print("\nNo liquid trades met the criteria.")
     
