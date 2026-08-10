@@ -9,11 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== PURE WYCKOFF ACCUMULATION + SPRING + DRY SQUEEZE BACKTEST ===", flush=True)
+print("=== WYCKOFF BREAKOUT RETEST (PULLBACK BUY) BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
-MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Liquidity
-MAX_HOLDING_DAYS = 40             # Max Holding Limit (40 Days)
+MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Liquidity
+MAX_HOLDING_DAYS = 30             # Positional Holding Period
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
@@ -42,12 +42,12 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. STRATEGY ENGINE (NO NIFTY FILTER) =====
-def backtest_pure_wyckoff_engine(df_daily):
+# ===== 2. STRATEGY ENGINE (BREAKOUT RETEST MODEL) =====
+def backtest_wyckoff_retest_engine(df_daily):
     trades = []
     df = df_daily.copy()
 
-    # Calculate Indicators
+    # Indicators
     df['Turnover'] = df['Close'] * df['Volume']
     df['Turnover_MA20'] = df['Turnover'].rolling(20).mean()
     df['SMA20'] = df['Close'].rolling(20).mean()
@@ -58,79 +58,75 @@ def backtest_pure_wyckoff_engine(df_daily):
     i = 80
 
     while i < n - MAX_HOLDING_DAYS:
-        # Stock Liquidity Check Only
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
             
-            # Step 1: Wyckoff Accumulation Check (Tight 40-day consolidation)
-            past_accum = df.iloc[i-40 : i-5]
+            # Step 1: Wyckoff Accumulation Check (30-50 days tight base)
+            past_accum = df.iloc[i-40 : i-10]
             accum_high = past_accum['High'].max()
             accum_low = past_accum['Low'].min()
             accum_range_pct = (accum_high - accum_low) / accum_low
 
-            if accum_range_pct <= 0.25: # Range height <= 25%
+            if accum_range_pct <= 0.25:
                 
-                # Step 2: Spring Test Check (Support test followed by quick recovery)
-                spring_window = df.iloc[i-5 : i]
-                spring_tested = (spring_window['Low'] <= accum_low * 1.01).any()
+                # Step 2: High Volume Breakout Identification
+                breakout_window = df.iloc[i-10 : i]
+                has_breakout = False
+                bo_vol = 0
 
-                if spring_tested:
+                for idx, bo_row in breakout_window.iterrows():
+                    if bo_row['Close'] > accum_high and bo_row['Volume'] >= df.loc[idx, 'Vol_SMA20'] * 1.5:
+                        has_breakout = True
+                        bo_vol = bo_row['Volume']
+                        break
+
+                if has_breakout:
+                    # Step 3: Retest / Pullback near Breakout Level or 20 SMA with Dry Volume
                     curr_close = df['Close'].iloc[i]
                     sma20_val = df['SMA20'].iloc[i]
-                    ema50_val = df['EMA50'].iloc[i]
+                    curr_vol = df['Volume'].iloc[i]
 
-                    # Stock Price above 20 SMA & 50 EMA
-                    if curr_close > sma20_val and curr_close > ema50_val:
-                        curr_vol = df['Volume'].iloc[i]
-                        avg_vol = df['Vol_SMA20'].iloc[i]
-                        is_green = df['Close'].iloc[i] > df['Open'].iloc[i]
+                    # Price pulled back near 20 SMA or Accumulation High
+                    is_retesting = abs(curr_close - accum_high) / accum_high <= 0.03 or abs(curr_close - sma20_val) / sma20_val <= 0.02
+                    is_dry_vol = curr_vol <= bo_vol * 0.50 # Volume dried up during pullback
 
-                        # Step 3: High Volume Mother Candle
-                        if is_green and curr_vol >= avg_vol * 1.4:
-                            mother_high = df['High'].iloc[i]
-                            mother_vol = curr_vol
+                    # Step 4: Bullish Reversal Signal on Retest
+                    is_green_reversal = df['Close'].iloc[i] > df['Open'].iloc[i]
 
-                            # Step 4: Dry Volume Squeeze + Breakout Trigger
-                            for d in range(1, 5):
-                                if i + d < n:
-                                    dry_vol = df['Volume'].iloc[i + d]
+                    if is_retesting and is_dry_vol and is_green_reversal:
+                        entry_price = curr_close
+                        stop_loss = min(df['Low'].iloc[i-2 : i+1].min(), sma20_val * 0.98)
+                        risk = entry_price - stop_loss
 
-                                    if dry_vol <= mother_vol * 0.55: # Dry Volume <= 55%
-                                        for entry_d in range(d + 1, d + 5):
-                                            if i + entry_d < n:
-                                                trig_close = df['Close'].iloc[i + entry_d]
-                                                prev_close = df['Close'].iloc[i + entry_d - 1]
+                        # Risk Cap Check (2% to 6% Risk)
+                        if risk > 0 and 0.02 <= (risk / entry_price) <= 0.06:
+                            target_price = entry_price + (risk * 2.5) # 1:2.5 Risk Reward Target
+                            future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
 
-                                                if trig_close > mother_high and prev_close <= mother_high:
-                                                    entry_price = trig_close
-                                                    squeeze_low = df['Low'].iloc[i : i + entry_d].min()
-                                                    stop_loss = squeeze_low
-                                                    risk = entry_price - stop_loss
+                            win = False
+                            exit_price = entry_price
 
-                                                    # Strict Risk Filter (2% - 7% Risk)
-                                                    if risk > 0 and 0.02 <= (risk / entry_price) <= 0.07:
-                                                        future_df = df.iloc[i + entry_d + 1 : i + entry_d + 1 + MAX_HOLDING_DAYS]
-
-                                                        win = False
-                                                        exit_price = entry_price
-                                                        trail_sl = stop_loss
-
-                                                        for _, f_row in future_df.iterrows():
-                                                            # Dynamic Trailing TSL on 20 SMA when profit >= 1.5R
-                                                            if f_row['Close'] > entry_price + (risk * 1.5):
-                                                                trail_sl = max(trail_sl, f_row['SMA20'])
-
-                                                            if f_row['Low'] <= trail_sl:
-                                                                exit_price = trail_sl
-                                                                win = exit_price > entry_price
-                                                                break
-
-                                                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                                                        trades.append({"Win": win, "PnL_%": pnl_pct})
-
-                                                        i += entry_d + 5
-                                                        break
-                                            break
+                            for _, f_row in future_df.iterrows():
+                                # Target Hit
+                                if f_row['High'] >= target_price:
+                                    exit_price = target_price
+                                    win = True
                                     break
+                                # Stop Loss Hit
+                                if f_row['Low'] <= stop_loss:
+                                    exit_price = stop_loss
+                                    win = False
+                                    break
+                                # Trend Exit on 20 SMA Close Breakdown
+                                if f_row['Close'] < f_row['SMA20']:
+                                    exit_price = f_row['Close']
+                                    win = exit_price > entry_price
+                                    break
+
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            trades.append({"Win": win, "PnL_%": pnl_pct})
+
+                            i += 5 # Skip forward
+                            continue
         i += 1
 
     if not trades:
@@ -161,7 +157,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Pure Wyckoff Accumulation Engine...", flush=True)
+print("\nRunning Wyckoff Retest Pullback Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -172,7 +168,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 150:
             continue
 
-        res = backtest_pure_wyckoff_engine(df)
+        res = backtest_wyckoff_retest_engine(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -186,12 +182,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: PURE WYCKOFF ACCUMULATION + SPRING (NO INDEX FILTER)")
+    print("🏆 RESULTS: WYCKOFF BREAKOUT RETEST (PULLBACK BUY)")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {all_trades}")
     print(f"Average Win-Rate               : {round(avg_winrate, 2)}%")
     print(f"Profit Factor                  : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the exact Wyckoff criteria.")
+    print("\nNo trades met the Retest criteria.")
     
