@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== DAILY MULTI-RESISTANCE 20MA VOLUME EXPANSION BACKTEST ===", flush=True)
+print("=== DAILY MULTI-RESISTANCE (BUFFERED) MAX RESISTANCE BREAKOUT BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Turnover
@@ -43,7 +43,7 @@ except Exception as e:
 
 
 # ===== 2. STRATEGY ENGINE =====
-def backtest_multi_resistance_setup(df_daily):
+def backtest_buffered_resistance_setup(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -53,7 +53,6 @@ def backtest_multi_resistance_setup(df_daily):
     df['SMA20'] = df['Close'].rolling(20).mean()
     df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
     df['Vol_Max10'] = df['Volume'].shift(1).rolling(10).max()
-    df['Price_Max10'] = df['High'].shift(1).rolling(10).max()
 
     n = len(df)
     i = 100 # Start after sufficient historical data
@@ -62,14 +61,14 @@ def backtest_multi_resistance_setup(df_daily):
         # Liquidity Check
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
             
-            # Step 1: Detect Multi-Resistance (Check if Highs hit a common level at least 2-3 times in last 60 days)
+            # Step 1: Detect Multi-Resistance with 1.5% Buffer
             recent_window = df.iloc[i-60 : i]
-            peak_high = recent_window['High'].max()
+            max_resistance_price = recent_window['High'].max()
             
-            # Count touchpoints within 1.5% of peak high
-            touchpoints = (recent_window['High'] >= peak_high * 0.985).sum()
+            # Touchpoints within 1.5% buffer of peak high
+            touchpoints = (recent_window['High'] >= max_resistance_price * 0.985).sum()
 
-            if touchpoints >= 2: # At least Multi-Resistance (2+ touches)
+            if touchpoints >= 2: # At least 2 touches in 1.5% buffer band
                 
                 # Step 2: Proximity to 20 SMA (Price within 3% of 20 SMA)
                 curr_close = df['Close'].iloc[i]
@@ -84,7 +83,6 @@ def backtest_multi_resistance_setup(df_daily):
 
                     if is_green and curr_vol >= avg_vol * 1.5:
                         mother_vol = curr_vol
-                        mother_low = df['Low'].iloc[i]
 
                         # Lookahead 2-6 days for Squeeze + Low Vol Green Candle + Volume Surge
                         for d in range(1, 6):
@@ -100,11 +98,10 @@ def backtest_multi_resistance_setup(df_daily):
 
                                     if surge_vol > vol_max_10:
                                         
-                                        # Step 6: Breakout Entry above 10-Day Max High Price
-                                        trigger_price = df['Price_Max10'].iloc[surge_day]
+                                        # Step 6: Buy directly on Breakout of MAX Resistance Price
                                         surge_close = df['Close'].iloc[surge_day]
 
-                                        if surge_close > trigger_price:
+                                        if surge_close >= max_resistance_price:
                                             entry_price = surge_close
                                             squeeze_low = df['Low'].iloc[i : surge_day].min()
                                             stop_loss = squeeze_low
@@ -163,7 +160,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning Multi-Resistance Volume Expansion Engine...", flush=True)
+print("\nRunning Buffered Resistance Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -174,7 +171,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 200:
             continue
 
-        res = backtest_multi_resistance_setup(df)
+        res = backtest_buffered_resistance_setup(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -188,7 +185,7 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: DAILY MULTI-RESISTANCE VOLUME EXPANSION")
+    print("🏆 RESULTS: DAILY MULTI-RESISTANCE (BUFFERED MAX PRICE)")
     print("==================================================================")
     print(f"Total Quality Trades Executed   : {all_trades}")
     print(f"Average Win-Rate                : {round(avg_winrate, 2)}%")
@@ -196,4 +193,4 @@ if all_trades > 0:
     print("==================================================================")
 else:
     print("\nNo trades met the exact criteria.")
-                                                
+    
