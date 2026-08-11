@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V120.0: ZIGZAG SWING HIGH + HAMMER BREAKOUT ENGINE ===", flush=True)
+print("=== V122.0: RED HAMMER VOLUME BREAKDOWN BACKTEST ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
@@ -46,12 +46,11 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. ZIGZAG HAMMER BREAKOUT BACKTEST ENGINE =====
-def backtest_zigzag_hammer(df_daily):
+# ===== 2. RED HAMMER VOLUME COMPARISON ENGINE =====
+def backtest_red_hammer_volume_split(df_daily):
     trades = []
     df = df_daily.copy()
 
-    # Basic Indicators
     df['Turnover'] = df['Close'] * df['Volume']
     df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
     df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
@@ -60,55 +59,48 @@ def backtest_zigzag_hammer(df_daily):
     i = 30
 
     while i < n - MAX_HOLDING_DAYS:
-        # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Step 1: Find Swing High (Zigzag Peak in past 5-25 days)
+            # Step 1: Find Swing High Peak
             found_swing_high = False
             swing_high_idx = -1
             swing_high_price = 0.0
 
             for idx in range(i - 20, i - 2):
                 if idx < 5: continue
-                
-                # Local Peak (Zigzag High) Condition
                 is_local_max = df['High'].iloc[idx] == df['High'].iloc[idx - 5 : idx + 6].max()
                 if is_local_max:
                     found_swing_high = True
                     swing_high_idx = idx
                     swing_high_price = df['High'].iloc[idx]
 
-            # Step 2: Look for Hammer Candle in Pullback Phase
+            # Step 2: Check for RED HAMMER Candle
             if found_swing_high and (i - swing_high_idx >= 2):
                 h_open = df['Open'].iloc[i]
                 h_close = df['Close'].iloc[i]
                 h_high = df['High'].iloc[i]
                 h_low = df['Low'].iloc[i]
 
+                h_vol = df['Volume'].iloc[i]
+                h_vol_avg = df['Vol_Avg_20'].iloc[i]
+
                 body = abs(h_close - h_open)
                 upper_wick = h_high - max(h_open, h_close)
                 lower_wick = min(h_open, h_close) - h_low
 
-                # Candle Color
-                is_green_hammer = h_close >= h_open
                 is_red_hammer = h_close < h_open
-
-                # Precise Hammer Geometry Rule
                 is_hammer = (lower_wick >= 2.0 * max(body, 0.01)) and (upper_wick <= 0.6 * max(body, 0.01))
-
-                # Price should be in a pullback (lower than Swing High)
                 is_pullback = h_close < swing_high_price
 
-                if is_hammer and is_pullback:
-                    hammer_type = "GREEN" if is_green_hammer else "RED"
+                if is_red_hammer and is_hammer and is_pullback:
                     
-                    # Step 3: Find Max Price of last 10 days (prior to hammer)
-                    past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
+                    # Category Classification based on Volume
+                    vol_type = "HIGH_VOL_RED_HAMMER" if h_vol >= h_vol_avg else "LOW_VOL_RED_HAMMER"
 
-                    # Find Recent Min Low (for Stop Loss)
+                    past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
                     recent_min_low = df['Low'].iloc[swing_high_idx : i + 1].min()
 
-                    # Step 4: Check Breakout of Past 10-Day Max Price within next 10 days
+                    # Step 3: Check Breakout of Past 10-Day Max Price within next 10 days
                     entry_found = False
                     entry_idx = -1
                     entry_price = 0.0
@@ -118,16 +110,16 @@ def backtest_zigzag_hammer(df_daily):
                         if df['High'].iloc[k] > past_10d_max:
                             entry_found = True
                             entry_idx = k
-                            entry_price = past_10d_max # Stop-limit entry
+                            entry_price = past_10d_max
                             break
 
-                    # Step 5: Trade Execution & Exit Simulation
+                    # Step 4: Trade Execution & Exit Simulation
                     if entry_found and entry_idx < n - MAX_HOLDING_DAYS:
                         stop_loss = round(recent_min_low * 0.99, 2)
                         risk = entry_price - stop_loss
 
                         if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
-                            target_price = round(entry_price + (risk * 2.0), 2) # 1:2 RR
+                            target_price = round(entry_price + (risk * 2.0), 2) # 1:2 Risk-Reward
                             breakeven_trigger = entry_price + (risk * 1.0)
 
                             future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
@@ -136,7 +128,6 @@ def backtest_zigzag_hammer(df_daily):
                             curr_sl = stop_loss
 
                             for _, f_row in future_df.iterrows():
-                                # Shift SL to Breakeven at 1:1 R
                                 if f_row['High'] >= breakeven_trigger:
                                     curr_sl = max(curr_sl, entry_price)
 
@@ -156,12 +147,12 @@ def backtest_zigzag_hammer(df_daily):
 
                             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                             trades.append({
-                                "Hammer_Type": hammer_type,
+                                "Vol_Type": vol_type,
                                 "Win": win,
                                 "PnL_%": pnl_pct
                             })
 
-                            i = entry_idx + 6 # Jump forward
+                            i = entry_idx + 6
                             continue
         i += 1
 
@@ -174,7 +165,7 @@ def backtest_zigzag_hammer(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V120.0 Zigzag Hammer Engine Backtest...", flush=True)
+print("\nRunning V122.0 Red Hammer Volume Split Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -185,7 +176,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_zigzag_hammer(df)
+        df_res = backtest_red_hammer_volume_split(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -204,18 +195,18 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 OVERALL RESULTS: ZIGZAG SWING HIGH + HAMMER BREAKOUT")
+    print("🏆 OVERALL RESULTS: RED HAMMER STRATEGY")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {total_tr}")
     print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
     print(f"Overall Profit Factor          : {round(overall_pf, 2)}")
     print("==================================================================")
 
-    # Red vs Green Hammer Breakdown
-    print("\n📊 RED HAMMER vs GREEN HAMMER COMPARISON:")
+    # High Vol vs Low Vol Breakdown
+    print("\n📊 RED HAMMER VOLUME BREAKDOWN:")
     print("------------------------------------------------------------------")
-    for h_type in ['GREEN', 'RED']:
-        sub_df = df_all[df_all['Hammer_Type'] == h_type]
+    for v_type in ['HIGH_VOL_RED_HAMMER', 'LOW_VOL_RED_HAMMER']:
+        sub_df = df_all[df_all['Vol_Type'] == v_type]
         if not sub_df.empty:
             sub_tr = len(sub_df)
             sub_wins = sub_df[sub_df['Win'] == True]
@@ -226,9 +217,9 @@ if all_trades:
             sub_gl = abs(sub_losses['PnL_%'].sum())
             sub_pf = sub_gp / sub_gl if sub_gl > 0 else 999.0
 
-            print(f"🔴 {h_type} HAMMER -> Trades: {sub_tr} | Win-Rate: {round(sub_wr, 2)}% | Profit Factor: {round(sub_pf, 2)}")
+            print(f"🔹 {v_type} -> Trades: {sub_tr} | Win-Rate: {round(sub_wr, 2)}% | Profit Factor: {round(sub_pf, 2)}")
     print("==================================================================")
 
 else:
-    print("\nNo trades met the Zigzag Hammer criteria in the backtest period.")
+    print("\nNo trades met the criteria in the backtest period.")
     
