@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V122.0: RED HAMMER VOLUME BREAKDOWN BACKTEST ENGINE ===", flush=True)
+print("=== V123.0: HIGH-VOL RED HAMMER + EXPANSION BREAKOUT ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
@@ -46,8 +46,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. RED HAMMER VOLUME COMPARISON ENGINE =====
-def backtest_red_hammer_volume_split(df_daily):
+# ===== 2. HIGH-VOL RED HAMMER STRATEGY ENGINE =====
+def backtest_high_vol_red_hammer(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -74,7 +74,7 @@ def backtest_red_hammer_volume_split(df_daily):
                     swing_high_idx = idx
                     swing_high_price = df['High'].iloc[idx]
 
-            # Step 2: Check for RED HAMMER Candle
+            # Step 2: STRICT HIGH-VOLUME RED HAMMER FILTER
             if found_swing_high and (i - swing_high_idx >= 2):
                 h_open = df['Open'].iloc[i]
                 h_close = df['Close'].iloc[i]
@@ -91,35 +91,36 @@ def backtest_red_hammer_volume_split(df_daily):
                 is_red_hammer = h_close < h_open
                 is_hammer = (lower_wick >= 2.0 * max(body, 0.01)) and (upper_wick <= 0.6 * max(body, 0.01))
                 is_pullback = h_close < swing_high_price
+                is_high_volume = h_vol >= h_vol_avg  # Filter: Vol >= 20D Avg
 
-                if is_red_hammer and is_hammer and is_pullback:
+                if is_red_hammer and is_hammer and is_pullback and is_high_volume:
                     
-                    # Category Classification based on Volume
-                    vol_type = "HIGH_VOL_RED_HAMMER" if h_vol >= h_vol_avg else "LOW_VOL_RED_HAMMER"
-
                     past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
                     recent_min_low = df['Low'].iloc[swing_high_idx : i + 1].min()
 
-                    # Step 3: Check Breakout of Past 10-Day Max Price within next 10 days
+                    # Step 3: Breakout Trigger within 10 days with Volume Expansion (>= 1.5x)
                     entry_found = False
                     entry_idx = -1
                     entry_price = 0.0
 
                     check_window = min(n - 1, i + 10)
                     for k in range(i + 1, check_window):
-                        if df['High'].iloc[k] > past_10d_max:
+                        break_vol = df['Volume'].iloc[k]
+                        break_vol_avg = df['Vol_Avg_20'].iloc[k]
+
+                        if df['High'].iloc[k] > past_10d_max and break_vol >= (break_vol_avg * 1.5):
                             entry_found = True
                             entry_idx = k
                             entry_price = past_10d_max
                             break
 
-                    # Step 4: Trade Execution & Exit Simulation
+                    # Step 4: Trade Simulation (Risk-Reward 1:2.5)
                     if entry_found and entry_idx < n - MAX_HOLDING_DAYS:
                         stop_loss = round(recent_min_low * 0.99, 2)
                         risk = entry_price - stop_loss
 
                         if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
-                            target_price = round(entry_price + (risk * 2.0), 2) # 1:2 Risk-Reward
+                            target_price = round(entry_price + (risk * 2.5), 2) # Target 1:2.5
                             breakeven_trigger = entry_price + (risk * 1.0)
 
                             future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
@@ -146,11 +147,7 @@ def backtest_red_hammer_volume_split(df_daily):
                                 win = exit_price > entry_price
 
                             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                            trades.append({
-                                "Vol_Type": vol_type,
-                                "Win": win,
-                                "PnL_%": pnl_pct
-                            })
+                            trades.append({"Win": win, "PnL_%": pnl_pct})
 
                             i = entry_idx + 6
                             continue
@@ -165,7 +162,7 @@ def backtest_red_hammer_volume_split(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V122.0 Red Hammer Volume Split Backtest...", flush=True)
+print("\nRunning V123.0 High-Vol Red Hammer Engine Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -176,7 +173,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_red_hammer_volume_split(df)
+        df_res = backtest_high_vol_red_hammer(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -186,7 +183,6 @@ if all_trades:
     df_all = pd.concat(all_trades, ignore_index=True)
     total_tr = len(df_all)
 
-    # Global Performance
     wins = df_all[df_all['Win'] == True]
     losses = df_all[df_all['Win'] == False]
     win_rate = (len(wins) / total_tr) * 100
@@ -195,31 +191,12 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 OVERALL RESULTS: RED HAMMER STRATEGY")
+    print("🏆 RESULTS: V123.0 HIGH-VOL RED HAMMER ENGINE")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {total_tr}")
     print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
     print(f"Overall Profit Factor          : {round(overall_pf, 2)}")
     print("==================================================================")
-
-    # High Vol vs Low Vol Breakdown
-    print("\n📊 RED HAMMER VOLUME BREAKDOWN:")
-    print("------------------------------------------------------------------")
-    for v_type in ['HIGH_VOL_RED_HAMMER', 'LOW_VOL_RED_HAMMER']:
-        sub_df = df_all[df_all['Vol_Type'] == v_type]
-        if not sub_df.empty:
-            sub_tr = len(sub_df)
-            sub_wins = sub_df[sub_df['Win'] == True]
-            sub_losses = sub_df[sub_df['Win'] == False]
-            
-            sub_wr = (len(sub_wins) / sub_tr) * 100
-            sub_gp = sub_wins['PnL_%'].sum()
-            sub_gl = abs(sub_losses['PnL_%'].sum())
-            sub_pf = sub_gp / sub_gl if sub_gl > 0 else 999.0
-
-            print(f"🔹 {v_type} -> Trades: {sub_tr} | Win-Rate: {round(sub_wr, 2)}% | Profit Factor: {round(sub_pf, 2)}")
-    print("==================================================================")
-
 else:
     print("\nNo trades met the criteria in the backtest period.")
     
