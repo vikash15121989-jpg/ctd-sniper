@@ -9,12 +9,12 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V115.0: RESISTANCE BREAKOUT & PULLBACK DRY-UP ENGINE ===", flush=True)
+print("=== V120.0: ZIGZAG SWING HIGH + HAMMER BREAKOUT ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
 MIN_AVG_TURNOVER_CR = 2.0        # Min ₹2 Crore Daily Turnover
-MAX_HOLDING_DAYS = 25             # Holding Period for Swing
+MAX_HOLDING_DAYS = 25             # Holding window for trade
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
@@ -46,112 +46,123 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. RESISTANCE BREAKOUT & PULLBACK DRY-UP LOGIC =====
-def backtest_breakout_pullback_engine(df_daily):
+# ===== 2. ZIGZAG HAMMER BREAKOUT BACKTEST ENGINE =====
+def backtest_zigzag_hammer(df_daily):
     trades = []
     df = df_daily.copy()
 
-    # Indicators
+    # Basic Indicators
     df['Turnover'] = df['Close'] * df['Volume']
     df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
     df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
 
     n = len(df)
-    i = 60
+    i = 30
 
     while i < n - MAX_HOLDING_DAYS:
         # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            live_close = df['Close'].iloc[i]
-            live_open = df['Open'].iloc[i]
-            live_vol = df['Volume'].iloc[i]
-            prev_close = df['Close'].iloc[i - 1]
-            avg_vol_now = df['Vol_Avg_20'].iloc[i]
+            # Step 1: Find Swing High (Zigzag Peak in past 5-25 days)
+            found_swing_high = False
+            swing_high_idx = -1
+            swing_high_price = 0.0
 
-            # Step 1: Find Resistance Breakout Candle in past 5-30 days
-            # Look for ultra-high volume breakout
-            found_anchor = False
-            anchor_idx = -1
-            resistance_level = 0.0
-
-            for idx in range(i - 30, i - 3):
-                if idx < 30: continue
+            for idx in range(i - 20, i - 2):
+                if idx < 5: continue
                 
-                check_vol = df['Volume'].iloc[idx]
-                avg_vol_then = df['Vol_Avg_20'].iloc[idx - 1]
-                
-                # Check prior resistance high (past 30 days before breakout)
-                prior_high = df['High'].iloc[max(0, idx - 30):idx].max()
-                
-                # Rule 1: Breakout above resistance with Ultra High Volume (> 2.8x Avg Vol)
-                if check_vol >= (avg_vol_then * 2.8) and df['Close'].iloc[idx] >= prior_high * 0.98:
-                    found_anchor = True
-                    anchor_idx = idx
-                    resistance_level = prior_high
+                # Local Peak (Zigzag High) Condition
+                is_local_max = df['High'].iloc[idx] == df['High'].iloc[idx - 5 : idx + 6].max()
+                if is_local_max:
+                    found_swing_high = True
+                    swing_high_idx = idx
+                    swing_high_price = df['High'].iloc[idx]
 
-            if found_anchor:
-                # Step 2: Check Pullback with Dry-up Volume
-                pullback_days = i - anchor_idx
-                if 2 <= pullback_days <= 15:
+            # Step 2: Look for Hammer Candle in Pullback Phase
+            if found_swing_high and (i - swing_high_idx >= 2):
+                h_open = df['Open'].iloc[i]
+                h_close = df['Close'].iloc[i]
+                h_high = df['High'].iloc[i]
+                h_low = df['Low'].iloc[i]
+
+                body = abs(h_close - h_open)
+                upper_wick = h_high - max(h_open, h_close)
+                lower_wick = min(h_open, h_close) - h_low
+
+                # Candle Color
+                is_green_hammer = h_close >= h_open
+                is_red_hammer = h_close < h_open
+
+                # Precise Hammer Geometry Rule
+                is_hammer = (lower_wick >= 2.0 * max(body, 0.01)) and (upper_wick <= 0.6 * max(body, 0.01))
+
+                # Price should be in a pullback (lower than Swing High)
+                is_pullback = h_close < swing_high_price
+
+                if is_hammer and is_pullback:
+                    hammer_type = "GREEN" if is_green_hammer else "RED"
                     
-                    pullback_zone = df.iloc[anchor_idx + 1 : i]
-                    
-                    # Support Rule: Pullback during squeeze shouldn't break resistance level by more than 4%
-                    min_pullback_low = pullback_zone['Low'].min()
-                    is_support_held = min_pullback_low >= (resistance_level * 0.96)
-                    
-                    # Volume Dry-up Rule: At least 50% days during pullback had volume below 20-day Avg
-                    dry_days = sum(pullback_zone['Volume'] < pullback_zone['Vol_Avg_20'])
-                    is_volume_dry = (dry_days / len(pullback_zone)) >= 0.40
+                    # Step 3: Find Max Price of last 10 days (prior to hammer)
+                    past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
 
-                    if is_support_held and is_volume_dry:
-                        # Step 3: Bullish Green Candle with High Volume (Trigger Today)
-                        is_green_candle = (live_close > live_open) and (live_close > prev_close)
-                        is_high_volume = live_vol >= (avg_vol_now * 1.5)
-                        
-                        # ENTRY SIGNAL
-                        if is_green_candle and is_high_volume:
-                            entry_price = live_close
-                            stop_loss = round(min_pullback_low * 0.98, 2) # SL just below pullback low
-                            risk = entry_price - stop_loss
+                    # Find Recent Min Low (for Stop Loss)
+                    recent_min_low = df['Low'].iloc[swing_high_idx : i + 1].min()
 
-                            # Strict Risk Filter (Risk between 2% to 7%)
-                            if risk > 0 and 0.02 <= (risk / entry_price) <= 0.07:
-                                target_price = round(entry_price + (risk * 2.0), 2) # 1:2 Risk-Reward
-                                breakeven_trigger = entry_price + (risk * 1.0)
-                                
-                                future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                                win = False
-                                exit_price = entry_price
-                                curr_sl = stop_loss
+                    # Step 4: Check Breakout of Past 10-Day Max Price within next 10 days
+                    entry_found = False
+                    entry_idx = -1
+                    entry_price = 0.0
 
-                                for _, f_row in future_df.iterrows():
-                                    # Trail SL to Breakeven at 1:1 R
-                                    if f_row['High'] >= breakeven_trigger:
-                                        curr_sl = max(curr_sl, entry_price)
+                    check_window = min(n - 1, i + 10)
+                    for k in range(i + 1, check_window):
+                        if df['High'].iloc[k] > past_10d_max:
+                            entry_found = True
+                            entry_idx = k
+                            entry_price = past_10d_max # Stop-limit entry
+                            break
 
-                                    # Target Hit
-                                    if f_row['High'] >= target_price:
-                                        exit_price = target_price
-                                        win = True
-                                        break
+                    # Step 5: Trade Execution & Exit Simulation
+                    if entry_found and entry_idx < n - MAX_HOLDING_DAYS:
+                        stop_loss = round(recent_min_low * 0.99, 2)
+                        risk = entry_price - stop_loss
 
-                                    # Stop Loss Hit
-                                    if f_row['Low'] <= curr_sl:
-                                        exit_price = curr_sl
-                                        win = exit_price > entry_price
-                                        break
+                        if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
+                            target_price = round(entry_price + (risk * 2.0), 2) # 1:2 RR
+                            breakeven_trigger = entry_price + (risk * 1.0)
 
-                                if exit_price == entry_price and not future_df.empty:
-                                    exit_price = future_df['Close'].iloc[-1]
+                            future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
+                            win = False
+                            exit_price = entry_price
+                            curr_sl = stop_loss
+
+                            for _, f_row in future_df.iterrows():
+                                # Shift SL to Breakeven at 1:1 R
+                                if f_row['High'] >= breakeven_trigger:
+                                    curr_sl = max(curr_sl, entry_price)
+
+                                if f_row['High'] >= target_price:
+                                    exit_price = target_price
+                                    win = True
+                                    break
+
+                                if f_row['Low'] <= curr_sl:
+                                    exit_price = curr_sl
                                     win = exit_price > entry_price
+                                    break
 
-                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                                trades.append({"Win": win, "PnL_%": pnl_pct})
+                            if exit_price == entry_price and not future_df.empty:
+                                exit_price = future_df['Close'].iloc[-1]
+                                win = exit_price > entry_price
 
-                                i += 8 # Skip to next swing
-                                continue
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            trades.append({
+                                "Hammer_Type": hammer_type,
+                                "Win": win,
+                                "PnL_%": pnl_pct
+                            })
+
+                            i = entry_idx + 6 # Jump forward
+                            continue
         i += 1
 
     if not trades:
@@ -163,7 +174,7 @@ def backtest_breakout_pullback_engine(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V115.0 Resistance Breakout & Pullback Backtest Engine...", flush=True)
+print("\nRunning V120.0 Zigzag Hammer Engine Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -174,7 +185,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_breakout_pullback_engine(df)
+        df_res = backtest_zigzag_hammer(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -183,21 +194,41 @@ for stock in STOCKS:
 if all_trades:
     df_all = pd.concat(all_trades, ignore_index=True)
     total_tr = len(df_all)
+
+    # Global Performance
     wins = df_all[df_all['Win'] == True]
     losses = df_all[df_all['Win'] == False]
-
     win_rate = (len(wins) / total_tr) * 100
     gross_profit = wins['PnL_%'].sum()
     gross_loss = abs(losses['PnL_%'].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+    overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 RESULTS: V115.0 BREAKOUT & PULLBACK DRY-UP ENGINE")
+    print("🏆 OVERALL RESULTS: ZIGZAG SWING HIGH + HAMMER BREAKOUT")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {total_tr}")
-    print(f"Average Win-Rate               : {round(win_rate, 2)}%")
-    print(f"Profit Factor                  : {round(profit_factor, 2)}")
+    print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
+    print(f"Overall Profit Factor          : {round(overall_pf, 2)}")
     print("==================================================================")
+
+    # Red vs Green Hammer Breakdown
+    print("\n📊 RED HAMMER vs GREEN HAMMER COMPARISON:")
+    print("------------------------------------------------------------------")
+    for h_type in ['GREEN', 'RED']:
+        sub_df = df_all[df_all['Hammer_Type'] == h_type]
+        if not sub_df.empty:
+            sub_tr = len(sub_df)
+            sub_wins = sub_df[sub_df['Win'] == True]
+            sub_losses = sub_df[sub_df['Win'] == False]
+            
+            sub_wr = (len(sub_wins) / sub_tr) * 100
+            sub_gp = sub_wins['PnL_%'].sum()
+            sub_gl = abs(sub_losses['PnL_%'].sum())
+            sub_pf = sub_gp / sub_gl if sub_gl > 0 else 999.0
+
+            print(f"🔴 {h_type} HAMMER -> Trades: {sub_tr} | Win-Rate: {round(sub_wr, 2)}% | Profit Factor: {round(sub_pf, 2)}")
+    print("==================================================================")
+
 else:
-    print("\nNo trades met the criteria in the backtest period.")
+    print("\nNo trades met the Zigzag Hammer criteria in the backtest period.")
     
