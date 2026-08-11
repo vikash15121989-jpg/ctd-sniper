@@ -9,16 +9,15 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V100.4: COMSYN ANCHOR & SQUEEZE BACKTEST ENGINE ===", flush=True)
+print("=== V115.0: RESISTANCE BREAKOUT & PULLBACK DRY-UP ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
-MIN_AVG_TURNOVER_CR = 5.0        # Min ₹5 Crore Daily Turnover
-LOOKBACK_ULTRA_VOL = 50          # Day 0 Lookback
-MAX_HOLDING_DAYS = 30             # Positional Holding Limit
+MIN_AVG_TURNOVER_CR = 2.0        # Min ₹2 Crore Daily Turnover
+MAX_HOLDING_DAYS = 25             # Holding Period for Swing
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
+START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
 
 # ===== 1. READ WATCHLIST FROM GOOGLE SHEET =====
 try:
@@ -47,8 +46,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. COMSYN BACKTEST ENGINE =====
-def backtest_comsyn_engine(df_daily):
+# ===== 2. RESISTANCE BREAKOUT & PULLBACK DRY-UP LOGIC =====
+def backtest_breakout_pullback_engine(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -61,94 +60,98 @@ def backtest_comsyn_engine(df_daily):
     i = 60
 
     while i < n - MAX_HOLDING_DAYS:
-        # Liquidity Filter
+        # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
             live_close = df['Close'].iloc[i]
+            live_open = df['Open'].iloc[i]
+            live_vol = df['Volume'].iloc[i]
+            prev_close = df['Close'].iloc[i - 1]
+            avg_vol_now = df['Vol_Avg_20'].iloc[i]
 
-            # Look for Anchor Candle (Day 0) in past 40 days
+            # Step 1: Find Resistance Breakout Candle in past 5-30 days
+            # Look for ultra-high volume breakout
             found_anchor = False
-            anchor_close = 0
-            anchor_vol = 0
             anchor_idx = -1
+            resistance_level = 0.0
 
-            for idx in range(i - 40, i - 1):
-                if idx < LOOKBACK_ULTRA_VOL: continue
-
+            for idx in range(i - 30, i - 3):
+                if idx < 30: continue
+                
                 check_vol = df['Volume'].iloc[idx]
-                check_close = df['Close'].iloc[idx]
-                check_open = df['Open'].iloc[idx]
-
-                past_50d = df.iloc[idx - LOOKBACK_ULTRA_VOL : idx]
-                max_vol_50d = past_50d['Volume'].max()
-
-                # 50-Day Max Volume + Green Candle
-                if check_vol > max_vol_50d and check_close > check_open:
-                    anchor_close = check_close
-                    anchor_vol = check_vol
-                    anchor_idx = idx
+                avg_vol_then = df['Vol_Avg_20'].iloc[idx - 1]
+                
+                # Check prior resistance high (past 30 days before breakout)
+                prior_high = df['High'].iloc[max(0, idx - 30):idx].max()
+                
+                # Rule 1: Breakout above resistance with Ultra High Volume (> 2.8x Avg Vol)
+                if check_vol >= (avg_vol_then * 2.8) and df['Close'].iloc[idx] >= prior_high * 0.98:
                     found_anchor = True
+                    anchor_idx = idx
+                    resistance_level = prior_high
 
             if found_anchor:
-                is_base_alive = True
-                dry_up_days = 0
-                prices_in_base = []
+                # Step 2: Check Pullback with Dry-up Volume
+                pullback_days = i - anchor_idx
+                if 2 <= pullback_days <= 15:
+                    
+                    pullback_zone = df.iloc[anchor_idx + 1 : i]
+                    
+                    # Support Rule: Pullback during squeeze shouldn't break resistance level by more than 4%
+                    min_pullback_low = pullback_zone['Low'].min()
+                    is_support_held = min_pullback_low >= (resistance_level * 0.96)
+                    
+                    # Volume Dry-up Rule: At least 50% days during pullback had volume below 20-day Avg
+                    dry_days = sum(pullback_zone['Volume'] < pullback_zone['Vol_Avg_20'])
+                    is_volume_dry = (dry_days / len(pullback_zone)) >= 0.40
 
-                for check_idx in range(anchor_idx + 1, i + 1):
-                    f_close = df['Close'].iloc[check_idx]
-                    f_vol = df['Volume'].iloc[check_idx]
-                    prices_in_base.append(f_close)
+                    if is_support_held and is_volume_dry:
+                        # Step 3: Bullish Green Candle with High Volume (Trigger Today)
+                        is_green_candle = (live_close > live_open) and (live_close > prev_close)
+                        is_high_volume = live_vol >= (avg_vol_now * 1.5)
+                        
+                        # ENTRY SIGNAL
+                        if is_green_candle and is_high_volume:
+                            entry_price = live_close
+                            stop_loss = round(min_pullback_low * 0.98, 2) # SL just below pullback low
+                            risk = entry_price - stop_loss
 
-                    # Stop Loss Level Check (Max 5% breakdown from Anchor Close)
-                    if f_close < (anchor_close * 0.95):
-                        is_base_alive = False
-                        break
-
-                    if f_vol < (anchor_vol * 0.25):
-                        dry_up_days += 1
-
-                if is_base_alive and len(prices_in_base) >= 2:
-                    base_min = min(prices_in_base)
-                    base_max = max(prices_in_base)
-                    current_range_pct = ((base_max - base_min) / base_min) * 100
-
-                    # Grading Logic
-                    if current_range_pct <= 3.5 and dry_up_days >= 4:
-                        grade = "A+"
-                    elif current_range_pct <= 5.0 and dry_up_days >= 2:
-                        grade = "A"
-                    else:
-                        grade = "B"
-
-                    # Trade Execution
-                    entry_price = live_close
-                    stop_loss = round(anchor_close * 0.95, 2)
-                    target_price = round(entry_price * 1.15, 2)
-
-                    if entry_price > stop_loss:
-                        future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                        win = False
-                        exit_price = entry_price
-
-                        for _, f_row in future_df.iterrows():
-                            if f_row['High'] >= target_price:
-                                exit_price = target_price
-                                win = True
-                                break
-                            if f_row['Low'] <= stop_loss:
-                                exit_price = stop_loss
+                            # Strict Risk Filter (Risk between 2% to 7%)
+                            if risk > 0 and 0.02 <= (risk / entry_price) <= 0.07:
+                                target_price = round(entry_price + (risk * 2.0), 2) # 1:2 Risk-Reward
+                                breakeven_trigger = entry_price + (risk * 1.0)
+                                
+                                future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
                                 win = False
-                                break
+                                exit_price = entry_price
+                                curr_sl = stop_loss
 
-                        if exit_price == entry_price and not future_df.empty:
-                            exit_price = future_df['Close'].iloc[-1]
-                            win = exit_price > entry_price
+                                for _, f_row in future_df.iterrows():
+                                    # Trail SL to Breakeven at 1:1 R
+                                    if f_row['High'] >= breakeven_trigger:
+                                        curr_sl = max(curr_sl, entry_price)
 
-                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                        trades.append({"Grade": grade, "Win": win, "PnL_%": pnl_pct})
+                                    # Target Hit
+                                    if f_row['High'] >= target_price:
+                                        exit_price = target_price
+                                        win = True
+                                        break
 
-                        i += 8 # Jump forward to avoid redundant signals
-                        continue
+                                    # Stop Loss Hit
+                                    if f_row['Low'] <= curr_sl:
+                                        exit_price = curr_sl
+                                        win = exit_price > entry_price
+                                        break
+
+                                if exit_price == entry_price and not future_df.empty:
+                                    exit_price = future_df['Close'].iloc[-1]
+                                    win = exit_price > entry_price
+
+                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                                trades.append({"Win": win, "PnL_%": pnl_pct})
+
+                                i += 8 # Skip to next swing
+                                continue
         i += 1
 
     if not trades:
@@ -160,7 +163,7 @@ def backtest_comsyn_engine(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V100.4 COMSYN Backtest Engine...", flush=True)
+print("\nRunning V115.0 Resistance Breakout & Pullback Backtest Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -171,7 +174,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_comsyn_engine(df)
+        df_res = backtest_breakout_pullback_engine(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -189,20 +192,12 @@ if all_trades:
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 OVERALL RESULTS: V100.4 COMSYN ENGINE")
+    print("🏆 RESULTS: V115.0 BREAKOUT & PULLBACK DRY-UP ENGINE")
     print("==================================================================")
-    print(f"Total Executed Quality Trades  : {total_tr}")
+    print(f"Total Quality Executed Trades  : {total_tr}")
     print(f"Average Win-Rate               : {round(win_rate, 2)}%")
     print(f"Profit Factor                  : {round(profit_factor, 2)}")
     print("==================================================================")
-
-    print("\n📊 GRADE-WISE BREAKDOWN:")
-    for g in ['A+', 'A', 'B']:
-        g_df = df_all[df_all['Grade'] == g]
-        if not g_df.empty:
-            g_wins = g_df[g_df['Win'] == True]
-            g_wr = (len(g_wins) / len(g_df)) * 100
-            print(f"Grade {g} -> Trades: {len(g_df)} | Win Rate: {round(g_wr, 2)}%")
 else:
-    print("\nNo trades met the COMSYN criteria in the backtest period.")
+    print("\nNo trades met the criteria in the backtest period.")
     
