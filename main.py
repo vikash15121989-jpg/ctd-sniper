@@ -9,11 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== STRICT WYCKOFF RETEST (HIGH PROBABILITY) BACKTEST ===", flush=True)
+print("=== OPTIMIZED WYCKOFF PULLBACK + ASYMMETRIC RR BACKTEST ===", flush=True)
 
 # ===== CONFIGURATION =====
-MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Liquidity
-MAX_HOLDING_DAYS = 30             # Positional Holding Period
+MIN_DAILY_TURNOVER = 20_000_000   # Min ₹2 Crore Daily Turnover
+MAX_HOLDING_DAYS = 35             # Holding Period
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Data
@@ -42,8 +42,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. STRATEGY ENGINE (STRICT QUALITY RETEST) =====
-def backtest_strict_retest_engine(df_daily):
+# ===== 2. STRATEGY ENGINE =====
+def backtest_wyckoff_asymmetric(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -60,21 +60,20 @@ def backtest_strict_retest_engine(df_daily):
     while i < n - MAX_HOLDING_DAYS:
         if df['Turnover_MA20'].iloc[i] >= MIN_DAILY_TURNOVER:
             
-            # Step 1: Wyckoff Base (40 days tight accumulation)
-            past_accum = df.iloc[i-40 : i-10]
+            # Step 1: Wyckoff Base Consolidation (Tight Range)
+            past_accum = df.iloc[i-45 : i-10]
             accum_high = past_accum['High'].max()
             accum_low = past_accum['Low'].min()
             accum_range_pct = (accum_high - accum_low) / accum_low
 
-            if accum_range_pct <= 0.22: # Tight range <= 22%
+            if accum_range_pct <= 0.20: # Range Height <= 20%
                 
-                # Step 2: High Volume Breakout Identification
+                # Step 2: High Volume Breakout Check
                 breakout_window = df.iloc[i-10 : i]
                 has_breakout = False
                 bo_vol = 0
 
                 for idx, bo_row in breakout_window.iterrows():
-                    # Strong breakout (> 1.8x Avg Volume)
                     if bo_row['Close'] > accum_high and bo_row['Volume'] >= df.loc[idx, 'Vol_SMA20'] * 1.8:
                         has_breakout = True
                         bo_vol = bo_row['Volume']
@@ -85,36 +84,46 @@ def backtest_strict_retest_engine(df_daily):
                     sma20_val = df['SMA20'].iloc[i]
                     curr_vol = df['Volume'].iloc[i]
 
-                    # Step 3: Strict Retest at 20 SMA / Breakout Level + Ultra Dry Volume (< 35% of BO Vol)
-                    near_support = (abs(curr_close - accum_high) / accum_high <= 0.02) or (abs(curr_close - sma20_val) / sma20_val <= 0.015)
+                    # Step 3: Mean Reversion Retest (Price near 20 MA, not overextended)
+                    overextension = (curr_close - sma20_val) / sma20_val
+                    near_20ma = 0.0 <= overextension <= 0.025
                     ultra_dry_vol = curr_vol <= bo_vol * 0.35
-                    is_green_reversal = df['Close'].iloc[i] > df['Open'].iloc[i]
+                    is_green = df['Close'].iloc[i] > df['Open'].iloc[i]
 
-                    if near_support and ultra_dry_vol and is_green_reversal:
+                    if near_20ma and ultra_dry_vol and is_green:
                         entry_price = curr_close
                         stop_loss = min(df['Low'].iloc[i-2 : i+1].min(), sma20_val * 0.985)
                         risk = entry_price - stop_loss
 
-                        # Strict Risk Cap (1.5% to 5% Max Risk)
-                        if risk > 0 and 0.015 <= (risk / entry_price) <= 0.05:
-                            target_price = entry_price + (risk * 2.0) # Fixed 1:2 Target
+                        # Risk Cap: 1.5% to 4.5%
+                        if risk > 0 and 0.015 <= (risk / entry_price) <= 0.045:
+                            target_price = entry_price + (risk * 2.5) # 1:2.5 Target
+                            breakeven_trigger = entry_price + (risk * 1.0)
+                            
                             future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
 
                             win = False
                             exit_price = entry_price
+                            current_sl = stop_loss
 
                             for _, f_row in future_df.iterrows():
-                                # Target Hit
+                                # Lock Breakeven at 1:1 Gain
+                                if f_row['High'] >= breakeven_trigger:
+                                    current_sl = max(current_sl, entry_price)
+
+                                # Hit Target
                                 if f_row['High'] >= target_price:
                                     exit_price = target_price
                                     win = True
                                     break
-                                # Stop Loss Hit
-                                if f_row['Low'] <= stop_loss:
-                                    exit_price = stop_loss
-                                    win = False
+                                
+                                # Hit Stop Loss / Breakeven
+                                if f_row['Low'] <= current_sl:
+                                    exit_price = current_sl
+                                    win = exit_price > entry_price
                                     break
-                                # Trend Breakdown on 20 SMA Close
+                                
+                                # Exit on 20 SMA Closing Breakdown
                                 if f_row['Close'] < f_row['SMA20']:
                                     exit_price = f_row['Close']
                                     win = exit_price > entry_price
@@ -123,7 +132,7 @@ def backtest_strict_retest_engine(df_daily):
                             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                             trades.append({"Win": win, "PnL_%": pnl_pct})
 
-                            i += 6 # Skip ahead
+                            i += 6
                             continue
         i += 1
 
@@ -155,7 +164,7 @@ all_profit = 0.0
 all_loss = 0.0
 winrate_list = []
 
-print("\nRunning High-Probability Retest Engine...", flush=True)
+print("\nRunning Wyckoff Asymmetric Risk-Reward Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -166,7 +175,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 150:
             continue
 
-        res = backtest_strict_retest_engine(df)
+        res = backtest_wyckoff_asymmetric(df)
         if res:
             all_trades += res["Trades"]
             all_profit += res["Gross_Profit"]
@@ -180,12 +189,12 @@ if all_trades > 0:
     overall_pf = all_profit / all_loss if all_loss > 0 else 999
 
     print("\n==================================================================")
-    print("🏆 RESULTS: STRICT HIGH-PROBABILITY WYCKOFF RETEST")
+    print("🏆 RESULTS: WYCKOFF ASYMMETRIC REWARD ENGINE")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {all_trades}")
     print(f"Average Win-Rate               : {round(avg_winrate, 2)}%")
     print(f"Profit Factor                  : {round(overall_pf, 2)}")
     print("==================================================================")
 else:
-    print("\nNo trades met the Strict Retest criteria.")
+    print("\nNo trades met the exact Wyckoff criteria.")
     
