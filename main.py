@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V123.0: HIGH-VOL RED HAMMER + EXPANSION BREAKOUT ENGINE ===", flush=True)
+print("=== V124.0: HIGH-VOL RED HAMMER PARTIAL PROFIT ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
@@ -46,8 +46,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. HIGH-VOL RED HAMMER STRATEGY ENGINE =====
-def backtest_high_vol_red_hammer(df_daily):
+# ===== 2. PARTIAL PROFIT BOOKING STRATEGY ENGINE =====
+def backtest_partial_profit_red_hammer(df_daily):
     trades = []
     df = df_daily.copy()
 
@@ -61,7 +61,7 @@ def backtest_high_vol_red_hammer(df_daily):
     while i < n - MAX_HOLDING_DAYS:
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Step 1: Find Swing High Peak
+            # Step 1: Swing High
             found_swing_high = False
             swing_high_idx = -1
             swing_high_price = 0.0
@@ -74,7 +74,7 @@ def backtest_high_vol_red_hammer(df_daily):
                     swing_high_idx = idx
                     swing_high_price = df['High'].iloc[idx]
 
-            # Step 2: STRICT HIGH-VOLUME RED HAMMER FILTER
+            # Step 2: High Vol Red Hammer Filter
             if found_swing_high and (i - swing_high_idx >= 2):
                 h_open = df['Open'].iloc[i]
                 h_close = df['Close'].iloc[i]
@@ -91,14 +91,14 @@ def backtest_high_vol_red_hammer(df_daily):
                 is_red_hammer = h_close < h_open
                 is_hammer = (lower_wick >= 2.0 * max(body, 0.01)) and (upper_wick <= 0.6 * max(body, 0.01))
                 is_pullback = h_close < swing_high_price
-                is_high_volume = h_vol >= h_vol_avg  # Filter: Vol >= 20D Avg
+                is_high_volume = h_vol >= h_vol_avg
 
                 if is_red_hammer and is_hammer and is_pullback and is_high_volume:
                     
                     past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
                     recent_min_low = df['Low'].iloc[swing_high_idx : i + 1].min()
 
-                    # Step 3: Breakout Trigger within 10 days with Volume Expansion (>= 1.5x)
+                    # Step 3: Breakout with Volume >= 1.3x
                     entry_found = False
                     entry_idx = -1
                     entry_price = 0.0
@@ -108,46 +108,56 @@ def backtest_high_vol_red_hammer(df_daily):
                         break_vol = df['Volume'].iloc[k]
                         break_vol_avg = df['Vol_Avg_20'].iloc[k]
 
-                        if df['High'].iloc[k] > past_10d_max and break_vol >= (break_vol_avg * 1.5):
+                        if df['High'].iloc[k] > past_10d_max and break_vol >= (break_vol_avg * 1.3):
                             entry_found = True
                             entry_idx = k
                             entry_price = past_10d_max
                             break
 
-                    # Step 4: Trade Simulation (Risk-Reward 1:2.5)
+                    # Step 4: Partial Booking Simulation (50% at 1:1.5, 50% at 1:3)
                     if entry_found and entry_idx < n - MAX_HOLDING_DAYS:
                         stop_loss = round(recent_min_low * 0.99, 2)
                         risk = entry_price - stop_loss
 
                         if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
-                            target_price = round(entry_price + (risk * 2.5), 2) # Target 1:2.5
-                            breakeven_trigger = entry_price + (risk * 1.0)
+                            t1_price = round(entry_price + (risk * 1.5), 2)
+                            t2_price = round(entry_price + (risk * 3.0), 2)
 
                             future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
-                            win = False
-                            exit_price = entry_price
+                            
+                            p1_booked = False
                             curr_sl = stop_loss
+                            pnl_p1 = 0.0
+                            pnl_p2 = 0.0
 
                             for _, f_row in future_df.iterrows():
-                                if f_row['High'] >= breakeven_trigger:
-                                    curr_sl = max(curr_sl, entry_price)
+                                # Target 1 Hit -> Book 50% and move SL to Breakeven
+                                if not p1_booked and f_row['High'] >= t1_price:
+                                    p1_booked = True
+                                    pnl_p1 = ((t1_price - entry_price) / entry_price) * 100
+                                    curr_sl = entry_price
 
-                                if f_row['High'] >= target_price:
-                                    exit_price = target_price
-                                    win = True
+                                # Target 2 Hit -> Book remaining 50%
+                                if p1_booked and f_row['High'] >= t2_price:
+                                    pnl_p2 = ((t2_price - entry_price) / entry_price) * 100
                                     break
 
+                                # SL Hit
                                 if f_row['Low'] <= curr_sl:
-                                    exit_price = curr_sl
-                                    win = exit_price > entry_price
+                                    if not p1_booked:
+                                        pnl_p1 = ((curr_sl - entry_price) / entry_price) * 100
+                                        pnl_p2 = pnl_p1
+                                    else:
+                                        pnl_p2 = ((curr_sl - entry_price) / entry_price) * 100
                                     break
 
-                            if exit_price == entry_price and not future_df.empty:
-                                exit_price = future_df['Close'].iloc[-1]
-                                win = exit_price > entry_price
+                            if not p1_booked and pnl_p1 == 0.0 and not future_df.empty:
+                                last_close = future_df['Close'].iloc[-1]
+                                pnl_p1 = ((last_close - entry_price) / entry_price) * 100
+                                pnl_p2 = pnl_p1
 
-                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                            trades.append({"Win": win, "PnL_%": pnl_pct})
+                            total_pnl = (0.5 * pnl_p1) + (0.5 * pnl_p2)
+                            trades.append({"Win": total_pnl > 0, "PnL_%": total_pnl})
 
                             i = entry_idx + 6
                             continue
@@ -162,7 +172,7 @@ def backtest_high_vol_red_hammer(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V123.0 High-Vol Red Hammer Engine Backtest...", flush=True)
+print("\nRunning V124.0 High-Vol Red Hammer Engine Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -173,7 +183,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_high_vol_red_hammer(df)
+        df_res = backtest_partial_profit_red_hammer(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -191,7 +201,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 RESULTS: V123.0 HIGH-VOL RED HAMMER ENGINE")
+    print("🏆 RESULTS: V124.0 HIGH-VOL RED HAMMER ENGINE")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {total_tr}")
     print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
