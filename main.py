@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V142.0 BACKTEST: DEEP SWEEP + TREND ALIGNMENT + 2.0X R:R ===", flush=True)
+print("=== V143.0 BACKTEST: HIGH FREQUENCY R:R OPTIMIZER ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
@@ -46,8 +46,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== ADVANCED V142 ENGINE =====
-def backtest_v142_deep_sweep(df):
+# ===== ADVANCED V143 ENGINE =====
+def backtest_v143_optimized_sweep(df):
     trades = []
     n = len(df)
     i = 50
@@ -56,34 +56,34 @@ def backtest_v142_deep_sweep(df):
         # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # 1. Structural Trend: Price > 20 EMA AND 20 EMA > 50 EMA
             price = df['Close'].iloc[i]
             ema20 = df['EMA_20'].iloc[i]
-            ema50 = df['EMA_50'].iloc[i]
-            strong_trend = (price > ema20) and (ema20 > ema50)
             
-            # 2. Deep Sweep Logic: Low breaches 10-day Low by at least 0.2%
+            # 1. Trend Filter: Price > 20 EMA
+            above_20_ema = price > ema20
+            
+            # 2. Sweep Logic: Low breaches 10-day low, Close stays above 10-day low
             prev_10_low = df['Low'].iloc[i-10:i].min()
-            deep_sweep = df['Low'].iloc[i] <= (prev_10_low * 0.998)
+            swept_low = df['Low'].iloc[i] < prev_10_low
             closed_above_low = price > prev_10_low
             
-            # 3. Pinbar / Hammer Candle Structure (Top 50% close)
+            # 3. Pinbar Candle Structure (Close in upper 50% of candle range)
             candle_range = df['High'].iloc[i] - df['Low'].iloc[i]
             strong_rejection = False
             if candle_range > 0:
                 close_pos = (price - df['Low'].iloc[i]) / candle_range
                 strong_rejection = close_pos >= 0.50
             
-            # 4. Institutional Volume Spike (1.5x 20-Day Avg)
-            high_vol = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
+            # 4. Moderate Volume Spike (1.2x 20-Day Avg)
+            high_vol = df['Volume'].iloc[i] >= (1.2 * df['Vol_Avg_20'].iloc[i])
 
-            if strong_trend and deep_sweep and closed_above_low and strong_rejection and high_vol:
+            if above_20_ema and swept_low and closed_above_low and strong_rejection and high_vol:
                 entry_price = price
                 stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
                 risk = entry_price - stop_loss
                 
-                # Dynamic Target: 10-day High with 2.0x Risk Floor
-                min_target = entry_price + (2.0 * risk)
+                # Dynamic Target: 1.8x Risk Floor or Previous 10-day High
+                min_target = entry_price + (1.8 * risk)
                 swing_high_target = df['High'].iloc[i-10:i].max()
                 target_price = round(max(swing_high_target, min_target), 2)
 
@@ -117,7 +117,7 @@ def backtest_v142_deep_sweep(df):
 # ===== MAIN EXECUTION =====
 all_trades = []
 
-print("\nExecuting V142.0 Backtest...", flush=True)
+print("\nExecuting V143.0 Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -132,9 +132,8 @@ for stock in STOCKS:
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
-        res = backtest_v142_deep_sweep(df)
+        res = backtest_v143_optimized_sweep(df)
         if res is not None and not res.empty:
             all_trades.append(res)
 
@@ -152,7 +151,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 V142.0 BACKTEST RESULTS (DEEP SWEEP + TREND ALIGNMENT + 2.0X R:R)")
+    print("🏆 V143.0 BACKTEST RESULTS (HIGH FREQUENCY R:R OPTIMIZER)")
     print("==================================================================")
     print(f"Total Executed Trades          : {total_tr}")
     print(f"Win-Rate                       : {round(win_rate, 2)}%")
@@ -161,4 +160,5 @@ if all_trades:
     print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 else:
-    print("\nNo trades executed in V142.0.")
+    print("\nNo trades executed in V143.0.")
+        
