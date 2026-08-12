@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V125.0: STRICT HIGH-VOL RED HAMMER ENGINE (FIXED R:R 1:2.5) ===", flush=True)
+print("=== V126.0: HIGH-VOL RED ABSORPTION BREAKOUT & RETEST ENGINE ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
@@ -46,14 +46,16 @@ except Exception as e:
     exit(1)
 
 
-# ===== 2. REFINED RED HAMMER ENGINE =====
-def backtest_v125_red_hammer(df_daily):
+# ===== 2. STRATEGY ENGINE (DIRECT VS RETEST) =====
+def backtest_red_absorption_strategy(df_daily):
     trades = []
     df = df_daily.copy()
 
     df['Turnover'] = df['Close'] * df['Volume']
     df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
     df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
+    df['Candle_Range'] = df['High'] - df['Low']
+    df['Range_Avg_10'] = df['Candle_Range'].rolling(10).mean()
 
     n = len(df)
     i = 30
@@ -61,96 +63,106 @@ def backtest_v125_red_hammer(df_daily):
     while i < n - MAX_HOLDING_DAYS:
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Step 1: Swing High Peak
-            found_swing_high = False
-            swing_high_idx = -1
-            swing_high_price = 0.0
+            # Condition 1: High-Range High-Volume Red Candle
+            is_red = df['Close'].iloc[i] < df['Open'].iloc[i]
+            is_high_range = df['Candle_Range'].iloc[i] >= (1.3 * df['Range_Avg_10'].iloc[i])
+            is_high_volume = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
 
-            for idx in range(i - 20, i - 2):
-                if idx < 5: continue
-                is_local_max = df['High'].iloc[idx] == df['High'].iloc[idx - 5 : idx + 6].max()
-                if is_local_max:
-                    found_swing_high = True
-                    swing_high_idx = idx
-                    swing_high_price = df['High'].iloc[idx]
+            if is_red and is_high_range and is_high_volume:
+                mother_high = df['High'].iloc[i]
+                mother_low = df['Low'].iloc[i]
+                mother_vol = df['Volume'].iloc[i]
 
-            # Step 2: High Vol Red Hammer Filter
-            if found_swing_high and (i - swing_high_idx >= 2):
-                h_open = df['Open'].iloc[i]
-                h_close = df['Close'].iloc[i]
-                h_high = df['High'].iloc[i]
-                h_low = df['Low'].iloc[i]
+                # Look for Low-Volume Breakout in next 15 bars
+                search_limit = min(n - 1, i + 15)
+                breakout_found = False
+                breakout_idx = -1
 
-                h_vol = df['Volume'].iloc[i]
-                h_vol_avg = df['Vol_Avg_20'].iloc[i]
+                for k in range(i + 1, search_limit):
+                    k_vol = df['Volume'].iloc[k]
+                    k_high = df['High'].iloc[k]
 
-                body = abs(h_close - h_open)
-                upper_wick = h_high - max(h_open, h_close)
-                lower_wick = min(h_open, h_close) - h_low
+                    # Breakout of Mother High with Volume < Mother Volume
+                    if k_high > mother_high and k_vol < mother_vol:
+                        breakout_found = True
+                        breakout_idx = k
+                        break
 
-                is_red_hammer = h_close < h_open
-                is_hammer = (lower_wick >= 2.0 * max(body, 0.01)) and (upper_wick <= 0.6 * max(body, 0.01))
-                is_pullback = h_close < swing_high_price
-                is_high_volume = h_vol >= h_vol_avg
-
-                if is_red_hammer and is_hammer and is_pullback and is_high_volume:
+                if breakout_found:
                     
-                    past_10d_max = df['High'].iloc[max(0, i - 10) : i].max()
-                    recent_min_low = df['Low'].iloc[swing_high_idx : i + 1].min()
+                    # --- SCENARIO A: DIRECT ENTRY AT BREAKOUT ---
+                    entry_a_price = mother_high
+                    stop_loss_a = round(mother_low * 0.99, 2)
+                    risk_a = entry_a_price - stop_loss_a
 
-                    # Step 3: Breakout Trigger (Strict 1.5x Volume Expansion)
-                    entry_found = False
-                    entry_idx = -1
-                    entry_price = 0.0
+                    if risk_a > 0 and 0.02 <= (risk_a / entry_a_price) <= 0.10:
+                        target_a = round(entry_a_price + (risk_a * 2.0), 2)
+                        
+                        future_a = df.iloc[breakout_idx + 1 : breakout_idx + 1 + MAX_HOLDING_DAYS]
+                        win_a = False
+                        exit_price_a = entry_a_price
 
-                    check_window = min(n - 1, i + 10)
-                    for k in range(i + 1, check_window):
-                        break_vol = df['Volume'].iloc[k]
-                        break_vol_avg = df['Vol_Avg_20'].iloc[k]
+                        for _, f_row in future_a.iterrows():
+                            if f_row['High'] >= target_a:
+                                exit_price_a = target_a
+                                win_a = True
+                                break
+                            if f_row['Low'] <= stop_loss_a:
+                                exit_price_a = stop_loss_a
+                                win_a = False
+                                break
 
-                        if df['High'].iloc[k] > past_10d_max and break_vol >= (break_vol_avg * 1.5):
-                            entry_found = True
-                            entry_idx = k
-                            entry_price = past_10d_max
+                        if exit_price_a == entry_a_price and not future_a.empty:
+                            exit_price_a = future_a['Close'].iloc[-1]
+                            win_a = exit_price_a > entry_a_price
+
+                        pnl_a = ((exit_price_a - entry_a_price) / entry_a_price) * 100
+                        trades.append({"Type": "DIRECT_ENTRY", "Win": win_a, "PnL_%": pnl_a})
+
+                    # --- SCENARIO B: RETEST ENTRY IN MOTHER RED CANDLE RANGE ---
+                    retest_found = False
+                    retest_idx = -1
+
+                    retest_limit = min(n - 1, breakout_idx + 10)
+                    for r in range(breakout_idx + 1, retest_limit):
+                        r_low = df['Low'].iloc[r]
+                        # Retest occurs inside the range [Mother Low, Mother High]
+                        if mother_low <= r_low <= mother_high:
+                            retest_found = True
+                            retest_idx = r
                             break
 
-                    # Step 4: Trade Simulation (Fixed 1:2.5 Target)
-                    if entry_found and entry_idx < n - MAX_HOLDING_DAYS:
-                        stop_loss = round(recent_min_low * 0.99, 2)
-                        risk = entry_price - stop_loss
+                    if retest_found and retest_idx < n - MAX_HOLDING_DAYS:
+                        entry_b_price = df['Close'].iloc[retest_idx]
+                        stop_loss_b = round(mother_low * 0.99, 2)
+                        risk_b = entry_b_price - stop_loss_b
 
-                        if risk > 0 and 0.02 <= (risk / entry_price) <= 0.08:
-                            target_price = round(entry_price + (risk * 2.5), 2)
-                            be_trigger = round(entry_price + (risk * 1.5), 2) # Move SL to BE at 1:1.5
+                        if risk_b > 0 and 0.02 <= (risk_b / entry_b_price) <= 0.10:
+                            target_b = round(entry_b_price + (risk_b * 2.0), 2)
+                            
+                            future_b = df.iloc[retest_idx + 1 : retest_idx + 1 + MAX_HOLDING_DAYS]
+                            win_b = False
+                            exit_price_b = entry_b_price
 
-                            future_df = df.iloc[entry_idx + 1 : entry_idx + 1 + MAX_HOLDING_DAYS]
-                            win = False
-                            exit_price = entry_price
-                            curr_sl = stop_loss
-
-                            for _, f_row in future_df.iterrows():
-                                if f_row['High'] >= be_trigger:
-                                    curr_sl = max(curr_sl, entry_price)
-
-                                if f_row['High'] >= target_price:
-                                    exit_price = target_price
-                                    win = True
+                            for _, f_row in future_b.iterrows():
+                                if f_row['High'] >= target_b:
+                                    exit_price_b = target_b
+                                    win_b = True
+                                    break
+                                if f_row['Low'] <= stop_loss_b:
+                                    exit_price_b = stop_loss_b
+                                    win_b = False
                                     break
 
-                                if f_row['Low'] <= curr_sl:
-                                    exit_price = curr_sl
-                                    win = exit_price > entry_price
-                                    break
+                            if exit_price_b == entry_b_price and not future_b.empty:
+                                exit_price_b = future_b['Close'].iloc[-1]
+                                win_b = exit_price_b > entry_b_price
 
-                            if exit_price == entry_price and not future_df.empty:
-                                exit_price = future_df['Close'].iloc[-1]
-                                win = exit_price > entry_price
+                            pnl_b = ((exit_price_b - entry_b_price) / entry_b_price) * 100
+                            trades.append({"Type": "RETEST_ENTRY", "Win": win_b, "PnL_%": pnl_b})
 
-                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                            trades.append({"Win": win, "PnL_%": pnl_pct})
-
-                            i = entry_idx + 6
-                            continue
+                    i = breakout_idx + 5
+                    continue
         i += 1
 
     if not trades:
@@ -162,7 +174,7 @@ def backtest_v125_red_hammer(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V125.0 Engine Backtest...", flush=True)
+print("\nRunning V126.0 Red Absorption Strategy Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -173,7 +185,7 @@ for stock in STOCKS:
         if df.empty or len(df) < 100:
             continue
 
-        df_res = backtest_v125_red_hammer(df)
+        df_res = backtest_red_absorption_strategy(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -183,6 +195,7 @@ if all_trades:
     df_all = pd.concat(all_trades, ignore_index=True)
     total_tr = len(df_all)
 
+    # Global Results
     wins = df_all[df_all['Win'] == True]
     losses = df_all[df_all['Win'] == False]
     win_rate = (len(wins) / total_tr) * 100
@@ -191,12 +204,31 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 RESULTS: V125.0 HIGH-VOL RED HAMMER ENGINE")
+    print("🏆 OVERALL RESULTS: HIGH-VOL RED ABSORPTION STRATEGY")
     print("==================================================================")
     print(f"Total Quality Executed Trades  : {total_tr}")
     print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
     print(f"Overall Profit Factor          : {round(overall_pf, 2)}")
     print("==================================================================")
+
+    # Direct vs Retest Comparison
+    print("\n📊 DIRECT ENTRY vs RETEST ENTRY BREAKDOWN:")
+    print("------------------------------------------------------------------")
+    for t_type in ['DIRECT_ENTRY', 'RETEST_ENTRY']:
+        sub_df = df_all[df_all['Type'] == t_type]
+        if not sub_df.empty:
+            sub_tr = len(sub_df)
+            sub_wins = sub_df[sub_df['Win'] == True]
+            sub_losses = sub_df[sub_df['Win'] == False]
+            
+            sub_wr = (len(sub_wins) / sub_tr) * 100
+            sub_gp = sub_wins['PnL_%'].sum()
+            sub_gl = abs(sub_losses['PnL_%'].sum())
+            sub_pf = sub_gp / sub_gl if sub_gl > 0 else 999.0
+
+            print(f"🔹 {t_type} -> Trades: {sub_tr} | Win-Rate: {round(sub_wr, 2)}% | Profit Factor: {round(sub_pf, 2)}")
+    print("==================================================================")
+
 else:
     print("\nNo trades met the criteria in the backtest period.")
     
