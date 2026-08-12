@@ -9,15 +9,15 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== BACKTEST: MOTHER CANDLE LOW RETRACEMENT (DEMAND ZONE ENTRY) ===", flush=True)
+print("=== BACKTEST: OPTIMIZED MOTHER CANDLE DEMAND REVERSAL ===", flush=True)
 
 # ===== CONFIGURATION =====
-MIN_AVG_VOLUME = 500_000          # 5 Lakh Daily Avg Volume
-MIN_AVG_TURNOVER_CR = 3.0        # ₹3 Crore Daily Turnover
-MAX_HOLDING_DAYS = 20            # 20 Days Holding Limit
+MIN_AVG_VOLUME = 500_000          
+MIN_AVG_TURNOVER_CR = 3.0        
+MAX_HOLDING_DAYS = 20            
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
+START_DATE = END_DATE - timedelta(days=1095)
 
 # ===== READ WATCHLIST =====
 try:
@@ -46,8 +46,8 @@ except Exception as e:
     exit(1)
 
 
-# ===== MOTHER CANDLE DEMAND RETRACEMENT ENGINE =====
-def backtest_mother_demand_entry(df):
+# ===== OPTIMIZED ENGINE =====
+def backtest_optimized_mother_reversal(df):
     trades = []
     n = len(df)
     i = 50
@@ -55,66 +55,63 @@ def backtest_mother_demand_entry(df):
     while i < n - MAX_HOLDING_DAYS:
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Step 1: Lookback within last 6 days for a valid Mother Candle
-            for m in range(i - 6, i):
-                m_range = df['High'].iloc[m] - df['Low'].iloc[m]
-                m_atr = df['ATR'].iloc[m]
-                m_vol = df['Volume'].iloc[m]
-                m_vol_avg = df['Vol_Avg_20'].iloc[m]
+            # RULE 1: Stock MUST be in Uptrend (Above 50 EMA)
+            if df['Close'].iloc[i] > df['EMA_50'].iloc[i]:
                 
-                # High Volume + Large Range Green Mother Candle
-                is_mother_candle = (m_range >= 1.8 * m_atr) and (m_vol >= 1.8 * m_vol_avg) and (df['Close'].iloc[m] > df['Open'].iloc[m])
+                # Lookback for Mother Candle (Last 8 Days)
+                for m in range(i - 8, i - 1):
+                    m_range = df['High'].iloc[m] - df['Low'].iloc[m]
+                    m_atr = df['ATR'].iloc[m]
+                    m_vol = df['Volume'].iloc[m]
+                    m_vol_avg = df['Vol_Avg_20'].iloc[m]
+                    
+                    # Strong Green Expansion Bar
+                    is_mother = (m_range >= 1.8 * m_atr) and (m_vol >= 1.8 * m_vol_avg) and (df['Close'].iloc[m] > df['Open'].iloc[m])
 
-                if is_mother_candle:
-                    mother_low = df['Low'].iloc[m]
-                    mother_high = df['High'].iloc[m]
+                    if is_mother:
+                        mother_low = df['Low'].iloc[m]
+                        mother_high = df['High'].iloc[m]
 
-                    # Step 2: Ensure Mother Low has not been broken between mother day and current day
-                    low_protected = df['Low'].iloc[m+1 : i+1].min() >= mother_low
+                        # RULE 2: Mother Low NEVER Broken
+                        low_protected = df['Low'].iloc[m+1 : i+1].min() >= mother_low
 
-                    # Step 3: Check if Current Price is in Demand Zone (Lower 35% of Mother Candle)
-                    demand_zone_upper = mother_low + (0.35 * m_range)
-                    in_demand_zone = df['Low'].iloc[i] <= demand_zone_upper
+                        # RULE 3: Entry in Lower 30% Zone + Green Reversal Candle + High Volume
+                        in_demand_zone = df['Low'].iloc[i] <= (mother_low + 0.35 * m_range)
+                        is_green_reversal = df['Close'].iloc[i] > df['Open'].iloc[i]
+                        high_volume_entry = df['Volume'].iloc[i] >= (1.2 * df['Vol_Avg_20'].iloc[i])
 
-                    # Step 4: Rejection Confirmation (Pinbar / Demand Support Candle)
-                    candle_range = df['High'].iloc[i] - df['Low'].iloc[i]
-                    strong_rejection = False
-                    if candle_range > 0:
-                        close_pos = (df['Close'].iloc[i] - df['Low'].iloc[i]) / candle_range
-                        strong_rejection = close_pos >= 0.40  # Close in upper 60% / Lower wick >= 40%
+                        if low_protected and in_demand_zone and is_green_reversal and high_volume_entry:
+                            entry_price = df['Close'].iloc[i]
+                            stop_loss = round(mother_low * 0.995, 2)
+                            target_price = round(mother_high, 2)
+                            
+                            risk = entry_price - stop_loss
+                            reward = target_price - entry_price
 
-                    if low_protected and in_demand_zone and strong_rejection:
-                        entry_price = df['Close'].iloc[i]
-                        stop_loss = round(mother_low * 0.995, 2)  # SL 0.5% below Mother Low
-                        target_price = round(mother_high, 2)      # Target = Mother Candle High
-                        
-                        risk = entry_price - stop_loss
-                        reward = target_price - entry_price
+                            # Minimum 1.5 Reward:Risk + Max 5% Risk Cap
+                            if risk > 0 and reward >= (1.5 * risk) and (risk / entry_price) <= 0.05:
+                                future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
+                                win = False
+                                exit_price = entry_price
 
-                        # Minimum 1.5 : 1 Reward-to-Risk Requirement
-                        if risk > 0 and reward >= (1.5 * risk) and (risk / entry_price) <= 0.06:
-                            future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                            win = False
-                            exit_price = entry_price
+                                for _, f_row in future_df.iterrows():
+                                    if f_row['High'] >= target_price:
+                                        exit_price = target_price
+                                        win = True
+                                        break
+                                    if f_row['Low'] <= stop_loss:
+                                        exit_price = stop_loss
+                                        win = False
+                                        break
 
-                            for _, f_row in future_df.iterrows():
-                                if f_row['High'] >= target_price:
-                                    exit_price = target_price
-                                    win = True
-                                    break
-                                if f_row['Low'] <= stop_loss:
-                                    exit_price = stop_loss
-                                    win = False
-                                    break
+                                if exit_price == entry_price and not future_df.empty:
+                                    exit_price = future_df['Close'].iloc[-1]
+                                    win = exit_price > entry_price
 
-                            if exit_price == entry_price and not future_df.empty:
-                                exit_price = future_df['Close'].iloc[-1]
-                                win = exit_price > entry_price
-
-                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                            trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
-                            i += MAX_HOLDING_DAYS
-                        break
+                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                                trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
+                                i += MAX_HOLDING_DAYS
+                            break
         i += 1
 
     return pd.DataFrame(trades) if trades else None
@@ -123,7 +120,7 @@ def backtest_mother_demand_entry(df):
 # ===== MAIN EXECUTION =====
 all_trades = []
 
-print("\nExecuting Demand Zone Retracement Backtest...", flush=True)
+print("\nExecuting Optimized Retracement Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -137,6 +134,7 @@ for stock in STOCKS:
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
+        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
         # ATR (14)
         df['TR'] = np.maximum(df['High'] - df['Low'], 
@@ -144,7 +142,7 @@ for stock in STOCKS:
                                          abs(df['Low'] - df['Close'].shift(1))))
         df['ATR'] = df['TR'].rolling(14).mean()
 
-        res = backtest_mother_demand_entry(df)
+        res = backtest_optimized_mother_reversal(df)
         if res is not None and not res.empty:
             all_trades.append(res)
 
@@ -162,7 +160,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 MOTHER CANDLE DEMAND ZONE RETRACEMENT RESULTS")
+    print("🏆 OPTIMIZED MOTHER CANDLE REVERSAL RESULTS")
     print("==================================================================")
     print(f"Total Executed Trades          : {total_tr}")
     print(f"Win-Rate                       : {round(win_rate, 2)}%")
@@ -171,5 +169,5 @@ if all_trades:
     print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 else:
-    print("\nNo trades executed for Demand Zone Strategy.")
+    print("\nNo trades executed for Optimized Strategy.")
     
