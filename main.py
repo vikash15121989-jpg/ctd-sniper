@@ -9,12 +9,13 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V133.0: RELATIVE VOLUME EXPANSION & VOLATILITY CONTRACTION ENGINE ===", flush=True)
+print("=== V134.0: EXHAUSTION RED CANDLE BREAKOUT (10% TARGET) ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 100_000         # Min 1 Lakh Daily Volume
 MIN_AVG_TURNOVER_CR = 2.0        # Min ₹2 Crore Daily Turnover
-MAX_HOLDING_DAYS = 20             # Tighter holding period
+MAX_HOLDING_DAYS = 30             # 10% Target ke liye 30 days maximum window
+TARGET_PCT = 0.10                 # Fixed 10% Target
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
@@ -47,81 +48,80 @@ except Exception as e:
 
 
 # ===== 2. STRATEGY ENGINE =====
-def backtest_v133_engine(df_daily):
+def backtest_v134_engine(df_daily):
     trades = []
     df = df_daily.copy()
 
     df['Turnover'] = df['Close'] * df['Volume']
     df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
     df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
-    df['SMA_200'] = df['Close'].rolling(200).mean()
+    
     df['Candle_Range'] = df['High'] - df['Low']
     df['Range_Avg_10'] = df['Candle_Range'].rolling(10).mean()
+    
+    # 10-day High tracking for "Swing High Fall" context
+    df['Swing_High_10'] = df['High'].rolling(10).max()
 
     n = len(df)
-    i = 200
+    i = 20 # Start index after indicators warm up
 
     while i < n - MAX_HOLDING_DAYS:
+        # Basic Liquidity Filter
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Baseline Trend Guardrail: Price above 200 SMA
-            if df['Close'].iloc[i] >= df['SMA_200'].iloc[i]:
-                
-                # Mother Red Candle (Absorption Day)
-                is_red = df['Close'].iloc[i] < df['Open'].iloc[i]
-                is_high_range = df['Candle_Range'].iloc[i] >= (1.3 * df['Range_Avg_10'].iloc[i])
-                is_high_volume = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
+            # Condition 1: Stock is falling from Swing High (Current Close is at least 3% below 10-day Swing High)
+            recent_high = df['Swing_High_10'].iloc[i]
+            is_falling_from_swing = df['Close'].iloc[i] <= (recent_high * 0.97)
 
-                if is_red and is_high_range and is_high_volume:
-                    mother_high = df['High'].iloc[i]
-                    mother_low = df['Low'].iloc[i]
+            # Condition 2: Red Candle + Range Bda (>= 1.3x Avg Range) + Volume Chhota (<= 0.8x 20-Day Avg Vol)
+            is_red = df['Close'].iloc[i] < df['Open'].iloc[i]
+            is_large_range = df['Candle_Range'].iloc[i] >= (1.3 * df['Range_Avg_10'].iloc[i])
+            is_low_volume = df['Volume'].iloc[i] <= (0.8 * df['Vol_Avg_20'].iloc[i])
 
-                    search_limit = min(n - 1, i + 12)
+            if is_falling_from_swing and is_red and is_large_range and is_low_volume:
+                red_high = df['High'].iloc[i]
+                red_low = df['Low'].iloc[i]
 
-                    for k in range(i + 1, search_limit):
-                        k_vol = df['Volume'].iloc[k]
-                        k_vol_avg = df['Vol_Avg_20'].iloc[k]
-                        k_close = df['Close'].iloc[k]
+                search_limit = min(n - 1, i + 10) # Wait up to 10 days for high break
 
-                        # Expansion Breakout: Close > Mother High AND Relative Volume Expansion >= 1.3x 20-day Average
-                        if k_close > mother_high and k_vol >= (1.3 * k_vol_avg):
+                for k in range(i + 1, search_limit):
+                    # Condition 3: Agli candle is Low-Vol Red Candle ka High BREAK/CLOSE kare
+                    if df['Close'].iloc[k] > red_high:
+                        
+                        entry_price = df['Close'].iloc[k]
+                        stop_loss = round(red_low * 0.995, 2) # Buffer below Red Candle Low
+                        target_price = round(entry_price * (1 + TARGET_PCT), 2) # Fixed 10% Target
 
-                            entry_price = k_close
-                            stop_loss = round(mother_low * 0.99, 2)
-                            risk = entry_price - stop_loss
+                        risk = entry_price - stop_loss
 
-                            if risk > 0 and 0.02 <= (risk / entry_price) <= 0.07:
-                                target_price = round(entry_price + (risk * 2.0), 2)
-                                be_trigger = round(entry_price + (risk * 1.2), 2)
+                        if risk > 0 and (risk / entry_price) <= 0.08: # Max 8% SL Risk cap
+                            future_df = df.iloc[k + 1 : k + 1 + MAX_HOLDING_DAYS]
+                            win = False
+                            exit_price = entry_price
 
-                                future_df = df.iloc[k + 1 : k + 1 + MAX_HOLDING_DAYS]
-                                win = False
-                                exit_price = entry_price
-                                curr_sl = stop_loss
+                            for _, f_row in future_df.iterrows():
+                                # Target 10% Hit
+                                if f_row['High'] >= target_price:
+                                    exit_price = target_price
+                                    win = True
+                                    break
+                                
+                                # Stop Loss Hit at Red Candle Low
+                                if f_row['Low'] <= stop_loss:
+                                    exit_price = stop_loss
+                                    win = False
+                                    break
 
-                                for _, f_row in future_df.iterrows():
-                                    if f_row['High'] >= be_trigger:
-                                        curr_sl = max(curr_sl, entry_price) # Trailing SL to BE
+                            # Time-based Exit at end of 30 days if neither hit
+                            if exit_price == entry_price and not future_df.empty:
+                                exit_price = future_df['Close'].iloc[-1]
+                                win = exit_price >= target_price
 
-                                    if f_row['High'] >= target_price:
-                                        exit_price = target_price
-                                        win = True
-                                        break
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
 
-                                    if f_row['Low'] <= curr_sl:
-                                        exit_price = curr_sl
-                                        win = exit_price > entry_price
-                                        break
-
-                                if exit_price == entry_price and not future_df.empty:
-                                    exit_price = future_df['Close'].iloc[-1]
-                                    win = exit_price > entry_price
-
-                                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                                trades.append({"Win": win, "PnL_%": pnl_pct})
-
-                                i = k + MAX_HOLDING_DAYS
-                                break
+                            i = k + MAX_HOLDING_DAYS
+                            break
         i += 1
 
     if not trades:
@@ -133,7 +133,7 @@ def backtest_v133_engine(df_daily):
 # ===== 3. EXECUTE BACKTEST =====
 all_trades = []
 
-print("\nRunning V133.0 Engine Backtest...", flush=True)
+print("\nRunning V134.0 Custom Logic Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -141,10 +141,10 @@ for stock in STOCKS:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 100:
+        if df.empty or len(df) < 50:
             continue
 
-        df_res = backtest_v133_engine(df)
+        df_res = backtest_v134_engine(df)
         if df_res is not None and not df_res.empty:
             all_trades.append(df_res)
     except Exception:
@@ -162,11 +162,13 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 OVERALL RESULTS: V133.0 RELATIVE VOLUME EXPANSION ENGINE")
+    print("🏆 RESULTS: CUSTOM LOW-VOL EXHAUSTION RED BREAKOUT (10% TARGET)")
     print("==================================================================")
-    print(f"Total Quality Executed Trades  : {total_tr}")
-    print(f"Overall Win-Rate               : {round(win_rate, 2)}%")
-    print(f"Overall Profit Factor          : {round(overall_pf, 2)}")
+    print(f"Total Executed Trades          : {total_tr}")
+    print(f"Win-Rate                       : {round(win_rate, 2)}%")
+    print(f"Profit Factor                  : {round(overall_pf, 2)}")
+    print(f"Average Profit per Win Trade   : +10.0%")
+    print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 
 else:
