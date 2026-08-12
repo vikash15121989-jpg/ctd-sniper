@@ -9,26 +9,22 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V143.0 PRODUCTION: LIVE SWEEP SIGNAL SCANNER ===", flush=True)
+print("=== BACKTEST: MOTHER CANDLE LOW RETRACEMENT (DEMAND ZONE ENTRY) ===", flush=True)
 
 # ===== CONFIGURATION =====
-MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
-MIN_AVG_TURNOVER_CR = 5.0        # ₹5 Crore Daily Turnover
+MIN_AVG_VOLUME = 500_000          # 5 Lakh Daily Avg Volume
+MIN_AVG_TURNOVER_CR = 3.0        # ₹3 Crore Daily Turnover
+MAX_HOLDING_DAYS = 20            # 20 Days Holding Limit
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=200)
+START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
 
-# ===== GOOGLE SHEETS SETUP =====
+# ===== READ WATCHLIST =====
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
     sh = gc.open("CTD_Sniper")
     ws_watchlist = sh.worksheet("Watchlist")
-
-    try:
-        ws_signals = sh.worksheet("Sweep_Signals")
-    except Exception:
-        ws_signals = sh.add_worksheet(title="Sweep_Signals", rows="100", cols="10")
 
     raw_stocks = ws_watchlist.col_values(1)
     STOCKS = []
@@ -43,14 +39,91 @@ try:
                 STOCKS.append(clean_s)
 
     STOCKS = sorted(list(set(STOCKS)))
-    print(f"✅ Loaded {len(STOCKS)} valid stocks for daily scanning.", flush=True)
+    print(f"✅ Total Valid Stocks Loaded: {len(STOCKS)}", flush=True)
 
 except Exception as e:
-    print(f"❌ Error setting up Google Sheet: {e}")
+    print(f"❌ Error Reading Watchlist: {e}")
     exit(1)
 
-# ===== DAILY SCAN ENGINE (V143.0 LOGIC) =====
-today_signals = []
+
+# ===== MOTHER CANDLE DEMAND RETRACEMENT ENGINE =====
+def backtest_mother_demand_entry(df):
+    trades = []
+    n = len(df)
+    i = 50
+
+    while i < n - MAX_HOLDING_DAYS:
+        if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
+            
+            # Step 1: Lookback within last 6 days for a valid Mother Candle
+            for m in range(i - 6, i):
+                m_range = df['High'].iloc[m] - df['Low'].iloc[m]
+                m_atr = df['ATR'].iloc[m]
+                m_vol = df['Volume'].iloc[m]
+                m_vol_avg = df['Vol_Avg_20'].iloc[m]
+                
+                # High Volume + Large Range Green Mother Candle
+                is_mother_candle = (m_range >= 1.8 * m_atr) and (m_vol >= 1.8 * m_vol_avg) and (df['Close'].iloc[m] > df['Open'].iloc[m])
+
+                if is_mother_candle:
+                    mother_low = df['Low'].iloc[m]
+                    mother_high = df['High'].iloc[m]
+
+                    # Step 2: Ensure Mother Low has not been broken between mother day and current day
+                    low_protected = df['Low'].iloc[m+1 : i+1].min() >= mother_low
+
+                    # Step 3: Check if Current Price is in Demand Zone (Lower 35% of Mother Candle)
+                    demand_zone_upper = mother_low + (0.35 * m_range)
+                    in_demand_zone = df['Low'].iloc[i] <= demand_zone_upper
+
+                    # Step 4: Rejection Confirmation (Pinbar / Demand Support Candle)
+                    candle_range = df['High'].iloc[i] - df['Low'].iloc[i]
+                    strong_rejection = False
+                    if candle_range > 0:
+                        close_pos = (df['Close'].iloc[i] - df['Low'].iloc[i]) / candle_range
+                        strong_rejection = close_pos >= 0.40  # Close in upper 60% / Lower wick >= 40%
+
+                    if low_protected and in_demand_zone and strong_rejection:
+                        entry_price = df['Close'].iloc[i]
+                        stop_loss = round(mother_low * 0.995, 2)  # SL 0.5% below Mother Low
+                        target_price = round(mother_high, 2)      # Target = Mother Candle High
+                        
+                        risk = entry_price - stop_loss
+                        reward = target_price - entry_price
+
+                        # Minimum 1.5 : 1 Reward-to-Risk Requirement
+                        if risk > 0 and reward >= (1.5 * risk) and (risk / entry_price) <= 0.06:
+                            future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
+                            win = False
+                            exit_price = entry_price
+
+                            for _, f_row in future_df.iterrows():
+                                if f_row['High'] >= target_price:
+                                    exit_price = target_price
+                                    win = True
+                                    break
+                                if f_row['Low'] <= stop_loss:
+                                    exit_price = stop_loss
+                                    win = False
+                                    break
+
+                            if exit_price == entry_price and not future_df.empty:
+                                exit_price = future_df['Close'].iloc[-1]
+                                win = exit_price > entry_price
+
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
+                            i += MAX_HOLDING_DAYS
+                        break
+        i += 1
+
+    return pd.DataFrame(trades) if trades else None
+
+
+# ===== MAIN EXECUTION =====
+all_trades = []
+
+print("\nExecuting Demand Zone Retracement Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -64,61 +137,39 @@ for stock in STOCKS:
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
-        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-        # Latest Candle Data
-        curr = df.iloc[-1]
-        prev_10_low = df['Low'].iloc[-11:-1].min()
-        prev_10_high = df['High'].iloc[-11:-1].max()
+        # ATR (14)
+        df['TR'] = np.maximum(df['High'] - df['Low'], 
+                              np.maximum(abs(df['High'] - df['Close'].shift(1)), 
+                                         abs(df['Low'] - df['Close'].shift(1))))
+        df['ATR'] = df['TR'].rolling(14).mean()
 
-        if curr['Vol_Avg_20'] >= MIN_AVG_VOLUME and curr['Turnover_Avg_20_Cr'] >= MIN_AVG_TURNOVER_CR:
-            
-            above_20_ema = curr['Close'] > curr['EMA_20']
-            swept_low = curr['Low'] < prev_10_low
-            closed_above_low = curr['Close'] > prev_10_low
-            
-            candle_range = curr['High'] - curr['Low']
-            strong_rejection = False
-            if candle_range > 0:
-                close_pos = (curr['Close'] - curr['Low']) / candle_range
-                strong_rejection = close_pos >= 0.50
-
-            high_vol = curr['Volume'] >= (1.2 * curr['Vol_Avg_20'])
-
-            # Signal Trigger
-            if above_20_ema and swept_low and closed_above_low and strong_rejection and high_vol:
-                entry = round(curr['Close'], 2)
-                sl = round(curr['Low'] * 0.995, 2)
-                risk = entry - sl
-                
-                min_target = entry + (1.8 * risk)
-                target = round(max(prev_10_high, min_target), 2)
-                
-                risk_pct = round((risk / entry) * 100, 2)
-                reward_pct = round(((target - entry) / entry) * 100, 2)
-
-                if risk_pct <= 7.0:
-                    today_signals.append([
-                        datetime.now().strftime("%Y-%m-%d"),
-                        stock.replace(".NS", ""),
-                        entry,
-                        sl,
-                        target,
-                        f"{risk_pct}%",
-                        f"+{reward_pct}%",
-                        round(curr['Turnover_Avg_20_Cr'], 2)
-                    ])
+        res = backtest_mother_demand_entry(df)
+        if res is not None and not res.empty:
+            all_trades.append(res)
 
     except Exception:
         pass
 
-# ===== UPDATE GOOGLE SHEET =====
-headers = ["Date", "Symbol", "Entry Price", "Stop Loss", "Target", "Risk %", "Expected Return %", "Avg Turnover (Cr)"]
-ws_signals.clear()
-ws_signals.append_row(headers)
+if all_trades:
+    df_all = pd.concat(all_trades, ignore_index=True)
+    total_tr = len(df_all)
+    wins = df_all[df_all['Win'] == True]
+    losses = df_all[df_all['Win'] == False]
+    win_rate = (len(wins) / total_tr) * 100
+    gross_profit = wins['PnL_%'].sum()
+    gross_loss = abs(losses['PnL_%'].sum())
+    overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
-if today_signals:
-    ws_signals.append_rows(today_signals)
-    print(f"\n🚀 SCAN COMPLETE: Found {len(today_signals)} active Sweep Signals!", flush=True)
+    print("\n==================================================================")
+    print("🏆 MOTHER CANDLE DEMAND ZONE RETRACEMENT RESULTS")
+    print("==================================================================")
+    print(f"Total Executed Trades          : {total_tr}")
+    print(f"Win-Rate                       : {round(win_rate, 2)}%")
+    print(f"Profit Factor                  : {round(overall_pf, 2)}")
+    print(f"Average Profit per Win Trade   : +{round(wins['PnL_%'].mean(), 2)}%")
+    print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
+    print("==================================================================")
 else:
-    print("\n⚡ SCAN COMPLETE: No active sweep signals today.", flush=True)
+    print("\nNo trades executed for Demand Zone Strategy.")
+    
