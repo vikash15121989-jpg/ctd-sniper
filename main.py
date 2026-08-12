@@ -9,11 +9,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V137.0: CUSTOM LIQUIDITY ENGINE (10 LAKH VOL | ₹5 CR TURNOVER) ===", flush=True)
+print("=== V138.0: REFINED LIQUIDITY SWEEP ENGINE (200 EMA + 1:2.5 RR) ===", flush=True)
 
-# ===== EXACT LIQUIDITY CONFIGURATION =====
-MIN_AVG_VOLUME = 1_000_000       # Exactly 10 Lakh Daily Avg Volume
-MIN_AVG_TURNOVER_CR = 5.0        # Exactly ₹5 Crore Daily Turnover
+# ===== CONFIGURATION =====
+MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
+MIN_AVG_TURNOVER_CR = 5.0        # ₹5 Crore Daily Turnover
 MAX_HOLDING_DAYS = 25            
 
 END_DATE = datetime.now().date()
@@ -46,28 +46,36 @@ except Exception as e:
     exit(1)
 
 
-# ===== STRATEGY ENGINES =====
-
-# LOGIC 1: LIQUIDITY SWEEP / SL HUNT
-def backtest_logic_1_sweep(df):
+# ===== STRATEGY ENGINE =====
+def backtest_v138_refined_sweep(df):
     trades = []
     n = len(df)
-    i = 20
+    i = 200 # Warm up for 200 EMA
+
     while i < n - MAX_HOLDING_DAYS:
+        # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
-            prev_10_low = df['Low'].iloc[i-10:i].min()
             
+            # Filter 1: Trend Alignment (Close > 200 EMA)
+            above_200_ema = df['Close'].iloc[i] > df['EMA_200'].iloc[i]
+            
+            # Filter 2: Liquidity Sweep of 10-day Low
+            prev_10_low = df['Low'].iloc[i-10:i].min()
             swept_low = df['Low'].iloc[i] < prev_10_low
             closed_above = df['Close'].iloc[i] > prev_10_low
-            high_vol = df['Volume'].iloc[i] >= (1.3 * df['Vol_Avg_20'].iloc[i])
+            
+            # Filter 3: High Institutional Volume (>= 1.5x 20-Day Avg)
+            high_vol = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
 
-            if swept_low and closed_above and high_vol:
+            if above_200_ema and swept_low and closed_above and high_vol:
                 entry_price = df['Close'].iloc[i]
                 stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
-                target_price = df['High'].iloc[i-10:i].max()
-                
                 risk = entry_price - stop_loss
-                if risk > 0 and (risk / entry_price) <= 0.08:
+                
+                # Dynamic Target based on 1:2.5 Risk-Reward
+                target_price = round(entry_price + (2.5 * risk), 2)
+
+                if risk > 0 and (risk / entry_price) <= 0.08: # Max 8% Risk Cap
                     future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
                     win = False
                     exit_price = entry_price
@@ -90,101 +98,14 @@ def backtest_logic_1_sweep(df):
                     trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
                     i += MAX_HOLDING_DAYS
         i += 1
-    return pd.DataFrame(trades) if trades else None
 
-
-# LOGIC 2: RELATIVE OUTPERFORMANCE
-def backtest_logic_2_relative(df):
-    trades = []
-    n = len(df)
-    i = 20
-    while i < n - MAX_HOLDING_DAYS:
-        if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
-            three_day_drop = df['Close'].iloc[i-1] <= df['Close'].iloc[i-4] * 0.96
-            stock_resilient = df['Close'].iloc[i] > df['Open'].iloc[i]
-            vol_spike = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
-
-            if three_day_drop and stock_resilient and vol_spike:
-                entry_price = df['Close'].iloc[i]
-                stop_loss = round(df['Low'].iloc[i] * 0.99, 2)
-                target_price = round(entry_price * 1.08, 2)
-                
-                risk = entry_price - stop_loss
-                if risk > 0 and (risk / entry_price) <= 0.08:
-                    future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                    win = False
-                    exit_price = entry_price
-
-                    for _, f_row in future_df.iterrows():
-                        if f_row['High'] >= target_price:
-                            exit_price = target_price
-                            win = True
-                            break
-                        if f_row['Low'] <= stop_loss:
-                            exit_price = stop_loss
-                            win = False
-                            break
-
-                    if exit_price == entry_price and not future_df.empty:
-                        exit_price = future_df['Close'].iloc[-1]
-                        win = exit_price > entry_price
-
-                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                    trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
-                    i += MAX_HOLDING_DAYS
-        i += 1
-    return pd.DataFrame(trades) if trades else None
-
-
-# LOGIC 3: VOLATILITY CONTRACTION (VCP)
-def backtest_logic_3_vcp(df):
-    trades = []
-    n = len(df)
-    i = 20
-    while i < n - MAX_HOLDING_DAYS:
-        if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
-            above_ema = df['Close'].iloc[i] > df['EMA_50'].iloc[i]
-            range_squeeze = df['Candle_Range'].iloc[i] <= (0.5 * df['Range_Avg_10'].iloc[i])
-            volume_dryup = df['Volume'].iloc[i] <= (0.5 * df['Vol_Avg_20'].iloc[i])
-
-            if above_ema and range_squeeze and volume_dryup:
-                if i + 1 < n:
-                    if df['Close'].iloc[i+1] > df['High'].iloc[i] and df['Volume'].iloc[i+1] > df['Vol_Avg_20'].iloc[i+1]:
-                        entry_price = df['Close'].iloc[i+1]
-                        stop_loss = round(df['Low'].iloc[i] * 0.99, 2)
-                        risk = entry_price - stop_loss
-                        target_price = round(entry_price + (2.5 * risk), 2)
-
-                        if risk > 0 and (risk / entry_price) <= 0.08:
-                            future_df = df.iloc[i + 2 : i + 2 + MAX_HOLDING_DAYS]
-                            win = False
-                            exit_price = entry_price
-
-                            for _, f_row in future_df.iterrows():
-                                if f_row['High'] >= target_price:
-                                    exit_price = target_price
-                                    win = True
-                                    break
-                                if f_row['Low'] <= stop_loss:
-                                    exit_price = stop_loss
-                                    win = False
-                                    break
-
-                            if exit_price == entry_price and not future_df.empty:
-                                exit_price = future_df['Close'].iloc[-1]
-                                win = exit_price > entry_price
-
-                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                            trades.append({"Win": win, "PnL_%": pnl_pct, "Risk_%": (risk / entry_price) * 100})
-                            i += MAX_HOLDING_DAYS
-        i += 1
     return pd.DataFrame(trades) if trades else None
 
 
 # ===== MAIN EXECUTION =====
-trades_l1, trades_l2, trades_l3 = [], [], []
+all_trades = []
 
-print("\nExecuting backtest with 10 Lakh Vol & ₹5 Cr Turnover filters...", flush=True)
+print("\nExecuting V138.0 Refined Sweep Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -192,33 +113,23 @@ for stock in STOCKS:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 200:
             continue
 
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
-        df['Candle_Range'] = df['High'] - df['Low']
-        df['Range_Avg_10'] = df['Candle_Range'].rolling(10).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-        res1 = backtest_logic_1_sweep(df)
-        res2 = backtest_logic_2_relative(df)
-        res3 = backtest_logic_3_vcp(df)
-
-        if res1 is not None: trades_l1.append(res1)
-        if res2 is not None: trades_l2.append(res2)
-        if res3 is not None: trades_l3.append(res3)
+        res = backtest_v138_refined_sweep(df)
+        if res is not None and not res.empty:
+            all_trades.append(res)
 
     except Exception:
         pass
 
-
-def summarize_results(name, trade_list):
-    if not trade_list:
-        print(f"\n[{name}] No trades executed.")
-        return
-    df_all = pd.concat(trade_list, ignore_index=True)
+if all_trades:
+    df_all = pd.concat(all_trades, ignore_index=True)
     total_tr = len(df_all)
     wins = df_all[df_all['Win'] == True]
     losses = df_all[df_all['Win'] == False]
@@ -227,16 +138,15 @@ def summarize_results(name, trade_list):
     gross_loss = abs(losses['PnL_%'].sum())
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
-    print(f"\n📊 --- {name} ---")
-    print(f"Total Trades   : {total_tr}")
-    print(f"Win-Rate       : {round(win_rate, 2)}%")
-    print(f"Profit Factor  : {round(overall_pf, 2)}")
-    print(f"Avg Loss/Trade : {round(losses['PnL_%'].mean(), 2)}%" if not losses.empty else "0%")
-
-print("\n==================================================================")
-print("🏆 CUSTOM LIQUIDITY (10L Vol | ₹5Cr Turnover) RESULTS")
-print("==================================================================")
-summarize_results("LOGIC 1: LIQUIDITY SWEEP / SL HUNT", trades_l1)
-summarize_results("LOGIC 2: RELATIVE OUTPERFORMANCE", trades_l2)
-summarize_results("LOGIC 3: VOLATILITY CONTRACTION (VCP)", trades_l3)
-print("==================================================================")
+    print("\n==================================================================")
+    print("🏆 V138.0 REFINED LIQUIDITY SWEEP RESULTS")
+    print("==================================================================")
+    print(f"Total Executed Trades          : {total_tr}")
+    print(f"Win-Rate                       : {round(win_rate, 2)}%")
+    print(f"Profit Factor                  : {round(overall_pf, 2)}")
+    print(f"Average Profit per Win Trade   : +{round(wins['PnL_%'].mean(), 2)}%")
+    print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
+    print("==================================================================")
+else:
+    print("\nNo trades executed in V138.0.")
+    
