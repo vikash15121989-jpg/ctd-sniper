@@ -9,7 +9,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V143.0 BACKTEST: HIGH FREQUENCY R:R OPTIMIZER ===", flush=True)
+print("=== V144.0 BACKTEST: ATR DYNAMIC SL + RSI FILTER ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
@@ -46,48 +46,50 @@ except Exception as e:
     exit(1)
 
 
-# ===== ADVANCED V143 ENGINE =====
-def backtest_v143_optimized_sweep(df):
+# ===== ADVANCED V144 ENGINE =====
+def backtest_v144_atr_rsi_sweep(df):
     trades = []
     n = len(df)
     i = 50
 
     while i < n - MAX_HOLDING_DAYS:
-        # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
             price = df['Close'].iloc[i]
             ema20 = df['EMA_20'].iloc[i]
+            rsi = df['RSI'].iloc[i]
+            atr = df['ATR'].iloc[i]
             
-            # 1. Trend Filter: Price > 20 EMA
+            # 1. Trend & RSI Filter
             above_20_ema = price > ema20
+            rsi_filter = rsi <= 50  # Only take trades when stock is in pullback zone
             
-            # 2. Sweep Logic: Low breaches 10-day low, Close stays above 10-day low
+            # 2. Sweep Logic
             prev_10_low = df['Low'].iloc[i-10:i].min()
             swept_low = df['Low'].iloc[i] < prev_10_low
             closed_above_low = price > prev_10_low
             
-            # 3. Pinbar Candle Structure (Close in upper 50% of candle range)
+            # 3. Pinbar Rejection
             candle_range = df['High'].iloc[i] - df['Low'].iloc[i]
             strong_rejection = False
             if candle_range > 0:
                 close_pos = (price - df['Low'].iloc[i]) / candle_range
                 strong_rejection = close_pos >= 0.50
             
-            # 4. Moderate Volume Spike (1.2x 20-Day Avg)
+            # 4. Volume Spike
             high_vol = df['Volume'].iloc[i] >= (1.2 * df['Vol_Avg_20'].iloc[i])
 
-            if above_20_ema and swept_low and closed_above_low and strong_rejection and high_vol:
+            if above_20_ema and rsi_filter and swept_low and closed_above_low and strong_rejection and high_vol:
                 entry_price = price
-                stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
+                # ATR-Based Dynamic Stop Loss
+                stop_loss = round(df['Low'].iloc[i] - (0.3 * atr), 2)
                 risk = entry_price - stop_loss
                 
-                # Dynamic Target: 1.8x Risk Floor or Previous 10-day High
                 min_target = entry_price + (1.8 * risk)
                 swing_high_target = df['High'].iloc[i-10:i].max()
                 target_price = round(max(swing_high_target, min_target), 2)
 
-                if risk > 0 and (risk / entry_price) <= 0.07: # Max 7% Risk Cap
+                if risk > 0 and (risk / entry_price) <= 0.07:
                     future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
                     win = False
                     exit_price = entry_price
@@ -117,7 +119,7 @@ def backtest_v143_optimized_sweep(df):
 # ===== MAIN EXECUTION =====
 all_trades = []
 
-print("\nExecuting V143.0 Backtest...", flush=True)
+print("\nExecuting V144.0 Backtest...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -128,12 +130,26 @@ for stock in STOCKS:
         if df.empty or len(df) < 50:
             continue
 
+        # Technical Indicators
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-        res = backtest_v143_optimized_sweep(df)
+        # ATR (14)
+        df['TR'] = np.maximum(df['High'] - df['Low'], 
+                              np.maximum(abs(df['High'] - df['Close'].shift(1)), 
+                                         abs(df['Low'] - df['Close'].shift(1))))
+        df['ATR'] = df['TR'].rolling(14).mean()
+
+        # RSI (14)
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        res = backtest_v144_atr_rsi_sweep(df)
         if res is not None and not res.empty:
             all_trades.append(res)
 
@@ -151,7 +167,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 V143.0 BACKTEST RESULTS (HIGH FREQUENCY R:R OPTIMIZER)")
+    print("🏆 V144.0 BACKTEST RESULTS (ATR DYNAMIC SL + RSI FILTER)")
     print("==================================================================")
     print(f"Total Executed Trades          : {total_tr}")
     print(f"Win-Rate                       : {round(win_rate, 2)}%")
@@ -160,5 +176,5 @@ if all_trades:
     print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 else:
-    print("\nNo trades executed in V143.0.")
-        
+    print("\nNo trades executed in V144.0.")
+    
