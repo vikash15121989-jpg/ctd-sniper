@@ -9,22 +9,26 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V143.0 TARGET MATRIX TEST (2% TO 10% TARGET SWEEP) ===", flush=True)
+print("=== V143.0 PRODUCTION: LIVE SWEEP SIGNAL SCANNER ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
 MIN_AVG_TURNOVER_CR = 5.0        # ₹5 Crore Daily Turnover
-MAX_HOLDING_DAYS = 20            # 20 Days Holding Period
 
 END_DATE = datetime.now().date()
-START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
+START_DATE = END_DATE - timedelta(days=200)
 
-# ===== READ WATCHLIST =====
+# ===== GOOGLE SHEETS SETUP =====
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
     sh = gc.open("CTD_Sniper")
     ws_watchlist = sh.worksheet("Watchlist")
+
+    try:
+        ws_signals = sh.worksheet("Sweep_Signals")
+    except Exception:
+        ws_signals = sh.add_worksheet(title="Sweep_Signals", rows="100", cols="10")
 
     raw_stocks = ws_watchlist.col_values(1)
     STOCKS = []
@@ -39,97 +43,14 @@ try:
                 STOCKS.append(clean_s)
 
     STOCKS = sorted(list(set(STOCKS)))
-    print(f"✅ Total Valid Stocks Loaded: {len(STOCKS)}", flush=True)
+    print(f"✅ Loaded {len(STOCKS)} valid stocks for daily scanning.", flush=True)
 
 except Exception as e:
-    print(f"❌ Error Reading Watchlist: {e}")
+    print(f"❌ Error setting up Google Sheet: {e}")
     exit(1)
 
-
-# ===== MULTI-TARGET ENGINE =====
-def run_target_sweep(df_dict, target_pct):
-    trades = []
-
-    for stock, df in df_dict.items():
-        n = len(df)
-        i = 50
-
-        while i < n - MAX_HOLDING_DAYS:
-            if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
-                
-                price = df['Close'].iloc[i]
-                ema20 = df['EMA_20'].iloc[i]
-                
-                above_20_ema = price > ema20
-                prev_10_low = df['Low'].iloc[i-10:i].min()
-                swept_low = df['Low'].iloc[i] < prev_10_low
-                closed_above_low = price > prev_10_low
-                
-                candle_range = df['High'].iloc[i] - df['Low'].iloc[i]
-                strong_rejection = False
-                if candle_range > 0:
-                    close_pos = (price - df['Low'].iloc[i]) / candle_range
-                    strong_rejection = close_pos >= 0.50
-                
-                high_vol = df['Volume'].iloc[i] >= (1.2 * df['Vol_Avg_20'].iloc[i])
-
-                if above_20_ema and swept_low and closed_above_low and strong_rejection and high_vol:
-                    entry_price = price
-                    stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
-                    risk = entry_price - stop_loss
-                    
-                    # Fixed Target Percent Test
-                    target_price = round(entry_price * (1 + target_pct / 100), 2)
-
-                    if risk > 0 and (risk / entry_price) <= 0.07:
-                        future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                        win = False
-                        exit_price = entry_price
-
-                        for _, f_row in future_df.iterrows():
-                            if f_row['High'] >= target_price:
-                                exit_price = target_price
-                                win = True
-                                break
-                            if f_row['Low'] <= stop_loss:
-                                exit_price = stop_loss
-                                win = False
-                                break
-
-                        if exit_price == entry_price and not future_df.empty:
-                            exit_price = future_df['Close'].iloc[-1]
-                            win = exit_price > entry_price
-
-                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                        trades.append({"Win": win, "PnL_%": pnl_pct})
-                        i += MAX_HOLDING_DAYS
-            i += 1
-
-    if not trades:
-        return None
-
-    df_res = pd.DataFrame(trades)
-    total_tr = len(df_res)
-    wins = df_res[df_res['Win'] == True]
-    losses = df_res[df_res['Win'] == False]
-    win_rate = (len(wins) / total_tr) * 100
-    gross_profit = wins['PnL_%'].sum()
-    gross_loss = abs(losses['PnL_%'].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
-
-    return {
-        "Target_%": f"{target_pct}%",
-        "Total_Trades": total_tr,
-        "Win_Rate_%": round(win_rate, 2),
-        "Profit_Factor": round(profit_factor, 2),
-        "Avg_Win_%": round(wins['PnL_%'].mean(), 2) if not wins.empty else 0,
-        "Avg_Loss_%": round(losses['PnL_%'].mean(), 2) if not losses.empty else 0
-    }
-
-
-# ===== DATA PREPARATION =====
-stock_data = {}
-print("\nFetching Stock Data...", flush=True)
+# ===== DAILY SCAN ENGINE (V143.0 LOGIC) =====
+today_signals = []
 
 for stock in STOCKS:
     try:
@@ -145,24 +66,59 @@ for stock in STOCKS:
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-        stock_data[stock] = df
+        # Latest Candle Data
+        curr = df.iloc[-1]
+        prev_10_low = df['Low'].iloc[-11:-1].min()
+        prev_10_high = df['High'].iloc[-11:-1].max()
+
+        if curr['Vol_Avg_20'] >= MIN_AVG_VOLUME and curr['Turnover_Avg_20_Cr'] >= MIN_AVG_TURNOVER_CR:
+            
+            above_20_ema = curr['Close'] > curr['EMA_20']
+            swept_low = curr['Low'] < prev_10_low
+            closed_above_low = curr['Close'] > prev_10_low
+            
+            candle_range = curr['High'] - curr['Low']
+            strong_rejection = False
+            if candle_range > 0:
+                close_pos = (curr['Close'] - curr['Low']) / candle_range
+                strong_rejection = close_pos >= 0.50
+
+            high_vol = curr['Volume'] >= (1.2 * curr['Vol_Avg_20'])
+
+            # Signal Trigger
+            if above_20_ema and swept_low and closed_above_low and strong_rejection and high_vol:
+                entry = round(curr['Close'], 2)
+                sl = round(curr['Low'] * 0.995, 2)
+                risk = entry - sl
+                
+                min_target = entry + (1.8 * risk)
+                target = round(max(prev_10_high, min_target), 2)
+                
+                risk_pct = round((risk / entry) * 100, 2)
+                reward_pct = round(((target - entry) / entry) * 100, 2)
+
+                if risk_pct <= 7.0:
+                    today_signals.append([
+                        datetime.now().strftime("%Y-%m-%d"),
+                        stock.replace(".NS", ""),
+                        entry,
+                        sl,
+                        target,
+                        f"{risk_pct}%",
+                        f"+{reward_pct}%",
+                        round(curr['Turnover_Avg_20_Cr'], 2)
+                    ])
 
     except Exception:
         pass
 
-# ===== MATRIX SWEEP EXECUTION =====
-print("\nRunning Target Matrix Sweep (2% to 10%)...\n", flush=True)
-matrix_results = []
+# ===== UPDATE GOOGLE SHEET =====
+headers = ["Date", "Symbol", "Entry Price", "Stop Loss", "Target", "Risk %", "Expected Return %", "Avg Turnover (Cr)"]
+ws_signals.clear()
+ws_signals.append_row(headers)
 
-for t_pct in range(2, 11):
-    res = run_target_sweep(stock_data, t_pct)
-    if res:
-        matrix_results.append(res)
-
-df_matrix = pd.DataFrame(matrix_results)
-
-print("=========================================================================================")
-print("🏆 TARGET MATRIX SWEEP RESULTS (WIN RATE vs TARGET %)")
-print("=========================================================================================")
-print(df_matrix.to_string(index=False))
-print("=========================================================================================")
+if today_signals:
+    ws_signals.append_rows(today_signals)
+    print(f"\n🚀 SCAN COMPLETE: Found {len(today_signals)} active Sweep Signals!", flush=True)
+else:
+    print("\n⚡ SCAN COMPLETE: No active sweep signals today.", flush=True)
