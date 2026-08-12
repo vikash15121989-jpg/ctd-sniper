@@ -9,12 +9,12 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== BACKTEST: RELAXED WYCKOFF ACCUMULATION & RE-ACCUMULATION ===", flush=True)
+print("=== BACKTEST: WYCKOFF ACCUMULATION (BOX SUPPORT VS SHAKEOUT SEPARATION) ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 300_000          # 3 Lakh Daily Avg Volume
 MIN_AVG_TURNOVER_CR = 1.0        # ₹1 Crore Daily Turnover
-MAX_HOLDING_DAYS = 25            # Max Holding Period
+MAX_HOLDING_DAYS = 25            # Max Holding Period for Swing
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
@@ -46,13 +46,13 @@ except Exception as e:
     exit(1)
 
 
-# ===== RELAXED ACCUMULATION ENGINE =====
-def backtest_relaxed_wyckoff(df):
-    trades_A = []  # Entry A: Direct Breakout
-    trades_B = []  # Entry B: Retest / Re-accumulation
+# ===== WYCKOFF TWO-STAGE DETECTION ENGINE =====
+def backtest_wyckoff_separated(df):
+    trades_A = []  # Entry A: Direct Breakout of Box High
+    trades_B = []  # Entry B: Retest / Re-accumulation at Box High
     
     n = len(df)
-    i = 35
+    i = 40  # Starting index after initial lookback
 
     while i < n - MAX_HOLDING_DAYS:
         curr_vol_avg = df['Vol_Avg_20'].iloc[i]
@@ -60,88 +60,100 @@ def backtest_relaxed_wyckoff(df):
 
         if curr_vol_avg >= MIN_AVG_VOLUME and curr_turnover_avg >= MIN_AVG_TURNOVER_CR:
             
-            # Step 1: Detect Consolidation Base (Last 20 Days)
-            lookback = df.iloc[i-20 : i]
-            range_high = lookback['High'].max()
-            range_low = lookback['Low'].min()
-            range_size = range_high - range_low
-            range_pct = (range_size / range_low) * 100
+            # STEP 1: DEFINE TRUE BOX RANGE (Excluding the recent 10 days)
+            box_data = df.iloc[i-35 : i-10]
+            box_high = box_data['High'].max()
+            box_low = box_data['Low'].min()  # True Support Line (Automatic Reaction Low)
+            box_size = box_high - box_low
+            box_pct = (box_size / box_low) * 100
 
-            # Downfall check: Price is coming off a decline or forming a base (4% to 22% Range Width)
-            if 4.0 <= range_pct <= 22.0:
+            # Valid Box Range Filter (Width between 4% and 25%)
+            if 4.0 <= box_pct <= 25.0:
                 
-                curr_close = df['Close'].iloc[i]
-                prev_close = df['Close'].iloc[i-1]
+                # STEP 2: DETECT SHAKEOUT IN RECENT 10 DAYS (Separate from Box Low)
+                recent_zone = df.iloc[i-10 : i]
+                
+                # Condition: Price dipped below Box Low BUT closed inside or above Box Low
+                shakeout_bars = recent_zone[(recent_zone['Low'] < box_low) & (recent_zone['Close'] >= box_low)]
+                
+                has_shakeout = not shakeout_bars.empty
 
-                # Step 2: ENTRY A - Breakout of Accumulation Range High
-                if curr_close > range_high and prev_close <= range_high:
-                    
-                    entry_a = curr_close
-                    sl_a = round(range_high - (0.5 * range_size), 2)  # SL at Mid-Range
-                    risk_a = entry_a - sl_a
-                    target_a = round(entry_a + (2.0 * risk_a), 2)     # 1:2 Risk-Reward
+                if has_shakeout:
+                    shakeout_lowest_low = shakeout_bars['Low'].min()  # True Shakeout Low
 
-                    risk_pct_a = (risk_a / entry_a) * 100
+                    # STEP 3: BREAKOUT CHECK (Current Bar closes above Box High)
+                    curr_close = df['Close'].iloc[i]
+                    prev_close = df['Close'].iloc[i-1]
 
-                    if risk_a > 0 and risk_pct_a <= 7.5:
-                        future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
-                        win_a = False
-                        exit_a = entry_a
+                    if curr_close > box_high and prev_close <= box_high:
+                        
+                        # ENTRY A: Direct Breakout Entry
+                        entry_a = curr_close
+                        sl_a = round(shakeout_lowest_low, 2)  # SL placed below Shakeout Low
+                        risk_a = entry_a - sl_a
+                        target_a = round(entry_a + (2.0 * risk_a), 2)  # 1:2 RR
 
-                        for _, f_row in future_df.iterrows():
-                            if f_row['High'] >= target_a:
-                                exit_a = target_a
-                                win_a = True
-                                break
-                            if f_row['Low'] <= sl_a:
-                                exit_a = sl_a
-                                win_a = False
-                                break
+                        risk_pct_a = (risk_a / entry_a) * 100
 
-                        if exit_a == entry_a and not future_df.empty:
-                            exit_a = future_df['Close'].iloc[-1]
-                            win_a = exit_a > entry_a
+                        if risk_a > 0 and risk_pct_a <= 9.0:
+                            future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
+                            win_a = False
+                            exit_a = entry_a
 
-                        pnl_a = ((exit_a - entry_a) / entry_a) * 100
-                        trades_A.append({"Win": win_a, "PnL_%": pnl_a})
+                            for _, f_row in future_df.iterrows():
+                                if f_row['High'] >= target_a:
+                                    exit_a = target_a
+                                    win_a = True
+                                    break
+                                if f_row['Low'] <= sl_a:
+                                    exit_a = sl_a
+                                    win_a = False
+                                    break
 
-                    # Step 3: ENTRY B - Retest of Range High (Re-accumulation Entry)
-                    future_10 = df.iloc[i + 1 : min(i + 11, n - MAX_HOLDING_DAYS)]
-                    
-                    for r_idx, r_row in future_10.iterrows():
-                        # Retest check: Price touches near Range High (within 2%) and holds
-                        if r_row['Low'] <= (range_high * 1.02) and r_row['Close'] >= (range_high * 0.99):
-                            entry_b = r_row['Close']
-                            sl_b = round(range_high * 0.965, 2)  # Tight SL (3.5% below Range High)
-                            risk_b = entry_b - sl_b
-                            target_b = round(entry_b + (2.0 * risk_b), 2) # 1:2 Risk-Reward
+                            if exit_a == entry_a and not future_df.empty:
+                                exit_a = future_df['Close'].iloc[-1]
+                                win_a = exit_a > entry_a
 
-                            risk_pct_b = (risk_b / entry_b) * 100
+                            pnl_a = ((exit_a - entry_a) / entry_a) * 100
+                            trades_A.append({"Win": win_a, "PnL_%": pnl_a})
 
-                            if risk_b > 0 and risk_pct_b <= 6.0:
-                                retest_future = df.loc[r_idx + 1 : r_idx + MAX_HOLDING_DAYS]
-                                win_b = False
-                                exit_b = entry_b
+                        # ENTRY B: Retest / Re-accumulation Entry (Look ahead 12 days)
+                        future_12 = df.iloc[i + 1 : min(i + 13, n - MAX_HOLDING_DAYS)]
+                        
+                        for r_idx, r_row in future_12.iterrows():
+                            # Retest Condition: Price pulls back to Box High (+/- 2.5% band) and holds
+                            if r_row['Low'] <= (box_high * 1.025) and r_row['Close'] >= (box_high * 0.985):
+                                entry_b = r_row['Close']
+                                sl_b = round(box_high * 0.96, 2)  # Tight SL (4% below Box High)
+                                risk_b = entry_b - sl_b
+                                target_b = round(entry_b + (2.0 * risk_b), 2)  # 1:2 RR
 
-                                for _, f_row in retest_future.iterrows():
-                                    if f_row['High'] >= target_b:
-                                        exit_b = target_b
-                                        win_b = True
-                                        break
-                                    if f_row['Low'] <= sl_b:
-                                        exit_b = sl_b
-                                        win_b = False
-                                        break
+                                risk_pct_b = (risk_b / entry_b) * 100
 
-                                if exit_b == entry_b and not retest_future.empty:
-                                    exit_b = retest_future['Close'].iloc[-1]
-                                    win_b = exit_b > entry_b
+                                if risk_b > 0 and risk_pct_b <= 7.0:
+                                    retest_future = df.loc[r_idx + 1 : r_idx + MAX_HOLDING_DAYS]
+                                    win_b = False
+                                    exit_b = entry_b
 
-                                pnl_b = ((exit_b - entry_b) / entry_b) * 100
-                                trades_B.append({"Win": win_b, "PnL_%": pnl_b})
-                                break
-                            
-                    i += MAX_HOLDING_DAYS
+                                    for _, f_row in retest_future.iterrows():
+                                        if f_row['High'] >= target_b:
+                                            exit_b = target_b
+                                            win_b = True
+                                            break
+                                        if f_row['Low'] <= sl_b:
+                                            exit_b = sl_b
+                                            win_b = False
+                                            break
+
+                                    if exit_b == entry_b and not retest_future.empty:
+                                        exit_b = retest_future['Close'].iloc[-1]
+                                        win_b = exit_b > entry_b
+
+                                    pnl_b = ((exit_b - entry_b) / entry_b) * 100
+                                    trades_B.append({"Win": win_b, "PnL_%": pnl_b})
+                                    break
+                                
+                        i += MAX_HOLDING_DAYS
         i += 1
 
     df_A = pd.DataFrame(trades_A) if trades_A else pd.DataFrame()
@@ -153,7 +165,7 @@ def backtest_relaxed_wyckoff(df):
 all_trades_A = []
 all_trades_B = []
 
-print("\nExecuting Relaxed Accumulation Backtest...", flush=True)
+print("\nExecuting Wyckoff Separation Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -168,7 +180,7 @@ for stock in STOCKS:
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
 
-        res_A, res_B = backtest_relaxed_wyckoff(df)
+        res_A, res_B = backtest_wyckoff_separated(df)
         if not res_A.empty:
             all_trades_A.append(res_A)
         if not res_B.empty:
@@ -200,5 +212,5 @@ def print_results(title, list_trades):
     else:
         print(f"\nNo trades executed for {title}.")
 
-print_results("ENTRY A (Direct Accumulation Breakout)", all_trades_A)
-print_results("ENTRY B (Range Retest / Re-accumulation)", all_trades_B)
+print_results("ENTRY A (Direct Breakout after Shakeout)", all_trades_A)
+print_results("ENTRY B (Retest / Re-accumulation after Shakeout)", all_trades_B)
