@@ -9,12 +9,12 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V138.0: REFINED LIQUIDITY SWEEP ENGINE (200 EMA + 1:2.5 RR) ===", flush=True)
+print("=== V139.0: REBOUNDED LIQUIDITY SWEEP ENGINE (50 EMA + SWING HIGH TARGET) ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
 MIN_AVG_TURNOVER_CR = 5.0        # ₹5 Crore Daily Turnover
-MAX_HOLDING_DAYS = 25            
+MAX_HOLDING_DAYS = 20            # Reduced to 20 Days for Faster Turnover
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
@@ -47,35 +47,36 @@ except Exception as e:
 
 
 # ===== STRATEGY ENGINE =====
-def backtest_v138_refined_sweep(df):
+def backtest_v139_sweep(df):
     trades = []
     n = len(df)
-    i = 200 # Warm up for 200 EMA
+    i = 50 
 
     while i < n - MAX_HOLDING_DAYS:
         # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Filter 1: Trend Alignment (Close > 200 EMA)
-            above_200_ema = df['Close'].iloc[i] > df['EMA_200'].iloc[i]
+            # Trend Check: Close > 50 EMA (Soft Trend Filter)
+            above_50_ema = df['Close'].iloc[i] > df['EMA_50'].iloc[i]
             
-            # Filter 2: Liquidity Sweep of 10-day Low
+            # Sweep Logic: Low sweeps 10-day Low but Closes above it
             prev_10_low = df['Low'].iloc[i-10:i].min()
             swept_low = df['Low'].iloc[i] < prev_10_low
             closed_above = df['Close'].iloc[i] > prev_10_low
             
-            # Filter 3: High Institutional Volume (>= 1.5x 20-Day Avg)
-            high_vol = df['Volume'].iloc[i] >= (1.5 * df['Vol_Avg_20'].iloc[i])
+            # Volume Spike Check (1.3x 20-Day Avg)
+            high_vol = df['Volume'].iloc[i] >= (1.3 * df['Vol_Avg_20'].iloc[i])
 
-            if above_200_ema and swept_low and closed_above and high_vol:
+            if above_50_ema and swept_low and closed_above and high_vol:
                 entry_price = df['Close'].iloc[i]
                 stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
-                risk = entry_price - stop_loss
                 
-                # Dynamic Target based on 1:2.5 Risk-Reward
-                target_price = round(entry_price + (2.5 * risk), 2)
+                # Dynamic Target: 10-Day High (Resistance Target)
+                target_price = df['High'].iloc[i-10:i].max()
+                
+                risk = entry_price - stop_loss
 
-                if risk > 0 and (risk / entry_price) <= 0.08: # Max 8% Risk Cap
+                if risk > 0 and (risk / entry_price) <= 0.07: # Tighter 7% Max Risk
                     future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
                     win = False
                     exit_price = entry_price
@@ -105,7 +106,7 @@ def backtest_v138_refined_sweep(df):
 # ===== MAIN EXECUTION =====
 all_trades = []
 
-print("\nExecuting V138.0 Refined Sweep Engine...", flush=True)
+print("\nExecuting V139.0 Rebounded Sweep Engine...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -113,15 +114,15 @@ for stock in STOCKS:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 50:
             continue
 
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
-        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
-        res = backtest_v138_refined_sweep(df)
+        res = backtest_v139_sweep(df)
         if res is not None and not res.empty:
             all_trades.append(res)
 
@@ -139,7 +140,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 V138.0 REFINED LIQUIDITY SWEEP RESULTS")
+    print("🏆 V139.0 REBOUNDED SWEEP RESULTS")
     print("==================================================================")
     print(f"Total Executed Trades          : {total_tr}")
     print(f"Win-Rate                       : {round(win_rate, 2)}%")
@@ -148,5 +149,5 @@ if all_trades:
     print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 else:
-    print("\nNo trades executed in V138.0.")
+    print("\nNo trades executed in V139.0.")
     
