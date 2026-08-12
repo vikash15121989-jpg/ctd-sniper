@@ -9,12 +9,12 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-print("=== V139.0: REBOUNDED LIQUIDITY SWEEP ENGINE (50 EMA + SWING HIGH TARGET) ===", flush=True)
+print("=== V140.0 TEST: LIQUIDITY SWEEP WITH 20 EMA FILTER ===", flush=True)
 
 # ===== CONFIGURATION =====
 MIN_AVG_VOLUME = 1_000_000       # 10 Lakh Daily Avg Volume
 MIN_AVG_TURNOVER_CR = 5.0        # ₹5 Crore Daily Turnover
-MAX_HOLDING_DAYS = 20            # Reduced to 20 Days for Faster Turnover
+MAX_HOLDING_DAYS = 20            # 20 Days Holding Window
 
 END_DATE = datetime.now().date()
 START_DATE = END_DATE - timedelta(days=1095) # 3 Years Backtest
@@ -46,18 +46,18 @@ except Exception as e:
     exit(1)
 
 
-# ===== STRATEGY ENGINE =====
-def backtest_v139_sweep(df):
+# ===== STRATEGY ENGINE (20 EMA TEST) =====
+def backtest_v140_20ema_sweep(df):
     trades = []
     n = len(df)
-    i = 50 
+    i = 20 # Warm up for 20 EMA
 
     while i < n - MAX_HOLDING_DAYS:
         # Liquidity Check
         if df['Vol_Avg_20'].iloc[i] >= MIN_AVG_VOLUME and df['Turnover_Avg_20_Cr'].iloc[i] >= MIN_AVG_TURNOVER_CR:
             
-            # Trend Check: Close > 50 EMA (Soft Trend Filter)
-            above_50_ema = df['Close'].iloc[i] > df['EMA_50'].iloc[i]
+            # Trend Check: Close > 20 EMA (Short-term Trend Alignment)
+            above_20_ema = df['Close'].iloc[i] > df['EMA_20'].iloc[i]
             
             # Sweep Logic: Low sweeps 10-day Low but Closes above it
             prev_10_low = df['Low'].iloc[i-10:i].min()
@@ -67,16 +67,16 @@ def backtest_v139_sweep(df):
             # Volume Spike Check (1.3x 20-Day Avg)
             high_vol = df['Volume'].iloc[i] >= (1.3 * df['Vol_Avg_20'].iloc[i])
 
-            if above_50_ema and swept_low and closed_above and high_vol:
+            if above_20_ema and swept_low and closed_above and high_vol:
                 entry_price = df['Close'].iloc[i]
                 stop_loss = round(df['Low'].iloc[i] * 0.995, 2)
                 
-                # Dynamic Target: 10-Day High (Resistance Target)
+                # Dynamic Target: Previous 10-Day High
                 target_price = df['High'].iloc[i-10:i].max()
                 
                 risk = entry_price - stop_loss
 
-                if risk > 0 and (risk / entry_price) <= 0.07: # Tighter 7% Max Risk
+                if risk > 0 and (risk / entry_price) <= 0.07: # Max 7% Risk
                     future_df = df.iloc[i + 1 : i + 1 + MAX_HOLDING_DAYS]
                     win = False
                     exit_price = entry_price
@@ -106,7 +106,7 @@ def backtest_v139_sweep(df):
 # ===== MAIN EXECUTION =====
 all_trades = []
 
-print("\nExecuting V139.0 Rebounded Sweep Engine...", flush=True)
+print("\nExecuting V140.0 Backtest with 20 EMA Filter...", flush=True)
 
 for stock in STOCKS:
     try:
@@ -120,9 +120,9 @@ for stock in STOCKS:
         df['Turnover'] = df['Close'] * df['Volume']
         df['Vol_Avg_20'] = df['Volume'].rolling(20).mean()
         df['Turnover_Avg_20_Cr'] = df['Turnover'].rolling(20).mean() / 10_000_000
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-        res = backtest_v139_sweep(df)
+        res = backtest_v140_20ema_sweep(df)
         if res is not None and not res.empty:
             all_trades.append(res)
 
@@ -140,7 +140,7 @@ if all_trades:
     overall_pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
     print("\n==================================================================")
-    print("🏆 V139.0 REBOUNDED SWEEP RESULTS")
+    print("🏆 V140.0 TEST RESULTS (20 EMA FILTER)")
     print("==================================================================")
     print(f"Total Executed Trades          : {total_tr}")
     print(f"Win-Rate                       : {round(win_rate, 2)}%")
@@ -149,5 +149,5 @@ if all_trades:
     print(f"Average Loss per Losing Trade  : {round(losses['PnL_%'].mean(), 2)}%")
     print("==================================================================")
 else:
-    print("\nNo trades executed in V139.0.")
+    print("\nNo trades executed in V140.0.")
     
