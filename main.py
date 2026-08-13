@@ -21,10 +21,10 @@ now = datetime.now()
 current_hour = now.hour
 
 # =====================================================================
-# MODE 1: NIGHTLY EOD SCAN (Strict Volume & Traded Value Filters)
+# MODE 1: NIGHTLY EOD SCAN (Strict Single Bar Validation)
 # =====================================================================
 if current_hour >= 16 or current_hour < 8:
-    print("📌 Running NIGHTLY EOD SCAN with 10 Lakh Vol & 3 Cr Value Filters...", flush=True)
+    print("📌 Running NIGHTLY EOD SCAN with Strict Data Fix...", flush=True)
     
     try:
         ws_targets = sh.worksheet("Today_Targets")
@@ -49,35 +49,45 @@ if current_hour >= 16 or current_hour < 8:
     targets = []
     for symbol in STOCKS:
         try:
-            df = yf.download(symbol, period="30d", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            # Ticker history prevents MultiIndex bugs
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="60d", interval="1d")
 
-            if len(df) < 22:
+            if df.empty or len(df) < 25:
                 continue
 
-            # Extract exact values
-            mother_high = float(df['High'].iloc[-2])
-            mother_low = float(df['Low'].iloc[-2])
-            inside_high = float(df['High'].iloc[-1])
-            inside_low = float(df['Low'].iloc[-1])
+            # Calculate 20 EMA
+            df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+
+            # Strictly pick last TWO COMPLETED daily bars
+            # If scanning after 16:00 IST, iloc[-2] is Yesterday and iloc[-1] is Today
+            mother_bar = df.iloc[-2]
+            inside_bar = df.iloc[-1]
+
+            mother_high = float(mother_bar['High'])
+            mother_low = float(mother_bar['Low'])
+            inside_high = float(inside_bar['High'])
+            inside_low = float(inside_bar['Low'])
             
-            # 20-Day Average Volume
             avg_vol_20 = float(df['Volume'].iloc[-21:-1].mean())
-            close = float(df['Close'].iloc[-1])
+            close = float(inside_bar['Close'])
+            ema20 = float(inside_bar['EMA20'])
             
-            # Average Daily Traded Value (in Rupees)
             avg_daily_value = avg_vol_20 * close
 
-            # --- FILTER 1: Average Volume >= 10 Lakhs (1,000,000 shares) ---
+            # Filter 1: Avg Volume >= 10 Lakh
             if avg_vol_20 < 1000000:
                 continue
 
-            # --- FILTER 2: Average Daily Traded Value >= ₹3 Crore (30,000,000 INR) ---
+            # Filter 2: Avg Daily Value >= 3 Cr
             if avg_daily_value < 30000000:
                 continue
 
-            # --- FILTER 3: Inside Bar Compression Check ---
+            # Filter 3: Price > 20 EMA
+            if close <= ema20:
+                continue
+
+            # Filter 4: STRICT INSIDE BAR (Inside High < Mother High AND Inside Low > Mother Low)
             is_inside = (inside_high < mother_high) and (inside_low > mother_low)
 
             if is_inside:
@@ -86,7 +96,8 @@ if current_hour >= 16 or current_hour < 8:
                     "Mother_High": round(mother_high, 2),
                     "Mother_Low": round(mother_low, 2),
                     "Vol_SMA20": int(avg_vol_20),
-                    "Traded_Val_Cr": round(avg_daily_value / 10000000, 2), # Value in Crores
+                    "Traded_Val_Cr": round(avg_daily_value / 10000000, 2),
+                    "EMA20": round(ema20, 2),
                     "Last_Close": round(close, 2)
                 })
         except Exception:
@@ -95,15 +106,15 @@ if current_hour >= 16 or current_hour < 8:
     if targets:
         df_out = pd.DataFrame(targets)
         ws_targets.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-        print(f"✅ Successfully pushed {len(targets)} highly liquid targets to 'Today_Targets'!")
+        print(f"✅ Successfully pushed {len(targets)} STRICT targets to 'Today_Targets'!")
     else:
-        print("ℹ️ No Inside Bar targets matched the liquidity criteria today.")
+        print("ℹ️ No Inside Bar targets matched today.")
 
 # =====================================================================
-# MODE 2: INTRADAY LIVE SCAN (Subah 9:30 AM Market Hours)
+# MODE 2: INTRADAY LIVE SCAN (Market Hours)
 # =====================================================================
 else:
-    print("⚡ Running INTRADAY LIVE VOLUME SURGE SCAN...", flush=True)
+    print("⚡ Running INTRADAY LIVE SCAN...", flush=True)
     
     try:
         ws_targets = sh.worksheet("Today_Targets")
@@ -137,9 +148,8 @@ else:
         v_sma20 = float(row['Vol_SMA20'])
 
         try:
-            df_live = yf.download(symbol, period="1d", interval="5m", progress=False)
-            if isinstance(df_live.columns, pd.MultiIndex):
-                df_live.columns = df_live.columns.get_level_values(0)
+            ticker = yf.Ticker(symbol)
+            df_live = ticker.history(period="1d", interval="5m")
 
             if df_live.empty:
                 continue
@@ -150,16 +160,18 @@ else:
             projected_vol = current_vol * projected_factor
             vol_ratio = round(projected_vol / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            # TRIGGER CONDITION: Price >= Mother High AND Projected Vol >= 2.0x
-            if live_price >= m_high and vol_ratio >= 2.0:
+            # TRIGGER CONDITION: Price >= Mother High AND Projected Vol >= 1.2x
+            if live_price >= m_high and vol_ratio >= 1.2:
+                pct_change = round(((live_price - m_high) / m_high) * 100, 2)
                 confirmed_breakouts.append({
                     "Stock": symbol.replace(".NS", ""),
                     "Live_Price": live_price,
                     "Mother_High": m_high,
-                    "Projected_Vol_Ratio": f"{vol_ratio}x",
+                    "Gain_Vs_High_%": pct_change,
+                    "Projected_Vol": f"{vol_ratio}x",
                     "Scan_Time": now.strftime('%H:%M IST')
                 })
-                print(f"🔥 BREAKOUT MATCH: {symbol} | Price: {live_price} | Vol Ratio: {vol_ratio}x")
+                print(f"🔥 BREAKOUT: {symbol} | Price: {live_price} | Vol: {vol_ratio}x")
 
         except Exception:
             pass
@@ -167,8 +179,8 @@ else:
     if confirmed_breakouts:
         df_out = pd.DataFrame(confirmed_breakouts)
         ws_live.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-        print(f"✅ Successfully wrote {len(confirmed_breakouts)} breakout stocks to 'LIVE_BREAKOUTS' sheet!")
+        print(f"✅ Successfully written {len(confirmed_breakouts)} breakout stocks to sheet!")
     else:
-        ws_live.update([["Stock", "Live_Price", "Mother_High", "Projected_Vol_Ratio", "Scan_Time"], ["NO BREAKOUT YET", "-", "-", "-", now.strftime('%H:%M IST')]])
+        ws_live.update([["Stock", "Live_Price", "Mother_High", "Gain_Vs_High_%", "Projected_Vol", "Scan_Time"], ["NO BREAKOUT YET", "-", "-", "-", "-", now.strftime('%H:%M IST')]])
         print("ℹ️ No volume surge breakouts matched at this time.")
         
