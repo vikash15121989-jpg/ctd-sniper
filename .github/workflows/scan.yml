@@ -1,28 +1,27 @@
-name: CTD Sniper Scanner
+name: CTD Sniper Scanner Engine
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '30 13 * * 1-5' # 7:00 PM IST Mon-Fri
+    # 1. Raat 8:00 PM IST (EOD Scan ke liye)
+    - cron: '30 14 * * 1-5'
+    # 2. Subah 9:30, 9:45, 10:00 AM IST (Live Scan ke liye)
+    - cron: '0,15,30 4 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
+      - uses: actions/checkout@v3
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-
       - name: Install dependencies
         run: |
-          pip install yfinance pandas gspread google-auth
-
+          pip install pandas yfinance gspread
       - name: Run Python Scanner
         env:
-          GSHEET_KEY: ${{ secrets.GSHEET_KEY }} # YE LINE SABSE IMPORTANT HAI
+          GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
         run: python main.py
         
