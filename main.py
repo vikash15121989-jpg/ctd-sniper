@@ -26,17 +26,96 @@ def get_or_create_worksheet(title):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows="100", cols="10")
+        return sh.add_worksheet(title=title, rows="200", cols="10")
+
+# Setup Automatic Position Sizing Calculator Tab Structure
+def update_position_sizing_calculator():
+    ws_pos = get_or_create_worksheet("Position_Sizing")
+    
+    # Read existing user inputs if available, else set defaults
+    existing_data = ws_pos.get_all_values()
+    capital = 100000
+    risk_pct = 1.0
+    stock_input = "RELIANCE"
+
+    if len(existing_data) >= 3:
+        try:
+            capital = float(existing_data[0][1].replace("₹", "").replace(",", "").strip())
+        except: pass
+        try:
+            risk_pct = float(existing_data[1][1].replace("%", "").strip())
+        except: pass
+        try:
+            stock_input = str(existing_data[2][1]).strip().upper()
+        except: pass
+
+    # Prepare Standard Layout
+    layout = [
+        ["Total Capital (₹)", capital],
+        ["Risk Per Trade (%)", risk_pct],
+        ["Stock Name", stock_input],
+        ["", ""],  # Blank Row
+        ["Stock Symbol", "CMP / Entry (₹)", "Stop Loss (20 EMA) (₹)", "Risk / Share (₹)", "Max Risk Amt (₹)", "Calculated Qty", "Total Investment (₹)", "Updated At"]
+    ]
+
+    # Fetch Stock Details from Yahoo Finance
+    calc_row = ["-", "-", "-", "-", "-", "-", "-", "-"]
+    if stock_input and stock_input not in ["-", "NONE", ""]:
+        try:
+            symbol = stock_input + ".NS" if not stock_input.endswith(".NS") else stock_input
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="60d", interval="1d")
+            
+            if not df.empty and len(df) >= 20:
+                df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+                cmp = round(float(df['Close'].iloc[-1]), 2)
+                sl = round(float(df['EMA20'].iloc[-1]), 2)  # Auto Stop Loss at 20 EMA
+                
+                # If SL is greater than or equal to CMP, set a 2% default SL
+                if sl >= cmp:
+                    sl = round(cmp * 0.98, 2)
+
+                risk_per_share = round(cmp - sl, 2)
+                max_risk_amt = round((capital * risk_pct) / 100.0, 2)
+                qty = int(max_risk_amt / risk_per_share) if risk_per_share > 0 else 0
+                total_investment = round(qty * cmp, 2)
+
+                calc_row = [
+                    stock_input.replace(".NS", ""),
+                    cmp,
+                    sl,
+                    risk_per_share,
+                    max_risk_amt,
+                    qty,
+                    total_investment,
+                    now.strftime('%H:%M IST')
+                ]
+        except Exception as e:
+            print(f"⚠️ Error fetching Position Sizing data for {stock_input}: {e}")
+
+    layout.append(calc_row)
+    
+    ws_pos.clear()
+    ws_pos.update("A1", layout)
+    print("📐 'Position_Sizing' Calculator updated successfully.")
+
+# Run Position Sizing Setup
+update_position_sizing_calculator()
 
 # =====================================================================
-# STEP 1: EOD SCAN (STRICT HIGH-QUALITY FILTER: 16:00 to 09:00 IST)
+# STEP 1: EOD SCAN (Market Closed: >= 16:00 or < 09:00 IST)
+# Creates 'Volume_Dry_All' & 'Ready_For_Today'
 # =====================================================================
 if current_hour >= 16 or current_hour < 9:
-    print("📌 Running STRICT EOD Scan for Quality Volume Dry Setups...", flush=True)
+    print("📌 Running EOD Scan: Filtering Volume Dry Setups...", flush=True)
+
+    ws_dry_all = get_or_create_worksheet("Volume_Dry_All")
+    ws_dry_all.clear()
+    ws_dry_all.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio_%", "Status"])
 
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
-    ws_ready.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio", "EMA20"])
+    ws_ready.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio_%", "EMA20"])
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -46,7 +125,9 @@ if current_hour >= 16 or current_hour < 9:
 
     STOCKS = [s.strip().upper() + ".NS" for s in raw_stocks if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]]
     
+    all_dry_targets = []
     ready_targets = []
+
     for symbol in set(STOCKS):
         try:
             ticker = yf.Ticker(symbol)
@@ -63,53 +144,43 @@ if current_hour >= 16 or current_hour < 9:
             last_close = float(recent['Close'].iloc[-1])
             ema20 = float(recent['EMA20'].iloc[-1])
             ema50 = float(recent['EMA50'].iloc[-1])
-            
-            daily_turnover_cr = (avg_vol * last_close) / 10000000
+            last_vol = float(recent['Volume'].iloc[-1])
+            dry_ratio = round((last_vol / avg_vol) * 100, 1) if avg_vol > 0 else 100.0
+            trigger_high = round(float(recent['High'].iloc[-1]), 2)
+            stock_clean = symbol.replace(".NS", "")
 
-            # 🛑 FILTER 1: High Liquidity Only (Min 5 Crore Turnover & 3 Lakh Volume)
-            if daily_turnover_cr < 5.0 or avg_vol < 300000:
-                continue
+            # 🟢 Pure Volume Dry Check
+            is_volume_dry = (recent['Volume'].iloc[-3:] < (0.50 * recent['Vol_SMA20'].iloc[-3:])).sum() >= 2
 
-            # 🛑 FILTER 2: Uptrend/Support Filter (Price must be ABOVE or within 2% of 20 EMA & 50 EMA)
-            if last_close < (ema20 * 0.98) or last_close < (ema50 * 0.98):
-                continue
+            if is_volume_dry:
+                all_dry_targets.append([
+                    stock_clean, trigger_high, round(last_close, 2), int(avg_vol), f"{dry_ratio}%", "DRY"
+                ])
 
-            # 🛑 FILTER 3: EXTREME VOLUME DRY-UP (At least 2 days vol < 40% of 20 SMA)
-            extreme_dry_days = (recent['Volume'].iloc[-3:] < (0.40 * recent['Vol_SMA20'].iloc[-3:])).sum()
-            if extreme_dry_days < 2:
-                continue
+                daily_turnover_cr = (avg_vol * last_close) / 10000000
+                is_liquid = daily_turnover_cr >= 3.0 and avg_vol >= 200000
+                in_uptrend = last_close >= (ema20 * 0.98) and last_close >= (ema50 * 0.98)
+                is_consolidating = (recent['High'].max() / recent['Low'].min()) <= 1.10
 
-            # 🛑 FILTER 4: Pullback/Consolidation (Not chasing multi-day runaway rally)
-            price_consolidating = recent['High'].max() / recent['Low'].min() <= 1.08  # Max 8% range in 5 days
+                if is_liquid and in_uptrend and is_consolidating:
+                    ready_targets.append([
+                        stock_clean, trigger_high, round(last_close, 2), int(avg_vol), f"{dry_ratio}%", round(ema20, 2)
+                    ])
 
-            if price_consolidating:
-                trigger_high = round(float(recent['High'].iloc[-1]), 2)
-                ready_targets.append({
-                    "data": [
-                        symbol.replace(".NS", ""),
-                        trigger_high,
-                        round(last_close, 2),
-                        int(avg_vol),
-                        f"{round((recent['Volume'].iloc[-1] / avg_vol) * 100, 1)}%",
-                        round(ema20, 2)
-                    ],
-                    "dry_pct": float(recent['Volume'].iloc[-1] / avg_vol)
-                })
         except Exception:
             continue
 
-    # Sort by Most Volume Dry stocks first & pick Top 30 Best Setups
+    if all_dry_targets:
+        ws_dry_all.append_rows(all_dry_targets)
+        print(f"✅ Saved ALL {len(all_dry_targets)} Volume Dry stocks to 'Volume_Dry_All'.")
+
     if ready_targets:
-        ready_targets.sort(key=lambda x: x['dry_pct'])
-        final_rows = [item['data'] for item in ready_targets[:30]] # Max 30 Top Stocks
-        
-        ws_ready.append_rows(final_rows)
-        print(f"✅ Filtered down to Top {len(final_rows)} Quality stocks in 'Ready_For_Today'!")
-    else:
-        print("ℹ️ No Quality Volume Dry targets found today.")
+        ws_ready.append_rows(ready_targets)
+        print(f"✅ Saved {len(ready_targets)} Quality stocks to 'Ready_For_Today'.")
 
 # =====================================================================
 # STEP 2: INTRADAY LIVE SCAN (Market Hours: 09:00 to 15:59 IST)
+# Scan 'Ready_For_Today' -> Push Green Candle Breakouts to 'LIVE_BREAKOUTS'
 # =====================================================================
 else:
     print("⚡ Running INTRADAY LIVE SCAN...", flush=True)
@@ -117,18 +188,16 @@ else:
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     records = ws_ready.get_all_records()
 
+    ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
+    ws_live.clear()
+    ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
+
     if not records:
-        print("⚠️ 'Ready_For_Today' sheet is empty. Run EOD scan first!")
-        ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
-        ws_live.clear()
-        ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
+        print("⚠️ 'Ready_For_Today' sheet is empty.")
         ws_live.append_row(["NO TARGETS SET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         exit(0)
 
     df_ready = pd.DataFrame(records)
-    ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
-    ws_live.clear()
-    ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
 
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     mins_passed = max(int((now - market_start).total_seconds() / 60), 5)
@@ -146,16 +215,12 @@ else:
             if df_live.empty: 
                 continue
 
-            open_price = round(float(df_live['Open'].iloc[0]), 2)  # Aaj ka Open Price
-            price = round(float(df_live['Close'].iloc[-1]), 2)       # Live Price (CMP)
+            open_price = round(float(df_live['Open'].iloc[0]), 2)  
+            price = round(float(df_live['Close'].iloc[-1]), 2)       
             vol = float(df_live['Volume'].sum())
             vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            # 🟢 STRICT LIVE CONDITIONS:
-            # 1. Price >= Trigger High (Breakout)
-            # 2. Volume Surge >= 2.0x (Volume Expansion)
-            # 3. CMP > Open Price (Green Day Candle - Buying Pressure only)
-            if price >= trigger and vol_ratio >= 2.0 and price > open_price:
+            if price >= trigger and vol_ratio >= 1.8 and price > open_price:
                 confirmed_breakouts.append([
                     row['Stock'], price, trigger,
                     round(((price - trigger) / trigger) * 100, 2),
@@ -167,7 +232,7 @@ else:
 
     if confirmed_breakouts:
         ws_live.append_rows(confirmed_breakouts)
-        print(f"🚀 Found {len(confirmed_breakouts)} live breakouts!")
+        print(f"🚀 Found {len(confirmed_breakouts)} live green-candle breakouts!")
     else:
         ws_live.append_row(["NO BREAKOUT YET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         print("ℹ️ No volume surge breakouts matched at this time.")
