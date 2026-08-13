@@ -17,24 +17,21 @@ except Exception as e:
     print(f"❌ Error connecting to Google Sheets: {e}")
     exit(1)
 
-# Current Market Time Check (IST)
 now = datetime.now()
 current_hour = now.hour
 
 # =====================================================================
-# MODE 1: NIGHTLY EOD SCAN (Shaam/Raat ko chalega - 10-15 Stocks Filter Karega)
+# MODE 1: NIGHTLY EOD SCAN (Strict Volume & Traded Value Filters)
 # =====================================================================
 if current_hour >= 16 or current_hour < 8:
-    print("📌 Running NIGHTLY EOD SCAN to find Inside Bar Setups...", flush=True)
+    print("📌 Running NIGHTLY EOD SCAN with 10 Lakh Vol & 3 Cr Value Filters...", flush=True)
     
-    # Get or Create 'Today_Targets' Worksheet
     try:
         ws_targets = sh.worksheet("Today_Targets")
         ws_targets.clear()
     except Exception:
         ws_targets = sh.add_worksheet(title="Today_Targets", rows="100", cols="10")
 
-    # Fetch Master Watchlist
     ws_watchlist = sh.worksheet("Watchlist")
     raw_stocks = ws_watchlist.col_values(1)
     
@@ -59,14 +56,28 @@ if current_hour >= 16 or current_hour < 8:
             if len(df) < 22:
                 continue
 
+            # Extract exact values
             mother_high = float(df['High'].iloc[-2])
             mother_low = float(df['Low'].iloc[-2])
             inside_high = float(df['High'].iloc[-1])
             inside_low = float(df['Low'].iloc[-1])
-            vol_sma20 = float(df['Volume'].iloc[-21:-1].mean())
+            
+            # 20-Day Average Volume
+            avg_vol_20 = float(df['Volume'].iloc[-21:-1].mean())
             close = float(df['Close'].iloc[-1])
+            
+            # Average Daily Traded Value (in Rupees)
+            avg_daily_value = avg_vol_20 * close
 
-            # Compression Check (Inside Bar Setup)
+            # --- FILTER 1: Average Volume >= 10 Lakhs (1,000,000 shares) ---
+            if avg_vol_20 < 1000000:
+                continue
+
+            # --- FILTER 2: Average Daily Traded Value >= ₹3 Crore (30,000,000 INR) ---
+            if avg_daily_value < 30000000:
+                continue
+
+            # --- FILTER 3: Inside Bar Compression Check ---
             is_inside = (inside_high < mother_high) and (inside_low > mother_low)
 
             if is_inside:
@@ -74,7 +85,8 @@ if current_hour >= 16 or current_hour < 8:
                     "Stock": symbol.replace(".NS", ""),
                     "Mother_High": round(mother_high, 2),
                     "Mother_Low": round(mother_low, 2),
-                    "Vol_SMA20": int(vol_sma20),
+                    "Vol_SMA20": int(avg_vol_20),
+                    "Traded_Val_Cr": round(avg_daily_value / 10000000, 2), # Value in Crores
                     "Last_Close": round(close, 2)
                 })
         except Exception:
@@ -83,12 +95,12 @@ if current_hour >= 16 or current_hour < 8:
     if targets:
         df_out = pd.DataFrame(targets)
         ws_targets.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-        print(f"✅ Successfully pushed {len(targets)} shortlisted stocks to 'Today_Targets' tab!")
+        print(f"✅ Successfully pushed {len(targets)} highly liquid targets to 'Today_Targets'!")
     else:
-        print("ℹ️ No Inside Bar targets found today.")
+        print("ℹ️ No Inside Bar targets matched the liquidity criteria today.")
 
 # =====================================================================
-# MODE 2: INTRADAY LIVE SCAN (Subah 9:30 AM Market Hours me chalega)
+# MODE 2: INTRADAY LIVE SCAN (Subah 9:30 AM Market Hours)
 # =====================================================================
 else:
     print("⚡ Running INTRADAY LIVE VOLUME SURGE SCAN...", flush=True)
@@ -104,7 +116,6 @@ else:
         print(f"❌ Error reading Today_Targets: {e}")
         exit(1)
 
-    # Get or Create 'LIVE_BREAKOUTS' Worksheet
     try:
         ws_live = sh.worksheet("LIVE_BREAKOUTS")
         ws_live.clear()
