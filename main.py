@@ -1,13 +1,18 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import gspread
 import pandas as pd
 import yfinance as yf
 
-print("=== STARTING CTD SNIPER AUTOMATED SCANNER ===", flush=True)
+# 1. IST Timezone Setup
+IST = timezone(timedelta(hours=5, minutes=30))
+now = datetime.now(IST)
+current_hour = now.hour
 
-# 1. CONNECT TO GOOGLE SHEETS
+print(f"=== CTD SNIPER STARTING | Time: {now.strftime('%H:%M IST')} ===", flush=True)
+
+# 2. CONNECT TO GOOGLE SHEETS
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -17,115 +22,88 @@ except Exception as e:
     print(f"❌ Error connecting to Google Sheets: {e}")
     exit(1)
 
-now = datetime.now()
-current_hour = now.hour
+# Helper function: Worksheet ko safely lene ya banane ke liye
+def get_or_create_worksheet(title):
+    try:
+        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows="100", cols="10")
 
 # =====================================================================
-# STEP 1: EOD SCAN - VOLUME DRY FILTER (Post 16:00 IST or Early Morning)
-# Filter stocks from 'Watchlist' -> Save to 'Ready_For_Today'
+# STEP 1: EOD SCAN (Market Closed: >= 16:00 or < 09:00 IST)
+# Filter 'Watchlist' -> Save to 'Ready_For_Today'
 # =====================================================================
 if current_hour >= 16 or current_hour < 9:
     print("📌 Running EOD Scan: Filtering Volume Dry-up Setups...", flush=True)
 
+    ws_ready = get_or_create_worksheet("Ready_For_Today")
+    ws_ready.clear()
+    ws_ready.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio"])
+
     try:
-        ws_ready = sh.worksheet("Ready_For_Today")
-        ws_ready.clear()
-    except Exception:
-        ws_ready = sh.add_worksheet(title="Ready_For_Today", rows="100", cols="10")
+        raw_stocks = sh.worksheet("Watchlist").col_values(1)
+    except Exception as e:
+        print(f"❌ Error reading Watchlist: {e}")
+        exit(1)
 
-    ws_watchlist = sh.worksheet("Watchlist")
-    raw_stocks = ws_watchlist.col_values(1)
-
-    STOCKS = []
-    REJECT_KEYWORDS = ['LIQUID', 'ETF', 'CPSE', 'NETF', 'GILT', 'GOLD', 'SILVER']
-    for s in raw_stocks:
-        clean_s = s.strip().upper()
-        if clean_s and clean_s not in ["STOCK", "SYMBOL", "NAME", "STOCKS"]:
-            if not any(k in clean_s for k in REJECT_KEYWORDS):
-                if not clean_s.endswith(".NS") and not clean_s.startswith("^"):
-                    clean_s += ".NS"
-                STOCKS.append(clean_s)
-    STOCKS = sorted(list(set(STOCKS)))
-
+    STOCKS = [s.strip().upper() + ".NS" for s in raw_stocks if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]]
+    
     ready_targets = []
-    for symbol in STOCKS:
+    for symbol in set(STOCKS):
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="60d", interval="1d")
-
-            if df.empty or len(df) < 30:
+            if df.empty or len(df) < 30: 
                 continue
 
-            df = df.reset_index()
             df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
-            df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-
-            # Focus on last 5 completed daily candles
             recent = df.iloc[-5:].copy()
-
-            avg_vol_20 = float(df['Vol_SMA20'].iloc[-1])
-            last_close = float(recent['Close'].iloc[-1])
-            ema50 = float(recent['EMA50'].iloc[-1])
-            avg_daily_val = avg_vol_20 * last_close
-
-            # Basic liquidity criteria
-            if avg_vol_20 < 500000 or avg_daily_val < 20000000:
-                continue
-
-            # LOGIC 1: Price is pulling down or consolidating
-            price_pullback = recent['Close'].iloc[-1] < recent['High'].iloc[-4]
-
-            # LOGIC 2: VOLUME DRY-UP (Volume < 55% of 20-day Average for at least 2 of last 3 days)
-            dry_days_count = (recent['Volume'].iloc[-3:] < (0.55 * recent['Vol_SMA20'].iloc[-3:])).sum()
-            is_volume_dry = dry_days_count >= 2
-
-            # LOGIC 3: Price above or holding near 50 EMA support
-            near_support = last_close >= (ema50 * 0.97)
-
-            if price_pullback and is_volume_dry and near_support:
-                trigger_high = round(float(recent['High'].iloc[-1]), 2)  # Reversal trigger
-                ready_targets.append({
-                    "Stock": symbol.replace(".NS", ""),
-                    "Trigger_High": trigger_high,
-                    "Last_Close": round(last_close, 2),
-                    "Vol_SMA20": int(avg_vol_20),
-                    "Recent_Vol": int(recent['Volume'].iloc[-1]),
-                    "Dry_Ratio": f"{round((recent['Volume'].iloc[-1] / avg_vol_20) * 100, 1)}%"
-                })
+            
+            # Logic: Volume Dry (Last 3 days volume < 55% of SMA)
+            avg_vol = float(df['Vol_SMA20'].iloc[-1])
+            is_dry = (recent['Volume'].iloc[-3:] < (0.55 * avg_vol)).sum() >= 2
+            
+            if is_dry:
+                ready_targets.append([
+                    symbol.replace(".NS", ""),
+                    round(float(recent['High'].iloc[-1]), 2),
+                    round(float(recent['Close'].iloc[-1]), 2),
+                    int(avg_vol),
+                    f"{round((recent['Volume'].iloc[-1] / avg_vol) * 100, 1)}%"
+                ])
         except Exception:
-            pass
+            continue
 
     if ready_targets:
-        df_out = pd.DataFrame(ready_targets)
-        ws_ready.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-        print(f"✅ Filtered {len(ready_targets)} Volume Dry stocks and saved to 'Ready_For_Today'!")
+        ws_ready.append_rows(ready_targets)
+        print(f"✅ Saved {len(ready_targets)} stocks to 'Ready_For_Today'.")
     else:
-        print("ℹ️ No Volume Dry setups matched today.")
+        print("ℹ️ No Volume Dry targets found today.")
 
 # =====================================================================
-# STEP 2: INTRADAY LIVE SCAN (Market Hours)
-# Reads ONLY 'Ready_For_Today' sheet -> Tests Live Volume & Price Breakout
+# STEP 2: INTRADAY LIVE SCAN (Market Hours: 09:00 to 15:59 IST)
+# Reads 'Ready_For_Today' -> Pushes Breakouts to 'LIVE_BREAKOUTS'
 # =====================================================================
 else:
-    print("⚡ Running INTRADAY LIVE BREAKOUT TEST on 'Ready_For_Today'...", flush=True)
+    print("⚡ Running INTRADAY LIVE SCAN...", flush=True)
+    
+    ws_ready = get_or_create_worksheet("Ready_For_Today")
+    records = ws_ready.get_all_records()
 
-    try:
-        ws_ready = sh.worksheet("Ready_For_Today")
-        records = ws_ready.get_all_records()
-        if not records:
-            print("❌ No target stocks found in 'Ready_For_Today' tab.")
-            exit(0)
-        df_ready = pd.DataFrame(records)
-    except Exception as e:
-        print(f"❌ Error reading 'Ready_For_Today': {e}")
-        exit(1)
-
-    try:
-        ws_live = sh.worksheet("LIVE_BREAKOUTS")
+    if not records:
+        print("⚠️ 'Ready_For_Today' sheet is empty or tab was just created. Run EOD scan first!")
+        ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
         ws_live.clear()
-    except Exception:
-        ws_live = sh.add_worksheet(title="LIVE_BREAKOUTS", rows="100", cols="10")
+        ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
+        ws_live.append_row(["NO TARGETS SET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
+        exit(0) # Smooth exit without error code
 
+    df_ready = pd.DataFrame(records)
+    ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
+    ws_live.clear()
+    ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
+
+    # Volume projection math
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     mins_passed = max(int((now - market_start).total_seconds() / 60), 5)
     projected_factor = 375 / mins_passed
@@ -133,49 +111,34 @@ else:
     confirmed_breakouts = []
 
     for _, row in df_ready.iterrows():
-        symbol = str(row['Stock']).strip()
-        if not symbol.endswith(".NS"):
-            symbol += ".NS"
-
-        trigger_high = float(row['Trigger_High'])
-        v_sma20 = float(row['Vol_SMA20'])
-
         try:
-            ticker = yf.Ticker(symbol)
-            df_live = ticker.history(period="1d", interval="5m")
+            symbol = str(row['Stock']).strip() + ".NS"
+            trigger = float(row['Trigger_High'])
+            v_sma20 = float(row['Vol_SMA20'])
 
-            if df_live.empty:
+            df_live = yf.Ticker(symbol).history(period="1d", interval="5m")
+            if df_live.empty: 
                 continue
 
-            live_price = round(float(df_live['Close'].iloc[-1]), 2)
-            current_vol = float(df_live['Volume'].sum())
+            price = round(float(df_live['Close'].iloc[-1]), 2)
+            vol = float(df_live['Volume'].sum())
+            vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            projected_vol = current_vol * projected_factor
-            vol_ratio = round(projected_vol / v_sma20, 2) if v_sma20 > 0 else 0.0
-
-            # LIVE TRIGGER: Price crosses Previous Day High AND Projected Volume Surge >= 1.8x
-            if live_price >= trigger_high and vol_ratio >= 1.8:
-                pct_change = round(((live_price - trigger_high) / trigger_high) * 100, 2)
-                confirmed_breakouts.append({
-                    "Stock": symbol.replace(".NS", ""),
-                    "Live_Price": live_price,
-                    "Trigger_High": trigger_high,
-                    "Gain_%": pct_change,
-                    "Projected_Vol": f"{vol_ratio}x",
-                    "Scan_Time": now.strftime('%H:%M IST')
-                })
-                print(f"🚀 BREAKOUT DETECTED: {symbol} | Price: {live_price} | Vol: {vol_ratio}x")
-
+            # TRIGGER: Price >= Trigger High AND Volume Surge >= 1.8x
+            if price >= trigger and vol_ratio >= 1.8:
+                confirmed_breakouts.append([
+                    row['Stock'], price, trigger,
+                    round(((price - trigger) / trigger) * 100, 2),
+                    f"{vol_ratio}x",
+                    now.strftime('%H:%M IST')
+                ])
         except Exception:
-            pass
+            continue
 
     if confirmed_breakouts:
-        df_out = pd.DataFrame(confirmed_breakouts)
-        ws_live.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-        print(f"✅ Pushed {len(confirmed_breakouts)} live breakout alerts to 'LIVE_BREAKOUTS'!")
+        ws_live.append_rows(confirmed_breakouts)
+        print(f"🚀 Found {len(confirmed_breakouts)} live breakouts!")
     else:
-        ws_live.update([
-            ["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"],
-            ["NO BREAKOUT YET", "-", "-", "-", "-", now.strftime('%H:%M IST')]
-        ])
+        ws_live.append_row(["NO BREAKOUT YET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         print("ℹ️ No volume surge breakouts matched at this time.")
+        
