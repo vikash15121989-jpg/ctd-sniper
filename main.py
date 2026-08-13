@@ -22,7 +22,6 @@ except Exception as e:
     print(f"❌ Error connecting to Google Sheets: {e}")
     exit(1)
 
-# Helper function: Worksheet ko safely lene ya banane ke liye
 def get_or_create_worksheet(title):
     try:
         return sh.worksheet(title)
@@ -30,15 +29,14 @@ def get_or_create_worksheet(title):
         return sh.add_worksheet(title=title, rows="100", cols="10")
 
 # =====================================================================
-# STEP 1: EOD SCAN (Market Closed: >= 16:00 or < 09:00 IST)
-# Filter 'Watchlist' -> Save to 'Ready_For_Today'
+# STEP 1: EOD SCAN (STRICT HIGH-QUALITY FILTER: 16:00 to 09:00 IST)
 # =====================================================================
 if current_hour >= 16 or current_hour < 9:
-    print("📌 Running EOD Scan: Filtering Volume Dry-up Setups...", flush=True)
+    print("📌 Running STRICT EOD Scan for Quality Volume Dry Setups...", flush=True)
 
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
-    ws_ready.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio"])
+    ws_ready.append_row(["Stock", "Trigger_High", "Last_Close", "Vol_SMA20", "Dry_Ratio", "EMA20"])
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -57,32 +55,61 @@ if current_hour >= 16 or current_hour < 9:
                 continue
 
             df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+            df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+            df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+
             recent = df.iloc[-5:].copy()
-            
-            # Logic: Volume Dry (Last 3 days volume < 55% of SMA)
             avg_vol = float(df['Vol_SMA20'].iloc[-1])
-            is_dry = (recent['Volume'].iloc[-3:] < (0.55 * avg_vol)).sum() >= 2
+            last_close = float(recent['Close'].iloc[-1])
+            ema20 = float(recent['EMA20'].iloc[-1])
+            ema50 = float(recent['EMA50'].iloc[-1])
             
-            if is_dry:
-                ready_targets.append([
-                    symbol.replace(".NS", ""),
-                    round(float(recent['High'].iloc[-1]), 2),
-                    round(float(recent['Close'].iloc[-1]), 2),
-                    int(avg_vol),
-                    f"{round((recent['Volume'].iloc[-1] / avg_vol) * 100, 1)}%"
-                ])
+            daily_turnover_cr = (avg_vol * last_close) / 10000000
+
+            # 🛑 FILTER 1: High Liquidity Only (Min 5 Crore Turnover & 3 Lakh Volume)
+            if daily_turnover_cr < 5.0 or avg_vol < 300000:
+                continue
+
+            # 🛑 FILTER 2: Uptrend/Support Filter (Price must be ABOVE or within 2% of 20 EMA & 50 EMA)
+            if last_close < (ema20 * 0.98) or last_close < (ema50 * 0.98):
+                continue
+
+            # 🛑 FILTER 3: EXTREME VOLUME DRY-UP (At least 2 days vol < 40% of 20 SMA)
+            extreme_dry_days = (recent['Volume'].iloc[-3:] < (0.40 * recent['Vol_SMA20'].iloc[-3:])).sum()
+            if extreme_dry_days < 2:
+                continue
+
+            # 🛑 FILTER 4: Pullback/Consolidation (Not chasing multi-day runaway rally)
+            price_consolidating = recent['High'].max() / recent['Low'].min() <= 1.08  # Max 8% range in 5 days
+
+            if price_consolidating:
+                trigger_high = round(float(recent['High'].iloc[-1]), 2)
+                ready_targets.append({
+                    "data": [
+                        symbol.replace(".NS", ""),
+                        trigger_high,
+                        round(last_close, 2),
+                        int(avg_vol),
+                        f"{round((recent['Volume'].iloc[-1] / avg_vol) * 100, 1)}%",
+                        round(ema20, 2)
+                    ],
+                    "dry_pct": float(recent['Volume'].iloc[-1] / avg_vol)
+                })
         except Exception:
             continue
 
+    # Sort by Most Volume Dry stocks first & pick Top 30 Best Setups
     if ready_targets:
-        ws_ready.append_rows(ready_targets)
-        print(f"✅ Saved {len(ready_targets)} stocks to 'Ready_For_Today'.")
+        ready_targets.sort(key=lambda x: x['dry_pct'])
+        final_rows = [item['data'] for item in ready_targets[:30]] # Max 30 Top Stocks
+        
+        ws_ready.append_rows(final_rows)
+        print(f"✅ Filtered down to Top {len(final_rows)} Quality stocks in 'Ready_For_Today'!")
     else:
-        print("ℹ️ No Volume Dry targets found today.")
+        print("ℹ️ No Quality Volume Dry targets found today.")
 
 # =====================================================================
 # STEP 2: INTRADAY LIVE SCAN (Market Hours: 09:00 to 15:59 IST)
-# Reads 'Ready_For_Today' -> Pushes Breakouts to 'LIVE_BREAKOUTS'
 # =====================================================================
 else:
     print("⚡ Running INTRADAY LIVE SCAN...", flush=True)
@@ -91,19 +118,18 @@ else:
     records = ws_ready.get_all_records()
 
     if not records:
-        print("⚠️ 'Ready_For_Today' sheet is empty or tab was just created. Run EOD scan first!")
+        print("⚠️ 'Ready_For_Today' sheet is empty. Run EOD scan first!")
         ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
         ws_live.clear()
         ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
         ws_live.append_row(["NO TARGETS SET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
-        exit(0) # Smooth exit without error code
+        exit(0)
 
     df_ready = pd.DataFrame(records)
     ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
     ws_live.clear()
     ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Scan_Time"])
 
-    # Volume projection math
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     mins_passed = max(int((now - market_start).total_seconds() / 60), 5)
     projected_factor = 375 / mins_passed
@@ -120,12 +146,16 @@ else:
             if df_live.empty: 
                 continue
 
-            price = round(float(df_live['Close'].iloc[-1]), 2)
+            open_price = round(float(df_live['Open'].iloc[0]), 2)  # Aaj ka Open Price
+            price = round(float(df_live['Close'].iloc[-1]), 2)       # Live Price (CMP)
             vol = float(df_live['Volume'].sum())
             vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            # TRIGGER: Price >= Trigger High AND Volume Surge >= 1.8x
-            if price >= trigger and vol_ratio >= 1.8:
+            # 🟢 STRICT LIVE CONDITIONS:
+            # 1. Price >= Trigger High (Breakout)
+            # 2. Volume Surge >= 2.0x (Volume Expansion)
+            # 3. CMP > Open Price (Green Day Candle - Buying Pressure only)
+            if price >= trigger and vol_ratio >= 2.0 and price > open_price:
                 confirmed_breakouts.append([
                     row['Stock'], price, trigger,
                     round(((price - trigger) / trigger) * 100, 2),
