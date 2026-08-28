@@ -1,6 +1,7 @@
 from datetime import datetime, timezone, timedelta
 import json
 import os
+import math
 import gspread
 import pandas as pd
 import yfinance as yf
@@ -12,6 +13,16 @@ IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
 
 print(f"=== CTD SNIPER STARTING | Time: {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+
+# Helper functions to sanitize non-JSON float values (NaN, Inf)
+def sanitize_value(val):
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+    return val
+
+def sanitize_rows(rows):
+    return [[sanitize_value(val) for val in row] for row in rows]
 
 # =====================================================================
 # 2. CONNECT TO GOOGLE SHEETS
@@ -32,26 +43,33 @@ def get_or_create_worksheet(title):
         return sh.add_worksheet(title=title, rows="200", cols="10")
 
 # =====================================================================
-# POSITION SIZING CALCULATOR
+# POSITION SIZING CALCULATOR (FIXED)
 # =====================================================================
 def update_position_sizing_calculator():
     ws_pos = get_or_create_worksheet("Position_Sizing")
     
     existing_data = ws_pos.get_all_values()
-    capital = 100000
+    capital = 100000.0
     risk_pct = 1.0
     stock_input = "RELIANCE"
 
+    # Safe extraction of input parameters
     if len(existing_data) >= 3:
         try:
-            capital = float(existing_data[0][1].replace("₹", "").replace(",", "").strip())
-        except: pass
+            if len(existing_data[0]) > 1 and existing_data[0][1]:
+                capital = float(str(existing_data[0][1]).replace("₹", "").replace(",", "").strip())
+        except Exception:
+            pass
         try:
-            risk_pct = float(existing_data[1][1].replace("%", "").strip())
-        except: pass
+            if len(existing_data[1]) > 1 and existing_data[1][1]:
+                risk_pct = float(str(existing_data[1][1]).replace("%", "").strip())
+        except Exception:
+            pass
         try:
-            stock_input = str(existing_data[2][1]).strip().upper()
-        except: pass
+            if len(existing_data[2]) > 1 and existing_data[2][1]:
+                stock_input = str(existing_data[2][1]).strip().upper()
+        except Exception:
+            pass
 
     layout = [
         ["Total Capital (₹)", capital],
@@ -62,6 +80,7 @@ def update_position_sizing_calculator():
     ]
 
     calc_row = ["-", "-", "-", "-", "-", "-", "-", "-"]
+    
     if stock_input and stock_input not in ["-", "NONE", ""]:
         try:
             symbol = stock_input + ".NS" if not stock_input.endswith(".NS") else stock_input
@@ -73,30 +92,32 @@ def update_position_sizing_calculator():
                 cmp = round(float(df['Close'].iloc[-1]), 2)
                 sl = round(float(df['EMA20'].iloc[-1]), 2)
                 
-                if sl >= cmp:
-                    sl = round(cmp * 0.98, 2)
+                if not (math.isnan(cmp) or math.isnan(sl)):
+                    if sl >= cmp:
+                        sl = round(cmp * 0.98, 2)
 
-                risk_per_share = round(cmp - sl, 2)
-                max_risk_amt = round((capital * risk_pct) / 100.0, 2)
-                qty = int(max_risk_amt / risk_per_share) if risk_per_share > 0 else 0
-                total_investment = round(qty * cmp, 2)
+                    risk_per_share = round(cmp - sl, 2)
+                    max_risk_amt = round((capital * risk_pct) / 100.0, 2)
+                    qty = int(max_risk_amt / risk_per_share) if risk_per_share > 0 else 0
+                    total_investment = round(qty * cmp, 2)
 
-                calc_row = [
-                    stock_input.replace(".NS", ""),
-                    cmp,
-                    sl,
-                    risk_per_share,
-                    max_risk_amt,
-                    qty,
-                    total_investment,
-                    now.strftime('%H:%M IST')
-                ]
+                    calc_row = [
+                        stock_input.replace(".NS", ""),
+                        cmp,
+                        sl,
+                        risk_per_share,
+                        max_risk_amt,
+                        qty,
+                        total_investment,
+                        now.strftime('%H:%M IST')
+                    ]
         except Exception as e:
             print(f"⚠️ Error fetching Position Sizing data for {stock_input}: {e}")
 
     layout.append(calc_row)
+    
     ws_pos.clear()
-    ws_pos.update("A1", layout)
+    ws_pos.update(range_name="A1", values=sanitize_rows(layout))
     print("📐 'Position_Sizing' Calculator updated successfully.")
 
 update_position_sizing_calculator()
@@ -107,7 +128,6 @@ update_position_sizing_calculator()
 market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-# Check if current time is within 09:15 AM to 03:30 PM IST
 is_live_market = market_open_time <= now <= market_close_time
 
 # =====================================================================
@@ -130,7 +150,6 @@ if is_live_market:
 
     df_ready = pd.DataFrame(records)
 
-    # Minutes passed calculation (Minimum 5 minutes limit)
     mins_passed = max(int((now - market_open_time).total_seconds() / 60), 5)
     projected_factor = 375 / mins_passed
 
@@ -151,7 +170,6 @@ if is_live_market:
             vol = float(df_live['Volume'].sum())
             vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            # 🚀 Breakout Condition: Price > Trigger High AND Projected Volume >= 1.8x AND Green Candle
             if price >= trigger and vol_ratio >= 1.8 and price > open_price:
                 confirmed_breakouts.append([
                     row['Stock'], price, trigger,
@@ -163,14 +181,14 @@ if is_live_market:
             continue
 
     if confirmed_breakouts:
-        ws_live.append_rows(confirmed_breakouts)
+        ws_live.append_rows(sanitize_rows(confirmed_breakouts))
         print(f"🚀 Found {len(confirmed_breakouts)} live green-candle breakouts!")
     else:
         ws_live.append_row(["NO BREAKOUT YET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         print("ℹ️ No volume surge breakouts matched at this time.")
 
 # =====================================================================
-# STEP 2: EOD SCAN (Market Closed: Before 09:15 AM or After 03:30 PM IST)
+# STEP 2: EOD SCAN (Market Closed)
 # =====================================================================
 else:
     print("📌 Running EOD Scan: Filtering Volume Dry Setups...", flush=True)
@@ -201,9 +219,12 @@ else:
             if df.empty or len(df) < 30: 
                 continue
 
-            # 💡 Turnover Check (Min ₹3 Cr Turnover)
             avg_vol = float(df['Volume'].rolling(window=20).mean().iloc[-1])
             last_close = float(df['Close'].iloc[-1])
+            
+            if math.isnan(avg_vol) or math.isnan(last_close):
+                continue
+
             daily_turnover_cr = (avg_vol * last_close) / 10000000.0
 
             if daily_turnover_cr < 3.0 or avg_vol < 200000:
@@ -221,7 +242,6 @@ else:
             trigger_high = round(float(recent['High'].iloc[-1]), 2)
             stock_clean = symbol.replace(".NS", "")
 
-            # Volume Dry Condition
             is_volume_dry = (recent['Volume'].iloc[-3:] < (0.50 * recent['Vol_SMA20'].iloc[-3:])).sum() >= 2
 
             if is_volume_dry:
@@ -241,10 +261,9 @@ else:
             continue
 
     if all_dry_targets:
-        ws_dry_all.append_rows(all_dry_targets)
+        ws_dry_all.append_rows(sanitize_rows(all_dry_targets))
         print(f"✅ Saved ALL {len(all_dry_targets)} Volume Dry stocks to 'Volume_Dry_All'.")
 
     if ready_targets:
-        ws_ready.append_rows(ready_targets)
+        ws_ready.append_rows(sanitize_rows(ready_targets))
         print(f"✅ Saved {len(ready_targets)} Quality stocks to 'Ready_For_Today'.")
-        
