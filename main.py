@@ -42,84 +42,12 @@ def get_or_create_worksheet(title):
     except gspread.exceptions.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows="200", cols="10")
 
-# =====================================================================
-# POSITION SIZING CALCULATOR
-# =====================================================================
-def update_position_sizing_calculator():
-    ws_pos = get_or_create_worksheet("Position_Sizing")
-    
-    existing_data = ws_pos.get_all_values()
-    capital = 100000.0
-    risk_pct = 1.0
-    stock_input = "RELIANCE"
+# ETF Exclusion Keywords List
+ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 
-    if len(existing_data) >= 3:
-        try:
-            if len(existing_data[0]) > 1 and existing_data[0][1]:
-                capital = float(str(existing_data[0][1]).replace("₹", "").replace(",", "").strip())
-        except Exception:
-            pass
-        try:
-            if len(existing_data[1]) > 1 and existing_data[1][1]:
-                risk_pct = float(str(existing_data[1][1]).replace("%", "").strip())
-        except Exception:
-            pass
-        try:
-            if len(existing_data[2]) > 1 and existing_data[2][1]:
-                stock_input = str(existing_data[2][1]).strip().upper()
-        except Exception:
-            pass
-
-    layout = [
-        ["Total Capital (₹)", capital],
-        ["Risk Per Trade (%)", risk_pct],
-        ["Stock Name", stock_input],
-        ["", ""],
-        ["Stock Symbol", "CMP / Entry (₹)", "Stop Loss (20 EMA) (₹)", "Risk / Share (₹)", "Max Risk Amt (₹)", "Calculated Qty", "Total Investment (₹)", "Updated At"]
-    ]
-
-    calc_row = ["-", "-", "-", "-", "-", "-", "-", "-"]
-    
-    if stock_input and stock_input not in ["-", "NONE", ""]:
-        try:
-            symbol = stock_input + ".NS" if not stock_input.endswith(".NS") else stock_input
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="60d", interval="1d")
-            
-            if not df.empty and len(df) >= 20:
-                df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-                cmp = round(float(df['Close'].iloc[-1]), 2)
-                sl = round(float(df['EMA20'].iloc[-1]), 2)
-                
-                if not (math.isnan(cmp) or math.isnan(sl)):
-                    if sl >= cmp:
-                        sl = round(cmp * 0.98, 2)
-
-                    risk_per_share = round(cmp - sl, 2)
-                    max_risk_amt = round((capital * risk_pct) / 100.0, 2)
-                    qty = int(max_risk_amt / risk_per_share) if risk_per_share > 0 else 0
-                    total_investment = round(qty * cmp, 2)
-
-                    calc_row = [
-                        stock_input.replace(".NS", ""),
-                        cmp,
-                        sl,
-                        risk_per_share,
-                        max_risk_amt,
-                        qty,
-                        total_investment,
-                        now.strftime('%H:%M IST')
-                    ]
-        except Exception as e:
-            print(f"⚠️ Error fetching Position Sizing data for {stock_input}: {e}")
-
-    layout.append(calc_row)
-    
-    ws_pos.clear()
-    ws_pos.update(range_name="A1", values=sanitize_rows(layout))
-    print("📐 'Position_Sizing' Calculator updated successfully.")
-
-update_position_sizing_calculator()
+def is_etf(symbol_name):
+    symbol_upper = symbol_name.upper()
+    return any(kw in symbol_upper for kw in ETF_KEYWORDS)
 
 # =====================================================================
 # TIME WINDOW CHECK (MARKET LIVE VS MARKET CLOSED)
@@ -156,7 +84,11 @@ if is_live_market:
 
     for _, row in df_ready.iterrows():
         try:
-            symbol = str(row['Stock']).strip() + ".NS"
+            stock_name = str(row['Stock']).strip().upper()
+            if is_etf(stock_name):
+                continue
+
+            symbol = stock_name + ".NS"
             trigger = float(row['Trigger_High'])
             v_sma20 = float(row['Vol_SMA20']) if 'Vol_SMA20' in row else 100000.0
             tag = row['Probability_Tag'] if 'Probability_Tag' in row else "PROBABILITY"
@@ -189,10 +121,10 @@ if is_live_market:
         print("ℹ️ No volume surge breakouts matched at this time.")
 
 # =====================================================================
-# STEP 2: EOD SCAN (NEW COMBO & EXPANDED LOOKBACK LOGIC)
+# STEP 2: EOD SCAN (NO ETF + EXPANDED LOOKBACK & COMBO LOGIC)
 # =====================================================================
 else:
-    print("📌 Running EOD Scan: Filtering High Probability Combo Setups...", flush=True)
+    print("📌 Running EOD Scan: Filtering High Probability Combo Setups (No ETFs)...", flush=True)
 
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
@@ -213,6 +145,12 @@ else:
 
     for symbol in set(STOCKS):
         try:
+            stock_clean = symbol.replace(".NS", "")
+            
+            # 🛑 ETF Filter (Skip if ETF/Index Fund)
+            if is_etf(stock_clean):
+                continue
+
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="100d", interval="1d")
             if df.empty or len(df) < 50: 
@@ -237,21 +175,20 @@ else:
             # -------------------------------------------------------------
             # EXPANDED LOOKBACK & COMBO LOGIC
             # -------------------------------------------------------------
-            # 1. Lookback Window Expanded to 20 Days (Pichle 1 Mahine Ka Breakout Catch Hoga)
             recent_20d = df.iloc[-20:]
             last_vol = float(recent_20d['Volume'].iloc[-1])
             
             # High Volume Surge Check (Pichle 20 dino me 1.5x+ Volume Surge aaya ho)
             had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.5)
 
-            # 2. Dry Volume Pullback Check (Aaj ka Volume Avg Vol se 55% kam ho)
+            # Dry Volume Pullback Check (Aaj ka Volume Avg Vol se 55% kam ho)
             is_dry_volume = last_vol <= (avg_vol * 0.55)
 
-            # 3. Demand Zone Check (Price 30-Day Low / Base Support ke 3.5% range me ho)
+            # Demand Zone Check (Price 30-Day Low / Base Support ke 3.5% range me ho)
             demand_zone_low = float(df['Low'].iloc[-30:].min())
             near_demand_zone = last_close <= (demand_zone_low * 1.035)
 
-            # 4. EMA Compression Check (20-EMA ke 2% Tolerance zone me ho)
+            # EMA Compression Check (20-EMA ke 2% Tolerance zone me ho)
             near_ema20 = last_close >= (ema20 * 0.98)
 
             # -------------------------------------------------------------
@@ -260,16 +197,12 @@ else:
             probability_tag = None
 
             if had_high_vol_breakout and is_dry_volume and near_ema20:
-                # CONDITION A: COMBO SETUP (Breakout + Dry Vol + Demand Zone)
                 if near_demand_zone:
                     probability_tag = "HIGH PROBABILITY"
-                
-                # CONDITION B: SINGLE SETUP (Breakout + Dry Vol)
                 else:
                     probability_tag = "PROBABILITY"
 
             if probability_tag:
-                stock_clean = symbol.replace(".NS", "")
                 trigger_high = round(float(recent_20d['High'].max()), 2)
                 dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%"
 
@@ -292,7 +225,8 @@ else:
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved ALL {len(filtered_setups)} Filtered Quality Setups to 'Ready_For_Today'.")
+        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Equity Stocks (No ETFs) to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
-        print("ℹ️ No stocks matched the setup criteria today.")
+        print("ℹ️ No equity stocks matched the setup criteria today.")
+        
