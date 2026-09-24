@@ -121,7 +121,7 @@ if is_live_market:
         print("ℹ️ No volume surge breakouts matched at this time.")
 
 # =====================================================================
-# STEP 2: EOD SCAN (NO ETF + EXPANDED LOOKBACK & COMBO LOGIC)
+# STEP 2: EOD SCAN (STRICT COMPLETED EOD DATA + NO ETF)
 # =====================================================================
 else:
     print("📌 Running EOD Scan: Filtering High Probability Combo Setups (No ETFs)...", flush=True)
@@ -153,8 +153,14 @@ else:
 
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="100d", interval="1d")
+            
             if df.empty or len(df) < 50: 
                 continue
+
+            # 🛠️ FIX: Agar Live Market Hours ya Incomplete Day chal raha ho, 
+            # toh aaj ki adhoori candle hata kar sirf Completed EOD data use karein.
+            if is_live_market and len(df) > 50:
+                df = df.iloc[:-1]
 
             # Indicators Calculation
             df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -181,7 +187,7 @@ else:
             # High Volume Surge Check (Pichle 20 dino me 1.5x+ Volume Surge aaya ho)
             had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.5)
 
-            # Dry Volume Pullback Check (Aaj ka Volume Avg Vol se 55% kam ho)
+            # Dry Volume Pullback Check (EOD Candle ka Volume Avg Vol se 55% kam ho)
             is_dry_volume = last_vol <= (avg_vol * 0.55)
 
             # Demand Zone Check (Price 30-Day Low / Base Support ke 3.5% range me ho)
@@ -229,4 +235,4 @@ else:
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
-        
+            
