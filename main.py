@@ -8,10 +8,10 @@ import yfinance as yf
 
 # =====================================================================
 # 📌 FORCE EOD FLAG
-# Live Market mein bhi EOD Scan chala kar Sheet bharne ke liye TRUE karein.
-# Sheet bharne ke baad ise FALSE kar dena.
+# Live Market hours me bhi EOD Scan chala kar Sheet bharne ke liye TRUE karein.
+# EOD Scan run karne ke baad ise FALSE kar dena.
 # =====================================================================
-FORCE_EOD_RUN = False
+FORCE_EOD_RUN = False 
 
 # =====================================================================
 # 1. IST TIMEZONE SETUP
@@ -67,32 +67,28 @@ if FORCE_EOD_RUN:
     is_live_market = False
 
 # =====================================================================
-# ROUTING: MARKET HOURS vs OFF-MARKET (EOD)
+# ROUTING: LIVE MARKET HOURS vs EOD SCAN (OFF-MARKET)
 # =====================================================================
 
 if is_live_market:
     # -----------------------------------------------------------------
-    # STEP 1: INTRADAY LIVE RE-BREAKOUT MONITOR
+    # INTRADAY MONITOR: ALL SHORTLISTED STOCKS FOR 15-MIN VOLUME BLAST
     # -----------------------------------------------------------------
-    print("⚡ [LIVE MARKET HOURS] Running Intraday Re-Breakout Monitor...", flush=True)
+    print("⚡ [LIVE MARKET HOURS] Scanning ALL shortlisted stocks for 15m Volume Blast...", flush=True)
     
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     records = ws_ready.get_all_records()
 
     ws_live = get_or_create_worksheet("LIVE_BREAKOUTS")
     ws_live.clear()
-    ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Tag", "Scan_Time"])
+    ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "15m_Candle_Vol_Spike", "Probability_Tag", "Entry_Time"])
 
     if not records or "Stock" not in records[0]:
         print("⚠️ 'Ready_For_Today' sheet is empty or invalid.")
-        ws_live.append_row(["NO TARGETS SET", "-", "-", "-", "-", "-", now.strftime('%H:%M IST')])
+        ws_live.append_row(["NO TARGETS SET IN READY_FOR_TODAY", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         exit(0)
 
     df_ready = pd.DataFrame(records)
-
-    mins_passed = max(int((now - market_open_time).total_seconds() / 60), 5)
-    projected_factor = 375 / mins_passed
-
     confirmed_breakouts = []
 
     for _, row in df_ready.iterrows():
@@ -102,24 +98,32 @@ if is_live_market:
 
             symbol = stock_name + ".NS"
             trigger = float(row['Trigger_High'])
-            v_sma20 = float(row['Vol_SMA20']) if 'Vol_SMA20' in row else 100000.0
             tag = row['Probability_Tag'] if 'Probability_Tag' in row else "PROBABILITY"
 
-            df_live = yf.Ticker(symbol).history(period="1d", interval="5m")
-            if df_live.empty: continue
+            # 15-minute timeframe data fetch
+            df_live_15m = yf.Ticker(symbol).history(period="1d", interval="15m")
+            if df_live_15m.empty or len(df_live_15m) < 2: continue
 
-            open_price = round(float(df_live['Open'].iloc[0]), 2)  
-            price = round(float(df_live['Close'].iloc[-1]), 2)       
-            vol = float(df_live['Volume'].sum())
-            vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
+            latest_candle = df_live_15m.iloc[-1]
+            prev_candles = df_live_15m.iloc[:-1]
 
-            # Live Volume Re-Breakout Trigger Check
-            if price >= trigger and vol_ratio >= 1.8 and price > open_price:
+            live_price = round(float(latest_candle['Close']), 2)
+            candle_vol = float(latest_candle['Volume'])
+            avg_15m_vol = float(prev_candles['Volume'].mean()) if len(prev_candles) > 0 else 1.0
+
+            vol_ratio = round(candle_vol / avg_15m_vol, 2) if avg_15m_vol > 0 else 0.0
+
+            # 🎯 ENTRY TRIGGER CONDITIONS:
+            # 1. Price Trigger High ke paas ya uske upar ho (Within 0.5% or Breakout)
+            # 2. 15-Minute candle me Average 15m volume se 2.5x ya usse bada Volume Blast ho
+            # 3. Green Candle Close Direction (Close >= Open)
+            if live_price >= (trigger * 0.995) and vol_ratio >= 2.5 and live_price >= float(latest_candle['Open']):
                 confirmed_breakouts.append([
-                    row['Stock'], price, trigger,
-                    round(((price - trigger) / trigger) * 100, 2),
-                    f"{vol_ratio}x",
-                    tag,
+                    stock_name, 
+                    live_price, 
+                    trigger, 
+                    f"{vol_ratio}x Spike", 
+                    tag, 
                     now.strftime('%H:%M IST')
                 ])
         except Exception:
@@ -127,16 +131,16 @@ if is_live_market:
 
     if confirmed_breakouts:
         ws_live.append_rows(sanitize_rows(confirmed_breakouts))
-        print(f"🚀 Found {len(confirmed_breakouts)} live volume re-breakouts!")
+        print(f"🚀 VOLUME BLAST DETECTED for {len(confirmed_breakouts)} stocks!")
     else:
-        ws_live.append_row(["NO BREAKOUT YET", "-", "-", "-", "-", "-", now.strftime('%H:%M IST')])
-        print("ℹ️ No live breakouts triggered yet.")
+        ws_live.append_row(["NO VOLUME BLAST YET", "-", "-", "-", "-", now.strftime('%H:%M IST')])
+        print("ℹ️ Scanning complete. Waiting for intraday volume blast...")
 
 else:
     # -----------------------------------------------------------------
-    # STEP 2: EOD SCAN (Prior Resistance Breakout + High Vol -> Low Vol Pullback @ Demand Zone)
+    # EOD SCANNER: DYNAMIC RESISTANCE + LOW VOLUME PULLBACK
     # -----------------------------------------------------------------
-    print("📌 Running Double Resistance Structure EOD Scanner...", flush=True)
+    print("📌 Running Dynamic Resistance EOD Scanner...", flush=True)
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -150,7 +154,6 @@ else:
     print(f"📥 Fetching EOD data for {len(clean_stocks)} stocks...", flush=True)
     
     filtered_setups = []
-
     batch_data = yf.download(clean_stocks, period="60d", interval="1d", group_by="ticker", threads=True, progress=False)
 
     for symbol in clean_stocks:
@@ -173,32 +176,35 @@ else:
             last_close = float(df['Close'].iloc[-1])
             avg_vol = float(df['Vol_SMA20'].iloc[-1])
 
-            # Liquidity Filters (Avg Vol >= 2 Lakh & Daily Turnover >= 3 Cr)
-            if math.isnan(avg_vol) or avg_vol < 200000 or math.isnan(last_close): 
+            # Liquidity Filter (Avg Vol >= 1.5 Lakh & Turnover >= 2.5 Cr)
+            if math.isnan(avg_vol) or avg_vol < 150000 or math.isnan(last_close): 
                 continue
-            if ((avg_vol * last_close) / 10000000.0) < 3.0: 
+            if ((avg_vol * last_close) / 10000000.0) < 2.5: 
                 continue  
 
             # -----------------------------------------------------------------
-            # RESISTANCE STRUCTURE LOGIC
-            # Prior Resistance (21-40 days pehle ka High)
-            # Recent Resistance (Pichle 20 days ka High)
+            # DYNAMIC RESISTANCE STRUCTURE (Pichle 40-Days Lookback Window)
             # -----------------------------------------------------------------
-            prior_chunk = df.iloc[-40:-20]
-            recent_chunk = df.iloc[-20:]
+            df_40d = df.iloc[-40:]
             recent_5d = df.iloc[-5:]
 
-            prior_resistance = float(prior_chunk['High'].max())
-            recent_resistance = float(recent_chunk['High'].max())
+            max_high_40d = float(df_40d['High'].max())
+            peak1_idx = df_40d['High'].idxmax()
+            
+            df_without_peak1 = df_40d.drop(peak1_idx)
+            max_high_other = float(df_without_peak1['High'].max())
 
-            # RULE 1: Recent Resistance ne Prior Resistance ko cross kiya ho ya uske Zone (within 2%) mein ho
+            recent_resistance = max_high_40d
+            prior_resistance = max_high_other
+
+            # RULE 1: Resistance Cross ya Zone Check (within 2%)
             has_crossed_or_in_zone = recent_resistance >= (prior_resistance * 0.98)
 
-            # RULE 2: Recent Resistance Attempt/Breakout ke dauran HIGH VOLUME hona chahiye (Vol >= 2.0x SMA20)
-            vol_ratios_recent = recent_chunk['Volume'] / recent_chunk['Vol_SMA20']
+            # RULE 2: High Volume Breakout/Attempt (Vol >= 2.0x SMA20)
+            vol_ratios_recent = df_40d['Volume'] / df_40d['Vol_SMA20']
             had_high_vol_breakout = (vol_ratios_recent >= 2.0).any()
 
-            # RULE 3: Uske baad Gira (Pullback) with LOW/DRY VOLUME (Recent 5 days me at least 2 days Vol < 60% SMA)
+            # RULE 3: Low Volume Pullback (Recent 5 days me at least 2 days Vol < 60% SMA)
             dry_days_count = (recent_5d['Volume'] < (0.60 * recent_5d['Vol_SMA20'])).sum()
             is_low_vol_pullback = dry_days_count >= 2
 
@@ -209,13 +215,12 @@ else:
                 last_vol = float(recent_5d['Volume'].iloc[-1])
                 dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%"
 
-                # RULE 4: Agar Pullback Demand Zone / EMA20 Support ke paas hai (within 4%) -> HIGH PROBABILITY
+                # RULE 4: TAGGING
+                # Agar Pullback Demand Zone / EMA20 Support ke paas (within 4%) ho -> HIGH PROBABILITY
+                # Otherwise -> PROBABILITY
                 is_near_demand = (last_close <= demand_zone_low * 1.04) or (abs(last_close - ema20) / ema20 <= 0.03)
                 
-                if is_near_demand:
-                    probability_tag = "HIGH PROBABILITY"
-                else:
-                    probability_tag = "PROBABILITY"
+                probability_tag = "HIGH PROBABILITY" if is_near_demand else "PROBABILITY"
 
                 filtered_setups.append([
                     stock_clean, probability_tag, trigger_high, round(last_close, 2),
@@ -225,7 +230,7 @@ else:
         except Exception:
             continue
 
-    # Update Google Sheet
+    # Google Sheet Update
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
     ws_ready.append_row([
@@ -237,7 +242,8 @@ else:
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved {len(filtered_setups)} Double Resistance Structure Setups to 'Ready_For_Today'.")
+        print(f"🎯 Saved {len(filtered_setups)} Filtered Setups to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
+        
