@@ -7,6 +7,12 @@ import pandas as pd
 import yfinance as yf
 
 # =====================================================================
+# 📌 FORCE EOD FLAG (Isse True rakhne par Market Hours mein bhi EOD Scan chalega)
+# Sheet bharne ke baad isko False kar dijiyega.
+# =====================================================================
+FORCE_EOD_RUN = True  
+
+# =====================================================================
 # 1. IST TIMEZONE SETUP
 # =====================================================================
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -50,22 +56,26 @@ def is_etf(symbol_name):
     return any(kw in symbol_upper for kw in ETF_KEYWORDS)
 
 # =====================================================================
-# TIME WINDOW CHECK (MARKET LIVE VS MARKET CLOSED)
+# TIME WINDOW CHECK
 # =====================================================================
 market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-# Mon (0) to Fri (4) check
 is_weekday = now.weekday() < 5
 is_live_market = is_weekday and (market_open_time <= now <= market_close_time)
 
+# Override with Force Flag
+if FORCE_EOD_RUN:
+    print("⚠️ FORCE_EOD_RUN is TRUE: Bypassing Live Market check to rebuild 'Ready_For_Today' sheet!", flush=True)
+    is_live_market = False
+
 # =====================================================================
-# ROUTING: MARKET HOURS vs OFF-MARKET
+# ROUTING: MARKET HOURS vs OFF-MARKET (EOD)
 # =====================================================================
 
 if is_live_market:
     # -----------------------------------------------------------------
-    # STEP 1: INTRADAY LIVE SCAN (Only checks breakout, DOES NOT touch EOD list)
+    # STEP 1: INTRADAY LIVE SCAN (Does NOT touch Ready_For_Today)
     # -----------------------------------------------------------------
     print("⚡ [LIVE MARKET HOURS] Running Intraday Breakout Monitor...", flush=True)
     
@@ -108,7 +118,6 @@ if is_live_market:
             vol = float(df_live['Volume'].sum())
             vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
-            # Signal Condition: Price trigger cross kare, volume 1.8x ho, aur green candle ho
             if price >= trigger and vol_ratio >= 1.8 and price > open_price:
                 confirmed_breakouts.append([
                     row['Stock'], price, trigger,
@@ -129,9 +138,9 @@ if is_live_market:
 
 else:
     # -----------------------------------------------------------------
-    # STEP 2: EOD SCAN (Batch Fetching - Saare Price Action Stocks Filter Karega)
+    # STEP 2: EOD SCAN (Batch Fetching - Saare Price Action Stocks)
     # -----------------------------------------------------------------
-    print("📌 [MARKET CLOSED] Running Full EOD Scanner...", flush=True)
+    print("📌 [EOD SCANNER RUNNING] Populating 'Ready_For_Today' Sheet...", flush=True)
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -140,13 +149,11 @@ else:
         exit(1)
 
     STOCKS = [s.strip().upper() + ".NS" for s in raw_stocks if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]]
-    
-    # Filter out ETFs
     clean_stocks = [s for s in set(STOCKS) if not is_etf(s.replace(".NS", ""))]
     
     print(f"📥 Downloading EOD data for {len(clean_stocks)} stocks in BATCH mode...", flush=True)
     
-    # BATCH DOWNLOAD: Yahoo Finance Block/Throttling bypass karega
+    # BATCH DOWNLOAD: Fast and avoids throttling
     batch_data = yf.download(clean_stocks, period="100d", interval="1d", group_by="ticker", threads=True, progress=False)
 
     filtered_setups = []
@@ -155,7 +162,6 @@ else:
         try:
             stock_clean = symbol.replace(".NS", "")
 
-            # Extract DataFrame from batch
             if len(clean_stocks) == 1:
                 df = batch_data.copy()
             else:
@@ -177,14 +183,13 @@ else:
             if math.isnan(avg_vol) or avg_vol == 0 or math.isnan(last_close):
                 continue
 
-            # Pure Price Action Trigger High (Pichle 20 din ka High)
             recent_20d = df.iloc[-20:]
             trigger_high = round(float(recent_20d['High'].max()), 2)
             demand_zone_low = round(float(df['Low'].iloc[-30:].min()), 2)
             last_vol = float(recent_20d['Volume'].iloc[-1])
             dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%" if avg_vol > 0 else "0%"
 
-            # Tag Classification: Har valid price action stock cover hoga
+            # Pure Price Action Tagging (Covers all valid stocks)
             had_high_vol = (recent_20d['Volume'].max() >= avg_vol * 1.2)
             near_ema = last_close >= (ema20 * 0.95)
 
@@ -193,7 +198,6 @@ else:
             else:
                 probability_tag = "PROBABILITY"
 
-            # Direct append all pure price action equity stocks
             filtered_setups.append([
                 stock_clean,
                 probability_tag,
@@ -208,7 +212,7 @@ else:
         except Exception as e:
             continue
 
-    # Write to Google Sheet AFTER processing all stocks
+    # Update Google Sheet
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
     ws_ready.append_row([
