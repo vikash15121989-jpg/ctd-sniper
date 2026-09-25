@@ -11,7 +11,7 @@ import yfinance as yf
 # Live Market mein bhi EOD Scan chala kar Sheet bharne ke liye TRUE karein.
 # Sheet bharne ke baad ise FALSE kar dena.
 # =====================================================================
-FORCE_EOD_RUN = True
+FORCE_EOD_RUN = false
 
 # =====================================================================
 # 1. IST TIMEZONE SETUP
