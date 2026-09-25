@@ -129,16 +129,9 @@ if is_live_market:
 
 else:
     # -----------------------------------------------------------------
-    # STEP 2: EOD SCAN (Runs ONLY when Market is CLOSED - Updates 'Ready_For_Today')
+    # STEP 2: EOD SCAN (Batch Fetching - Saare Price Action Stocks Filter Karega)
     # -----------------------------------------------------------------
-    print("📌 [MARKET CLOSED] Running Full EOD Scanner for Next Trading Session...", flush=True)
-
-    ws_ready = get_or_create_worksheet("Ready_For_Today")
-    ws_ready.clear()
-    ws_ready.append_row([
-        "Stock", "Probability_Tag", "Trigger_High", "Last_Close", 
-        "Demand_Zone_Low", "Vol_SMA20", "Dry_Ratio", "Scan_Date"
-    ])
+    print("📌 [MARKET CLOSED] Running Full EOD Scanner...", flush=True)
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -148,20 +141,29 @@ else:
 
     STOCKS = [s.strip().upper() + ".NS" for s in raw_stocks if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]]
     
+    # Filter out ETFs
+    clean_stocks = [s for s in set(STOCKS) if not is_etf(s.replace(".NS", ""))]
+    
+    print(f"📥 Downloading EOD data for {len(clean_stocks)} stocks in BATCH mode...", flush=True)
+    
+    # BATCH DOWNLOAD: Yahoo Finance Block/Throttling bypass karega
+    batch_data = yf.download(clean_stocks, period="100d", interval="1d", group_by="ticker", threads=True, progress=False)
+
     filtered_setups = []
 
-    for symbol in set(STOCKS):
+    for symbol in clean_stocks:
         try:
             stock_clean = symbol.replace(".NS", "")
-            
-            # Skip ETFs
-            if is_etf(stock_clean):
-                continue
 
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="100d", interval="1d")
-            
-            if df.empty or len(df) < 50: 
+            # Extract DataFrame from batch
+            if len(clean_stocks) == 1:
+                df = batch_data.copy()
+            else:
+                if symbol not in batch_data.columns.levels[0]:
+                    continue
+                df = batch_data[symbol].dropna(how="all").copy()
+
+            if df.empty or len(df) < 20:
                 continue
 
             # Indicators Calculation
@@ -175,62 +177,50 @@ else:
             if math.isnan(avg_vol) or avg_vol == 0 or math.isnan(last_close):
                 continue
 
-            # Basic Turnover Filter (> 1 Cr for wider screening)
-            daily_turnover_cr = (avg_vol * last_close) / 10000000.0
-            if daily_turnover_cr < 1.0 or avg_vol < 30000:
-                continue
-
-            # Lookback Logic
+            # Pure Price Action Trigger High (Pichle 20 din ka High)
             recent_20d = df.iloc[-20:]
+            trigger_high = round(float(recent_20d['High'].max()), 2)
+            demand_zone_low = round(float(df['Low'].iloc[-30:].min()), 2)
             last_vol = float(recent_20d['Volume'].iloc[-1])
-            
-            # Conditions
-            had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.3)  # Relaxed to 1.3x
-            is_dry_volume = last_vol <= (avg_vol * 0.85)                           # Relaxed to 85% of Avg
-            demand_zone_low = float(df['Low'].iloc[-30:].min())
-            near_demand_zone = last_close <= (demand_zone_low * 1.08)              # Range 8%
-            near_ema20 = last_close >= (ema20 * 0.95)                              # 5% Tolerance
+            dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%" if avg_vol > 0 else "0%"
 
-            # -------------------------------------------------------------
-            # WIDE SELECTION CLASSIFICATION LOGIC
-            # -------------------------------------------------------------
-            probability_tag = None
+            # Tag Classification: Har valid price action stock cover hoga
+            had_high_vol = (recent_20d['Volume'].max() >= avg_vol * 1.2)
+            near_ema = last_close >= (ema20 * 0.95)
 
-            # High Quality Setup
-            if had_high_vol_breakout and is_dry_volume and near_ema20:
-                if near_demand_zone:
-                    probability_tag = "HIGH PROBABILITY"
-                else:
-                    probability_tag = "PROBABILITY"
-            
-            # Price Action Base Setup (Fallback to catch all valid stocks)
-            elif near_ema20 or near_demand_zone or had_high_vol_breakout:
+            if had_high_vol and near_ema:
+                probability_tag = "HIGH PROBABILITY"
+            else:
                 probability_tag = "PROBABILITY"
 
-            if probability_tag:
-                trigger_high = round(float(recent_20d['High'].max()), 2)
-                dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%" if avg_vol > 0 else "0%"
+            # Direct append all pure price action equity stocks
+            filtered_setups.append([
+                stock_clean,
+                probability_tag,
+                trigger_high,
+                round(last_close, 2),
+                demand_zone_low,
+                int(avg_vol),
+                dry_ratio,
+                now.strftime('%d-%b-%Y')
+            ])
 
-                filtered_setups.append([
-                    stock_clean,
-                    probability_tag,
-                    trigger_high,
-                    round(last_close, 2),
-                    round(demand_zone_low, 2),
-                    int(avg_vol),
-                    dry_ratio,
-                    now.strftime('%d-%b-%Y')
-                ])
-
-        except Exception:
+        except Exception as e:
             continue
 
-    # Priority Sorting: HIGH PROBABILITY setups always on top
+    # Write to Google Sheet AFTER processing all stocks
+    ws_ready = get_or_create_worksheet("Ready_For_Today")
+    ws_ready.clear()
+    ws_ready.append_row([
+        "Stock", "Probability_Tag", "Trigger_High", "Last_Close", 
+        "Demand_Zone_Low", "Vol_SMA20", "Dry_Ratio", "Scan_Date"
+    ])
+
     filtered_setups.sort(key=lambda x: x[1], reverse=True)
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Equity Stocks to 'Ready_For_Today'.")
+        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Price Action Stocks to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
