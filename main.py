@@ -11,7 +11,7 @@ import yfinance as yf
 # Isse TRUE rakha hai taaki Market Hours me bhi EOD Scan chale aur Sheet bhar jaye.
 # Sheet bharne ke baad isko False kar dijiyega.
 # =====================================================================
-FORCE_EOD_RUN = True  
+FORCE_EOD_RUN = False 
 
 # =====================================================================
 # 1. IST TIMEZONE SETUP
