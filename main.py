@@ -7,12 +7,6 @@ import pandas as pd
 import yfinance as yf
 
 # =====================================================================
-# 📌 FORCE EOD FLAG (Isse True rakhne par Market Hours mein bhi EOD Scan chalega)
-# Sheet bharne ke baad isko False kar dijiyega.
-# =====================================================================
-FORCE_EOD_RUN = True  
-
-# =====================================================================
 # 1. IST TIMEZONE SETUP
 # =====================================================================
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -52,11 +46,10 @@ def get_or_create_worksheet(title):
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 
 def is_etf(symbol_name):
-    symbol_upper = symbol_name.upper()
-    return any(kw in symbol_upper for kw in ETF_KEYWORDS)
+    return any(kw in symbol_name.upper() for kw in ETF_KEYWORDS)
 
 # =====================================================================
-# TIME WINDOW CHECK
+# TIME WINDOW CHECK (MARKET LIVE VS MARKET CLOSED)
 # =====================================================================
 market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -64,18 +57,14 @@ market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 is_weekday = now.weekday() < 5
 is_live_market = is_weekday and (market_open_time <= now <= market_close_time)
 
-# Override with Force Flag
-if FORCE_EOD_RUN:
-    print("⚠️ FORCE_EOD_RUN is TRUE: Bypassing Live Market check to rebuild 'Ready_For_Today' sheet!", flush=True)
-    is_live_market = False
-
 # =====================================================================
-# ROUTING: MARKET HOURS vs OFF-MARKET (EOD)
+# ROUTING: MARKET HOURS vs OFF-MARKET
 # =====================================================================
 
 if is_live_market:
     # -----------------------------------------------------------------
-    # STEP 1: INTRADAY LIVE SCAN (Does NOT touch Ready_For_Today)
+    # STEP 1: INTRADAY LIVE SCAN (09:15 AM - 03:30 PM IST)
+    # Ready_For_Today sheet ko READ karega, clear bilkul NAHI karega
     # -----------------------------------------------------------------
     print("⚡ [LIVE MARKET HOURS] Running Intraday Breakout Monitor...", flush=True)
     
@@ -101,8 +90,7 @@ if is_live_market:
     for _, row in df_ready.iterrows():
         try:
             stock_name = str(row['Stock']).strip().upper()
-            if is_etf(stock_name):
-                continue
+            if is_etf(stock_name): continue
 
             symbol = stock_name + ".NS"
             trigger = float(row['Trigger_High'])
@@ -110,8 +98,7 @@ if is_live_market:
             tag = row['Probability_Tag'] if 'Probability_Tag' in row else "PROBABILITY"
 
             df_live = yf.Ticker(symbol).history(period="1d", interval="5m")
-            if df_live.empty: 
-                continue
+            if df_live.empty: continue
 
             open_price = round(float(df_live['Open'].iloc[0]), 2)  
             price = round(float(df_live['Close'].iloc[-1]), 2)       
@@ -138,9 +125,10 @@ if is_live_market:
 
 else:
     # -----------------------------------------------------------------
-    # STEP 2: EOD SCAN (Batch Fetching - Saare Price Action Stocks)
+    # STEP 2: EOD SCAN (OFF-MARKET)
+    # Original Volume Dry + Uptrend Rules (Returns ~300 Quality Stocks)
     # -----------------------------------------------------------------
-    print("📌 [EOD SCANNER RUNNING] Populating 'Ready_For_Today' Sheet...", flush=True)
+    print("📌 [MARKET CLOSED] Running Full EOD Scanner (Volume Dry Filter)...", flush=True)
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -153,8 +141,7 @@ else:
     
     print(f"📥 Downloading EOD data for {len(clean_stocks)} stocks in BATCH mode...", flush=True)
     
-    # BATCH DOWNLOAD: Fast and avoids throttling
-    batch_data = yf.download(clean_stocks, period="100d", interval="1d", group_by="ticker", threads=True, progress=False)
+    batch_data = yf.download(clean_stocks, period="60d", interval="1d", group_by="ticker", threads=True, progress=False)
 
     filtered_setups = []
 
@@ -165,51 +152,48 @@ else:
             if len(clean_stocks) == 1:
                 df = batch_data.copy()
             else:
-                if symbol not in batch_data.columns.levels[0]:
-                    continue
+                if symbol not in batch_data.columns.levels[0]: continue
                 df = batch_data[symbol].dropna(how="all").copy()
 
-            if df.empty or len(df) < 20:
-                continue
+            if df.empty or len(df) < 30: continue
 
-            # Indicators Calculation
-            df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
             df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+            df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+            df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
             last_close = float(df['Close'].iloc[-1])
             avg_vol = float(df['Vol_SMA20'].iloc[-1])
-            ema20 = float(df['EMA20'].iloc[-1])
 
-            if math.isnan(avg_vol) or avg_vol == 0 or math.isnan(last_close):
-                continue
+            if math.isnan(avg_vol) or avg_vol < 200000 or math.isnan(last_close): continue
+            
+            # Turnover Liquidity Filter (> 3 Crore Daily Volume)
+            if ((avg_vol * last_close) / 10000000.0) < 3.0: continue  
 
+            recent_5d = df.iloc[-5:]
             recent_20d = df.iloc[-20:]
+            
+            last_vol = float(recent_5d['Volume'].iloc[-1])
+            dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%"
             trigger_high = round(float(recent_20d['High'].max()), 2)
             demand_zone_low = round(float(df['Low'].iloc[-30:].min()), 2)
-            last_vol = float(recent_20d['Volume'].iloc[-1])
-            dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%" if avg_vol > 0 else "0%"
 
-            # Pure Price Action Tagging (Covers all valid stocks)
-            had_high_vol = (recent_20d['Volume'].max() >= avg_vol * 1.2)
-            near_ema = last_close >= (ema20 * 0.95)
+            # 🎯 ORIGINAL VOLUME DRY FILTER (Pichle 3 me se 2 din Volume Average se 50% kam)
+            is_volume_dry = (recent_5d['Volume'].iloc[-3:] < (0.50 * recent_5d['Vol_SMA20'].iloc[-3:])).sum() >= 2
+            
+            ema20 = float(recent_5d['EMA20'].iloc[-1])
+            ema50 = float(recent_5d['EMA50'].iloc[-1])
+            
+            # Uptrend & Consolidation Check
+            in_uptrend = last_close >= (ema20 * 0.98) and last_close >= (ema50 * 0.98)
+            is_consolidating = (recent_5d['High'].max() / recent_5d['Low'].min()) <= 1.10
 
-            if had_high_vol and near_ema:
-                probability_tag = "HIGH PROBABILITY"
-            else:
-                probability_tag = "PROBABILITY"
-
-            filtered_setups.append([
-                stock_clean,
-                probability_tag,
-                trigger_high,
-                round(last_close, 2),
-                demand_zone_low,
-                int(avg_vol),
-                dry_ratio,
-                now.strftime('%d-%b-%Y')
-            ])
-
-        except Exception as e:
+            if is_volume_dry and in_uptrend and is_consolidating:
+                probability_tag = "HIGH PROBABILITY" if last_close >= ema20 else "PROBABILITY"
+                filtered_setups.append([
+                    stock_clean, probability_tag, trigger_high, round(last_close, 2),
+                    demand_zone_low, int(avg_vol), dry_ratio, now.strftime('%d-%b-%Y')
+                ])
+        except Exception:
             continue
 
     # Update Google Sheet
@@ -224,7 +208,7 @@ else:
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Price Action Stocks to 'Ready_For_Today'.")
+        print(f"🎯 Saved {len(filtered_setups)} Quality Volume Dry Stocks to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
