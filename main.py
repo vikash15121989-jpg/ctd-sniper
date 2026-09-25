@@ -7,6 +7,13 @@ import pandas as pd
 import yfinance as yf
 
 # =====================================================================
+# 📌 FORCE EOD FLAG
+# Isse TRUE rakha hai taaki Market Hours me bhi EOD Scan chale aur Sheet bhar jaye.
+# Sheet bharne ke baad isko False kar dijiyega.
+# =====================================================================
+FORCE_EOD_RUN = True  
+
+# =====================================================================
 # 1. IST TIMEZONE SETUP
 # =====================================================================
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -49,7 +56,7 @@ def is_etf(symbol_name):
     return any(kw in symbol_name.upper() for kw in ETF_KEYWORDS)
 
 # =====================================================================
-# TIME WINDOW CHECK (MARKET LIVE VS MARKET CLOSED)
+# TIME WINDOW CHECK
 # =====================================================================
 market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -57,14 +64,18 @@ market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 is_weekday = now.weekday() < 5
 is_live_market = is_weekday and (market_open_time <= now <= market_close_time)
 
+# OVERRIDE WITH FORCE FLAG TO RUN EOD SCAN RIGHT NOW
+if FORCE_EOD_RUN:
+    print("⚠️ FORCE_EOD_RUN is TRUE: Bypassing Live Market check to rebuild 'Ready_For_Today' sheet!", flush=True)
+    is_live_market = False
+
 # =====================================================================
-# ROUTING: MARKET HOURS vs OFF-MARKET
+# ROUTING: MARKET HOURS vs OFF-MARKET (EOD)
 # =====================================================================
 
 if is_live_market:
     # -----------------------------------------------------------------
-    # STEP 1: INTRADAY LIVE SCAN (09:15 AM - 03:30 PM IST)
-    # Ready_For_Today sheet ko READ karega, clear bilkul NAHI karega
+    # STEP 1: INTRADAY LIVE SCAN
     # -----------------------------------------------------------------
     print("⚡ [LIVE MARKET HOURS] Running Intraday Breakout Monitor...", flush=True)
     
@@ -125,10 +136,9 @@ if is_live_market:
 
 else:
     # -----------------------------------------------------------------
-    # STEP 2: EOD SCAN (OFF-MARKET)
-    # Strictly filters Volume Dry Setups (~300 Quality Stocks)
+    # STEP 2: EOD SCAN (Strict Volume Dry Filters -> Generates ~300 Quality Stocks)
     # -----------------------------------------------------------------
-    print("📌 [MARKET CLOSED] Running Full EOD Scanner (Volume Dry Filter)...", flush=True)
+    print("📌 Running Full EOD Scanner (Volume Dry Filter)...", flush=True)
 
     try:
         raw_stocks = sh.worksheet("Watchlist").col_values(1)
@@ -143,14 +153,12 @@ else:
     
     filtered_setups = []
 
-    # Batch Fetch with clean structure extraction
     batch_data = yf.download(clean_stocks, period="60d", interval="1d", group_by="ticker", threads=True, progress=False)
 
     for symbol in clean_stocks:
         try:
             stock_clean = symbol.replace(".NS", "")
 
-            # Single ticker vs Multi-ticker MultiIndex Handling
             if len(clean_stocks) == 1:
                 df = batch_data.copy()
             else:
@@ -183,15 +191,14 @@ else:
             trigger_high = round(float(recent_20d['High'].max()), 2)
             demand_zone_low = round(float(df['Low'].iloc[-30:].min()), 2)
 
-            # 🎯 STRICT VOLUME DRY LOGIC:
-            # Pichle 5 dino me kam se kam 2 din volume average ke 50% se KAM hona chahiye
+            # STRICT VOLUME DRY LOGIC: 5 me se kam se kam 2 din volume 50% se KAM
             vol_check = (recent_5d['Volume'] < (0.50 * recent_5d['Vol_SMA20'])).sum()
             is_volume_dry = vol_check >= 2
             
             ema20 = float(recent_5d['EMA20'].iloc[-1])
             ema50 = float(recent_5d['EMA50'].iloc[-1])
             
-            # Uptrend and Tight Range Check
+            # Uptrend & Consolidation Check
             in_uptrend = last_close >= (ema20 * 0.98) and last_close >= (ema50 * 0.98)
             is_consolidating = (recent_5d['High'].max() / recent_5d['Low'].min()) <= 1.12
 
