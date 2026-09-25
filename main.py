@@ -55,13 +55,19 @@ def is_etf(symbol_name):
 market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-is_live_market = market_open_time <= now <= market_close_time
+# Mon (0) to Fri (4) check
+is_weekday = now.weekday() < 5
+is_live_market = is_weekday and (market_open_time <= now <= market_close_time)
 
 # =====================================================================
-# STEP 1: INTRADAY LIVE SCAN (09:15 AM TO 03:30 PM IST)
+# ROUTING: MARKET HOURS vs OFF-MARKET
 # =====================================================================
+
 if is_live_market:
-    print("⚡ Running INTRADAY LIVE SCAN...", flush=True)
+    # -----------------------------------------------------------------
+    # STEP 1: INTRADAY LIVE SCAN (Only checks breakout, DOES NOT touch EOD list)
+    # -----------------------------------------------------------------
+    print("⚡ [LIVE MARKET HOURS] Running Intraday Breakout Monitor...", flush=True)
     
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     records = ws_ready.get_all_records()
@@ -70,8 +76,8 @@ if is_live_market:
     ws_live.clear()
     ws_live.append_row(["Stock", "Live_Price", "Trigger_High", "Gain_%", "Projected_Vol", "Tag", "Scan_Time"])
 
-    if not records:
-        print("⚠️ 'Ready_For_Today' sheet is empty.")
+    if not records or "Stock" not in records[0]:
+        print("⚠️ 'Ready_For_Today' sheet is empty or invalid.")
         ws_live.append_row(["NO TARGETS SET", "-", "-", "-", "-", "-", now.strftime('%H:%M IST')])
         exit(0)
 
@@ -102,6 +108,7 @@ if is_live_market:
             vol = float(df_live['Volume'].sum())
             vol_ratio = round((vol * projected_factor) / v_sma20, 2) if v_sma20 > 0 else 0.0
 
+            # Signal Condition: Price trigger cross kare, volume 1.8x ho, aur green candle ho
             if price >= trigger and vol_ratio >= 1.8 and price > open_price:
                 confirmed_breakouts.append([
                     row['Stock'], price, trigger,
@@ -115,16 +122,16 @@ if is_live_market:
 
     if confirmed_breakouts:
         ws_live.append_rows(sanitize_rows(confirmed_breakouts))
-        print(f"🚀 Found {len(confirmed_breakouts)} live green-candle breakouts!")
+        print(f"🚀 Found {len(confirmed_breakouts)} live breakouts!")
     else:
         ws_live.append_row(["NO BREAKOUT YET", "-", "-", "-", "-", "-", now.strftime('%H:%M IST')])
-        print("ℹ️ No volume surge breakouts matched at this time.")
+        print("ℹ️ No live breakouts triggered yet.")
 
-# =====================================================================
-# STEP 2: EOD SCAN (STRICT COMPLETED EOD DATA + NO ETF)
-# =====================================================================
 else:
-    print("📌 Running EOD Scan: Filtering High Probability Combo Setups (No ETFs)...", flush=True)
+    # -----------------------------------------------------------------
+    # STEP 2: EOD SCAN (Runs ONLY when Market is CLOSED - Updates 'Ready_For_Today')
+    # -----------------------------------------------------------------
+    print("📌 [MARKET CLOSED] Running Full EOD Scanner for Next Trading Session...", flush=True)
 
     ws_ready = get_or_create_worksheet("Ready_For_Today")
     ws_ready.clear()
@@ -147,7 +154,7 @@ else:
         try:
             stock_clean = symbol.replace(".NS", "")
             
-            # 🛑 ETF Filter (Skip if ETF/Index Fund)
+            # Skip ETFs
             if is_etf(stock_clean):
                 continue
 
@@ -156,11 +163,6 @@ else:
             
             if df.empty or len(df) < 50: 
                 continue
-
-            # 🛠️ FIX: Agar Live Market Hours ya Incomplete Day chal raha ho, 
-            # toh aaj ki adhoori candle hata kar sirf Completed EOD data use karein.
-            if is_live_market and len(df) > 50:
-                df = df.iloc[:-1]
 
             # Indicators Calculation
             df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -178,39 +180,37 @@ else:
             if daily_turnover_cr < 2.0 or avg_vol < 50000:
                 continue
 
-            # -------------------------------------------------------------
-            # EXPANDED LOOKBACK & COMBO LOGIC
-            # -------------------------------------------------------------
+            # Lookback Logic
             recent_20d = df.iloc[-20:]
             last_vol = float(recent_20d['Volume'].iloc[-1])
             
-            # High Volume Surge Check (Pichle 20 dino me 1.5x+ Volume Surge aaya ho)
             had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.5)
-
-            # Dry Volume Pullback Check (EOD Candle ka Volume Avg Vol se 55% kam ho)
             is_dry_volume = last_vol <= (avg_vol * 0.55)
 
-            # Demand Zone Check (Price 30-Day Low / Base Support ke 3.5% range me ho)
             demand_zone_low = float(df['Low'].iloc[-30:].min())
             near_demand_zone = last_close <= (demand_zone_low * 1.035)
 
-            # EMA Compression Check (20-EMA ke 2% Tolerance zone me ho)
             near_ema20 = last_close >= (ema20 * 0.98)
 
             # -------------------------------------------------------------
-            # CLASSIFICATION LOGIC (HIGH PROBABILITY VS PROBABILITY)
+            # SAFE CLASSIFICATION LOGIC
             # -------------------------------------------------------------
             probability_tag = None
 
+            # Priority 1: High Volume Surge + Dry Pullback + Near EMA20
             if had_high_vol_breakout and is_dry_volume and near_ema20:
                 if near_demand_zone:
                     probability_tag = "HIGH PROBABILITY"
                 else:
                     probability_tag = "PROBABILITY"
+            
+            # Priority 2: Safe Fallback
+            elif near_ema20 and near_demand_zone:
+                probability_tag = "PROBABILITY"
 
             if probability_tag:
                 trigger_high = round(float(recent_20d['High'].max()), 2)
-                dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%"
+                dry_ratio = f"{round((last_vol / avg_vol) * 100, 1)}%" if avg_vol > 0 else "0%"
 
                 filtered_setups.append([
                     stock_clean,
@@ -231,8 +231,7 @@ else:
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Equity Stocks (No ETFs) to 'Ready_For_Today'.")
+        print(f"🎯 Saved ALL {len(filtered_setups)} Pure Equity Stocks to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
-            
