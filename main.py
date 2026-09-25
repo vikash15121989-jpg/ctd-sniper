@@ -175,37 +175,36 @@ else:
             if math.isnan(avg_vol) or avg_vol == 0 or math.isnan(last_close):
                 continue
 
-            # Turnover Filter (> 2 Cr)
+            # Basic Turnover Filter (> 1 Cr for wider screening)
             daily_turnover_cr = (avg_vol * last_close) / 10000000.0
-            if daily_turnover_cr < 2.0 or avg_vol < 50000:
+            if daily_turnover_cr < 1.0 or avg_vol < 30000:
                 continue
 
             # Lookback Logic
             recent_20d = df.iloc[-20:]
             last_vol = float(recent_20d['Volume'].iloc[-1])
             
-            had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.5)
-            is_dry_volume = last_vol <= (avg_vol * 0.55)
-
+            # Conditions
+            had_high_vol_breakout = (recent_20d['Volume'].max() >= avg_vol * 1.3)  # Relaxed to 1.3x
+            is_dry_volume = last_vol <= (avg_vol * 0.85)                           # Relaxed to 85% of Avg
             demand_zone_low = float(df['Low'].iloc[-30:].min())
-            near_demand_zone = last_close <= (demand_zone_low * 1.035)
-
-            near_ema20 = last_close >= (ema20 * 0.98)
+            near_demand_zone = last_close <= (demand_zone_low * 1.08)              # Range 8%
+            near_ema20 = last_close >= (ema20 * 0.95)                              # 5% Tolerance
 
             # -------------------------------------------------------------
-            # SAFE CLASSIFICATION LOGIC
+            # WIDE SELECTION CLASSIFICATION LOGIC
             # -------------------------------------------------------------
             probability_tag = None
 
-            # Priority 1: High Volume Surge + Dry Pullback + Near EMA20
+            # High Quality Setup
             if had_high_vol_breakout and is_dry_volume and near_ema20:
                 if near_demand_zone:
                     probability_tag = "HIGH PROBABILITY"
                 else:
                     probability_tag = "PROBABILITY"
             
-            # Priority 2: Safe Fallback
-            elif near_ema20 and near_demand_zone:
+            # Price Action Base Setup (Fallback to catch all valid stocks)
+            elif near_ema20 or near_demand_zone or had_high_vol_breakout:
                 probability_tag = "PROBABILITY"
 
             if probability_tag:
