@@ -126,7 +126,7 @@ if is_live_market:
 else:
     # -----------------------------------------------------------------
     # STEP 2: EOD SCAN (OFF-MARKET)
-    # Original Volume Dry + Uptrend Rules (Returns ~300 Quality Stocks)
+    # Strictly filters Volume Dry Setups (~300 Quality Stocks)
     # -----------------------------------------------------------------
     print("📌 [MARKET CLOSED] Running Full EOD Scanner (Volume Dry Filter)...", flush=True)
 
@@ -137,26 +137,31 @@ else:
         exit(1)
 
     STOCKS = [s.strip().upper() + ".NS" for s in raw_stocks if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]]
-    clean_stocks = [s for s in set(STOCKS) if not is_etf(s.replace(".NS", ""))]
+    clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS", ""))]))
     
-    print(f"📥 Downloading EOD data for {len(clean_stocks)} stocks in BATCH mode...", flush=True)
+    print(f"📥 Fetching EOD data for {len(clean_stocks)} stocks...", flush=True)
     
-    batch_data = yf.download(clean_stocks, period="60d", interval="1d", group_by="ticker", threads=True, progress=False)
-
     filtered_setups = []
+
+    # Batch Fetch with clean structure extraction
+    batch_data = yf.download(clean_stocks, period="60d", interval="1d", group_by="ticker", threads=True, progress=False)
 
     for symbol in clean_stocks:
         try:
             stock_clean = symbol.replace(".NS", "")
 
+            # Single ticker vs Multi-ticker MultiIndex Handling
             if len(clean_stocks) == 1:
                 df = batch_data.copy()
             else:
-                if symbol not in batch_data.columns.levels[0]: continue
+                if symbol not in batch_data.columns.levels[0]: 
+                    continue
                 df = batch_data[symbol].dropna(how="all").copy()
 
-            if df.empty or len(df) < 30: continue
+            if df.empty or len(df) < 30: 
+                continue
 
+            # Indicators Calculation
             df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
             df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
             df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
@@ -164,10 +169,11 @@ else:
             last_close = float(df['Close'].iloc[-1])
             avg_vol = float(df['Vol_SMA20'].iloc[-1])
 
-            if math.isnan(avg_vol) or avg_vol < 200000 or math.isnan(last_close): continue
-            
-            # Turnover Liquidity Filter (> 3 Crore Daily Volume)
-            if ((avg_vol * last_close) / 10000000.0) < 3.0: continue  
+            # Liquidity Filters: Min Avg Volume & Turnover > 3 Crore
+            if math.isnan(avg_vol) or avg_vol < 200000 or math.isnan(last_close): 
+                continue
+            if ((avg_vol * last_close) / 10000000.0) < 3.0: 
+                continue  
 
             recent_5d = df.iloc[-5:]
             recent_20d = df.iloc[-20:]
@@ -177,15 +183,17 @@ else:
             trigger_high = round(float(recent_20d['High'].max()), 2)
             demand_zone_low = round(float(df['Low'].iloc[-30:].min()), 2)
 
-            # 🎯 ORIGINAL VOLUME DRY FILTER (Pichle 3 me se 2 din Volume Average se 50% kam)
-            is_volume_dry = (recent_5d['Volume'].iloc[-3:] < (0.50 * recent_5d['Vol_SMA20'].iloc[-3:])).sum() >= 2
+            # 🎯 STRICT VOLUME DRY LOGIC:
+            # Pichle 5 dino me kam se kam 2 din volume average ke 50% se KAM hona chahiye
+            vol_check = (recent_5d['Volume'] < (0.50 * recent_5d['Vol_SMA20'])).sum()
+            is_volume_dry = vol_check >= 2
             
             ema20 = float(recent_5d['EMA20'].iloc[-1])
             ema50 = float(recent_5d['EMA50'].iloc[-1])
             
-            # Uptrend & Consolidation Check
+            # Uptrend and Tight Range Check
             in_uptrend = last_close >= (ema20 * 0.98) and last_close >= (ema50 * 0.98)
-            is_consolidating = (recent_5d['High'].max() / recent_5d['Low'].min()) <= 1.10
+            is_consolidating = (recent_5d['High'].max() / recent_5d['Low'].min()) <= 1.12
 
             if is_volume_dry and in_uptrend and is_consolidating:
                 probability_tag = "HIGH PROBABILITY" if last_close >= ema20 else "PROBABILITY"
@@ -193,7 +201,7 @@ else:
                     stock_clean, probability_tag, trigger_high, round(last_close, 2),
                     demand_zone_low, int(avg_vol), dry_ratio, now.strftime('%d-%b-%Y')
                 ])
-        except Exception:
+        except Exception as e:
             continue
 
     # Update Google Sheet
@@ -208,7 +216,7 @@ else:
 
     if filtered_setups:
         ws_ready.append_rows(sanitize_rows(filtered_setups))
-        print(f"🎯 Saved {len(filtered_setups)} Quality Volume Dry Stocks to 'Ready_For_Today'.")
+        print(f"🎯 Saved {len(filtered_setups)} Strictly Filtered Volume Dry Stocks to 'Ready_For_Today'.")
     else:
         ws_ready.append_row(["NO MATCHING SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
         print("ℹ️ No equity stocks matched the setup criteria today.")
