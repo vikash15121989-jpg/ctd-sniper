@@ -1,11 +1,11 @@
-name: CTD Sniper Scanner Engine
+Name: CTD Sniper Scanner Engine
 
 on:
   schedule:
-    # 1. Raat 8:00 PM IST (EOD Scan ke liye)
+    # Roz Raat 8:00 PM IST ko Auto Run Hoga (UTC: 2:30 PM / 14:30)
     - cron: '30 14 * * 1-5'
-    # 2. Subah 9:30, 9:45, 10:00 AM IST (Live Scan ke liye)
-    - cron: '0,15,30 4 * * 1-5'
+  
+  # Manual Run Button Ke Liye (Jab Aapka Man Kare Tab Run Karein)
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
           python-version: '3.10'
       - name: Install dependencies
         run: |
-          pip install pandas yfinance gspread
+          pip install pandas yfinance gspread numpy
       - name: Run Python Scanner
         env:
           GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
