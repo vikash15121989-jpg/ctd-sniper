@@ -4,12 +4,16 @@ import os
 import math
 import gspread
 import pandas as pd
+import numpy as np
 import yfinance as yf
 
+# -----------------------------------------------------------------
+# TIME SETUP
+# -----------------------------------------------------------------
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
 
-print(f"=== [VPA RBS FINAL] RUNNING LH RETEST + DRY VOL SCANNER | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [FINAL FLEXIBLE] VPA RBS SCANNER | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -20,7 +24,9 @@ def sanitize_value(val):
 def sanitize_rows(rows):
     return [[sanitize_value(val) for val in row] for row in rows]
 
-# 1. Connect to Google Sheets
+# -----------------------------------------------------------------
+# GOOGLE SHEET CONNECT
+# -----------------------------------------------------------------
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -41,7 +47,9 @@ ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF
 def is_etf(symbol_name):
     return any(kw in symbol_name.upper() for kw in ETF_KEYWORDS)
 
-# 2. Read Watchlist
+# -----------------------------------------------------------------
+# WATCHLIST READ
+# -----------------------------------------------------------------
 try:
     raw_stocks = sh.worksheet("Watchlist").col_values(1)
 except Exception as e:
@@ -57,130 +65,148 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS", ""))]))
-print(f"📥 Scanning RBS Data for {len(clean_stocks)} stocks...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks for LL-LH + Vol + Breakout + Pullback...", flush=True)
 
+# -----------------------------------------------------------------
+# LINE STRUCTURE FUNCTION (Close Basis)
+# -----------------------------------------------------------------
+def find_line_structure(df, window=3):
+    close_prices = df['Close'].values
+    n = len(close_prices)
+    swing_highs = []
+    swing_lows = []
+    for i in range(window, n - window):
+        if all(close_prices[i] > close_prices[i - j] for j in range(1, window + 1)) and \
+           all(close_prices[i] > close_prices[i + j] for j in range(1, window + 1)):
+            swing_highs.append((i, close_prices[i]))
+        if all(close_prices[i] < close_prices[i - j] for j in range(1, window + 1)) and \
+           all(close_prices[i] < close_prices[i + j] for j in range(1, window + 1)):
+            swing_lows.append((i, close_prices[i]))
+
+    is_downtrend = False
+    nearest_lh_price = None
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        last_sh = swing_highs[-1][1]
+        prev_sh = swing_highs[-2][1]
+        last_sl = swing_lows[-1][1]
+        prev_sl = swing_lows[-2][1]
+        if (last_sh < prev_sh) and (last_sl < prev_sl):
+            is_downtrend = True
+            nearest_lh_price = last_sh
+    return is_downtrend, nearest_lh_price
+
+# -----------------------------------------------------------------
+# MAIN SCANNING LOOP
+# -----------------------------------------------------------------
 filtered_setups = []
 
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-
         df = yf.Ticker(symbol).history(period="70d", interval="1d")
         if df.empty or len(df) < 45:
             continue
 
         df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
-        df['Spread'] = df['High'] - df['Low']
-        df['Spread_SMA20'] = df['Spread'].rolling(window=20).mean()
-
         last_close = float(df['Close'].iloc[-1])
         last_high = float(df['High'].iloc[-1])
         last_low = float(df['Low'].iloc[-1])
         last_open = float(df['Open'].iloc[-1])
         last_vol = float(df['Volume'].iloc[-1])
-
         avg_vol = float(df['Vol_SMA20'].iloc[-1])
-        avg_spread = float(df['Spread_SMA20'].iloc[-1])
 
-        if math.isnan(avg_vol) or avg_vol < 30000 or math.isnan(last_close) or avg_spread <= 0:
+        if math.isnan(avg_vol) or avg_vol < 30000 or math.isnan(last_close):
             continue
 
         vol_ratio = last_vol / avg_vol
         last_spread = last_high - last_low
-        spread_ratio = last_spread / avg_spread
 
-        # -----------------------------------------------------------------
-        # STEP 1: DOWNTREND + VOLUME DRY IN FALL
-        # -----------------------------------------------------------------
-        past_window = df.iloc[-35:-6] # 35 se 6 din pehle tak
-
-        first_half_high = past_window['High'].iloc[:15].max()
-        second_half_high = past_window['High'].iloc[15:].max()
-        is_in_downtrend = second_half_high < first_half_high
-
-        # Girte time volume average se kam hona chahiye - Bechne wala kamzor
-        falling_vol_avg = past_window['Volume'].mean()
-        is_falling_vol_dry = falling_vol_avg < (avg_vol * 1.0)
-
-        # -----------------------------------------------------------------
-        # STEP 2: VOLUME BLAST + LH BREAKOUT (Last 5 days)
-        # -----------------------------------------------------------------
-        recent_window = df.iloc[-6:-1] # Kal tak ke 5 din
-        nearest_lh = float(past_window['High'].iloc[-15:].max())
-        lh_date = past_window['High'].iloc[-15:].idxmax()
-        days_since_lh = len(df) - df.index.get_loc(lh_date)
-
-        # LH bahut purana nahi hona chahiye
-        if days_since_lh > 25:
+        # 1. DOWNTREND (LL-LH) - Close Basis
+        structure_df = df.iloc[-50:-3]
+        is_downtrend, nearest_lh_price = find_line_structure(structure_df, window=3)
+        if not is_downtrend or nearest_lh_price is None:
             continue
 
-        has_volume_blast = False
-        blast_vol_ratio = 0
-        blast_close = 0
+        # 2+3. VOLUME + BREAKOUT - LOOKBACK WINDOW (Pichhle 7 din)
+        lookback_window = df.iloc[-8:-1]
 
-        for i in range(len(recent_window)):
-            row = recent_window.iloc[i]
-            c_vol_sma = float(row['Vol_SMA20'])
-            if math.isnan(c_vol_sma) or c_vol_sma == 0:
+        has_big_volume = False
+        has_breakout = False
+        has_both_same_day = False
+
+        for i in range(len(lookback_window)):
+            row = lookback_window.iloc[i]
+            vol_sma = float(row['Vol_SMA20']) if not math.isnan(row['Vol_SMA20']) else 0
+            if vol_sma == 0:
                 continue
-            c_vol_ratio = float(row['Volume']) / c_vol_sma
 
-            if c_vol_ratio >= 1.6 and float(row['High']) >= (nearest_lh * 0.998) and float(row['Close']) > float(row['Open']):
-                has_volume_blast = True
-                blast_vol_ratio = c_vol_ratio
-                blast_close = float(row['Close'])
-                break
+            c_vol_ratio = float(row['Volume']) / vol_sma
+            c_close = float(row['Close'])
+            c_low = float(row['Low'])
+            c_high = float(row['High'])
+            c_spread = c_high - c_low
 
-        # -----------------------------------------------------------------
-        # STEP 3: DRY VOLUME RETEST ON LH (Aaj ka din)
-        # -----------------------------------------------------------------
-        is_valid_retest = False
+            has_wick = (c_close - c_low) >= (0.35 * c_spread) if c_spread > 0 else False
 
-        if has_volume_blast:
-            # 1. Price LH Support ke paas aaya?
-            is_touching_support = (last_low <= nearest_lh * 1.02) and (last_close >= nearest_lh * 0.97) and (last_close <= blast_close * 1.03)
+            # Stopping Volume Check (1.6x + Lower Rejection Wick)
+            if c_vol_ratio >= 1.6 and has_wick:
+                has_big_volume = True
 
-            # 2. VOLUME DRY-UP FILTER - Tera Sawal
-            # Blast aur Aaj ke beech wale din + Aaj ka volume low hona chahiye
-            vol_last_3_days = df['Volume'].iloc[-4:-1].mean() # Blast ke baad se ab tak
-            is_vol_dry_before = vol_last_3_days < (avg_vol * 0.95)
-            is_low_vol_today = vol_ratio <= 1.1 # Aaj retest pe volume high nahi hona chahiye
+            # LH Breakout Check (Close Basis)
+            if c_close >= nearest_lh_price * 0.998:
+                has_breakout = True
 
-            # 3. Rejection Wick
-            has_rejection_wick = (last_close - last_low) >= (0.35 * last_spread)
-            is_green_or_doji = last_close >= last_open * 0.998
+            # Dono Ek Hi Din Me (Strongest Trigger)
+            if c_vol_ratio >= 1.6 and c_close >= nearest_lh_price * 0.998:
+                has_both_same_day = True
 
-            is_valid_retest = is_touching_support and is_vol_dry_before and is_low_vol_today and has_rejection_wick and is_green_or_doji
+        # FIXED LOGIC: Must satisfy either Same-Day OR Both Volume & Breakout in Lookback Window
+        if not (has_both_same_day or (has_big_volume and has_breakout)):
+            continue
 
-        # -----------------------------------------------------------------
-        # FINAL SAVE
-        # -----------------------------------------------------------------
-        if is_in_downtrend and is_falling_vol_dry and has_volume_blast and is_valid_retest:
-            trigger_high = round(nearest_lh, 2)
-            stop_loss = round(float(df['Low'].iloc[-4:].min() * 0.98), 2)
-            vol_status = f"Blast:{round(blast_vol_ratio,1)}x -> Retest:{round(vol_ratio,1)}x Dry"
+        # 4. PULLBACK / RETEST - Low Volume Pullback on Broken LH
+        is_near_support = (last_low <= nearest_lh_price * 1.02) and (last_close >= nearest_lh_price * 0.97)
+        is_low_vol = vol_ratio <= 1.15
+        has_rejection = (last_close - last_low) >= (0.35 * last_spread) if last_spread > 0 else False
+        is_green = last_close > last_open
 
-            probability_tag = "RBS LH RETEST + DRY VOL"
+        is_valid_retest = is_near_support and is_low_vol and (has_rejection or is_green)
+
+        if is_valid_retest:
+            if has_both_same_day:
+                tag = "STRONG SAME-DAY VOL+BREAKOUT"
+            else:
+                tag = "FLEXI VOL+BREAKOUT RETEST"
+
+            stop_loss = round(float(df['Low'].iloc[-6:].min() * 0.98), 2)
 
             filtered_setups.append([
-                stock_clean, probability_tag, trigger_high, round(last_close, 2),
-                stop_loss, vol_status, int(avg_vol), now.strftime('%d-%b-%Y')
+                stock_clean,
+                tag,
+                round(nearest_lh_price, 2),
+                round(last_close, 2),
+                stop_loss,
+                f"{round(vol_ratio, 1)}x Dry",
+                int(avg_vol),
+                now.strftime('%d-%b-%Y')
             ])
 
     except Exception:
         continue
 
-# 3. Update Google Sheet
+# -----------------------------------------------------------------
+# UPDATE GOOGLE SHEET
+# -----------------------------------------------------------------
 ws_ready = get_or_create_worksheet("Ready_For_Today")
 ws_ready.clear()
 ws_ready.append_row([
-    "Stock", "Probability_Tag", "LH_Support", "Last_Close",
-    "StopLoss", "Volume_Status", "Vol_SMA20", "Scan_Date"
+    "Stock", "Tag", "LH_Support", "Last_Close", "StopLoss", "Vol_Status", "Vol_SMA20", "Date"
 ])
 
 if filtered_setups:
     ws_ready.append_rows(sanitize_rows(filtered_setups))
-    print(f"🎯 SUCCESS! Saved {len(filtered_setups)} RBS setups in 'Ready_For_Today'!")
+    print(f"🎯 SUCCESS! Saved {len(filtered_setups)} setups in Google Sheet!")
 else:
-    ws_ready.append_row(["NO RBS SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
-    print("ℹ️ No stocks matched RBS + Dry Vol criteria today.")
+    ws_ready.append_row(["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
+    print("ℹ️ No setups matched criteria today.")
+    
