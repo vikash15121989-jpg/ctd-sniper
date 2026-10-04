@@ -1,11 +1,11 @@
-Name: CTD Sniper Scanner Engine
+name: CTD Sniper Scanner Engine
 
 on:
   schedule:
-    # Roz Raat 8:00 PM IST ko Auto Run Hoga (UTC: 2:30 PM / 14:30)
+    # Roz Raat 8:00 PM IST ko Auto Run (UTC: 2:30 PM / 14:30)
     - cron: '30 14 * * 1-5'
   
-  # Manual Run Button Ke Liye (Jab Aapka Man Kare Tab Run Karein)
+  # Manual Run Button Ke Liye
   workflow_dispatch:
 
 jobs:
