@@ -8,12 +8,12 @@ import numpy as np
 import yfinance as yf
 
 # -----------------------------------------------------------------
-# TIME SETUP
+# TIME SETUP (IST)
 # -----------------------------------------------------------------
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
 
-print(f"=== [FINAL FLEXIBLE] VPA RBS SCANNER | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [VPA PRO] LINE-STRUCTURE + EFFORT-VS-RESULT SCANNER | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -65,34 +65,40 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS", ""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks for LL-LH + Vol + Breakout + Pullback...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks for VPA RBS Setups...", flush=True)
 
 # -----------------------------------------------------------------
-# LINE STRUCTURE FUNCTION (Close Basis)
+# LINE STRUCTURE FUNCTION (Close Basis - Window=3)
 # -----------------------------------------------------------------
 def find_line_structure(df, window=3):
     close_prices = df['Close'].values
     n = len(close_prices)
     swing_highs = []
     swing_lows = []
+    
     for i in range(window, n - window):
         if all(close_prices[i] > close_prices[i - j] for j in range(1, window + 1)) and \
            all(close_prices[i] > close_prices[i + j] for j in range(1, window + 1)):
             swing_highs.append((i, close_prices[i]))
+            
         if all(close_prices[i] < close_prices[i - j] for j in range(1, window + 1)) and \
            all(close_prices[i] < close_prices[i + j] for j in range(1, window + 1)):
             swing_lows.append((i, close_prices[i]))
 
     is_downtrend = False
     nearest_lh_price = None
+    
     if len(swing_highs) >= 2 and len(swing_lows) >= 2:
         last_sh = swing_highs[-1][1]
         prev_sh = swing_highs[-2][1]
         last_sl = swing_lows[-1][1]
         prev_sl = swing_lows[-2][1]
+        
+        # Check Lower High & Lower Low Structure
         if (last_sh < prev_sh) and (last_sl < prev_sl):
             is_downtrend = True
             nearest_lh_price = last_sh
+            
     return is_downtrend, nearest_lh_price
 
 # -----------------------------------------------------------------
@@ -107,37 +113,42 @@ for symbol in clean_stocks:
         if df.empty or len(df) < 45:
             continue
 
+        # Indicators: Vol SMA20 & Spread SMA20
         df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+        df['Spread'] = df['High'] - df['Low']
+        df['Spread_SMA20'] = df['Spread'].rolling(window=20).mean()
+
         last_close = float(df['Close'].iloc[-1])
         last_high = float(df['High'].iloc[-1])
         last_low = float(df['Low'].iloc[-1])
         last_open = float(df['Open'].iloc[-1])
         last_vol = float(df['Volume'].iloc[-1])
         avg_vol = float(df['Vol_SMA20'].iloc[-1])
+        avg_spread = float(df['Spread_SMA20'].iloc[-1])
 
-        if math.isnan(avg_vol) or avg_vol < 30000 or math.isnan(last_close):
+        if math.isnan(avg_vol) or avg_vol < 30000 or math.isnan(last_close) or math.isnan(avg_spread) or avg_spread <= 0:
             continue
 
         vol_ratio = last_vol / avg_vol
         last_spread = last_high - last_low
+        last_spread_ratio = last_spread / avg_spread
 
-        # 1. DOWNTREND (LL-LH) - Close Basis
+        # 1. DOWNTREND (LL-LH) - Close Basis Line Structure
         structure_df = df.iloc[-50:-3]
         is_downtrend, nearest_lh_price = find_line_structure(structure_df, window=3)
         if not is_downtrend or nearest_lh_price is None:
             continue
 
-        # 2+3. VOLUME + BREAKOUT - LOOKBACK WINDOW (Pichhle 7 din)
+        # 2+3. VOLUME BLAST + SPREAD EXPANSION + LH BREAKOUT (Pichhle 7 din me STRICT BINDING)
         lookback_window = df.iloc[-8:-1]
-
-        has_big_volume = False
-        has_breakout = False
-        has_both_same_day = False
+        has_valid_vol_breakout = False
 
         for i in range(len(lookback_window)):
             row = lookback_window.iloc[i]
             vol_sma = float(row['Vol_SMA20']) if not math.isnan(row['Vol_SMA20']) else 0
-            if vol_sma == 0:
+            spread_sma = float(row['Spread_SMA20']) if not math.isnan(row['Spread_SMA20']) else 0
+            
+            if vol_sma == 0 or spread_sma == 0:
                 continue
 
             c_vol_ratio = float(row['Volume']) / vol_sma
@@ -145,39 +156,36 @@ for symbol in clean_stocks:
             c_low = float(row['Low'])
             c_high = float(row['High'])
             c_spread = c_high - c_low
+            c_spread_ratio = c_spread / spread_sma
 
             has_wick = (c_close - c_low) >= (0.35 * c_spread) if c_spread > 0 else False
 
-            # Stopping Volume Check (1.6x + Lower Rejection Wick)
-            if c_vol_ratio >= 1.6 and has_wick:
-                has_big_volume = True
+            # VPA EFFORT VS RESULT CONDITIONS:
+            is_breakout = c_close >= (nearest_lh_price * 0.998)
+            is_volume_blast = c_vol_ratio >= 1.6                  # Effort (Institutional Buying)
+            is_wide_spread = c_spread_ratio >= 1.2                # Result (Price Range Expansion)
 
-            # LH Breakout Check (Close Basis)
-            if c_close >= nearest_lh_price * 0.998:
-                has_breakout = True
+            # Breakout wale din hi Volume + Wide Spread + Lower Wick Rejection hona chahiye
+            if is_breakout and is_volume_blast and is_wide_spread and has_wick:
+                has_valid_vol_breakout = True
+                break
 
-            # Dono Ek Hi Din Me (Strongest Trigger)
-            if c_vol_ratio >= 1.6 and c_close >= nearest_lh_price * 0.998:
-                has_both_same_day = True
-
-        # FIXED LOGIC: Must satisfy either Same-Day OR Both Volume & Breakout in Lookback Window
-        if not (has_both_same_day or (has_big_volume and has_breakout)):
+        if not has_valid_vol_breakout:
             continue
 
-        # 4. PULLBACK / RETEST - Low Volume Pullback on Broken LH
+        # 4. PULLBACK / RETEST - DRY VOLUME + SPREAD COMPRESSION (Aaj/Kal)
         is_near_support = (last_low <= nearest_lh_price * 1.02) and (last_close >= nearest_lh_price * 0.97)
-        is_low_vol = vol_ratio <= 1.15
+        is_low_vol = vol_ratio <= 1.15                           # Volume Shrank (Dry)
+        is_compressed_spread = last_spread_ratio <= 1.25          # Spread Shrank (No Aggressive Selling)
+        
         has_rejection = (last_close - last_low) >= (0.35 * last_spread) if last_spread > 0 else False
         is_green = last_close > last_open
 
-        is_valid_retest = is_near_support and is_low_vol and (has_rejection or is_green)
+        is_valid_retest = is_near_support and is_low_vol and is_compressed_spread and (has_rejection or is_green)
 
+        # SAVE MATCHED SETUPS
         if is_valid_retest:
-            if has_both_same_day:
-                tag = "STRONG SAME-DAY VOL+BREAKOUT"
-            else:
-                tag = "FLEXI VOL+BREAKOUT RETEST"
-
+            tag = "VPA RBS RETEST (VOL+SPREAD CONFIRMED)"
             stop_loss = round(float(df['Low'].iloc[-6:].min() * 0.98), 2)
 
             filtered_setups.append([
@@ -205,8 +213,7 @@ ws_ready.append_row([
 
 if filtered_setups:
     ws_ready.append_rows(sanitize_rows(filtered_setups))
-    print(f"🎯 SUCCESS! Saved {len(filtered_setups)} setups in Google Sheet!")
+    print(f"🎯 SUCCESS! Saved {len(filtered_setups)} high-quality VPA setups in Google Sheet!")
 else:
     ws_ready.append_row(["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
-    print("ℹ️ No setups matched criteria today.")
-    
+    print("ℹ️ No stocks matched criteria today.")
