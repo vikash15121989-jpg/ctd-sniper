@@ -6,11 +6,17 @@ import gspread
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import plotly.graph_objects as go
 
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER (COMPLETE)] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER + CHART] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+
+# Create Charts directory if it doesn't exist
+charts_dir = "charts"
+if not os.path.exists(charts_dir):
+    os.makedirs(charts_dir)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,14 +63,50 @@ print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain...", flush=True)
 
 filtered_setups = []
 
+# -------------------------------------------------------------
+# CHART GENERATION FUNCTION (Plotly Candlestick Chart)
+# -------------------------------------------------------------
+def plot_stock_chart(symbol, df, breakout_price, entry_price, stop_loss, target_1, pattern_type):
+    fig = go.Figure()
+
+    # Candlestick Chart
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name="Price"
+    ))
+
+    # Horizontal Lines for Levels
+    fig.add_hline(y=breakout_price, line_dash="dash", line_color="orange", annotation_text="Breakout/Support", annotation_position="top left")
+    fig.add_hline(y=entry_price, line_dash="solid", line_color="blue", annotation_text=f"Entry: {entry_price}", annotation_position="top right")
+    fig.add_hline(y=stop_loss, line_dash="solid", line_color="red", annotation_text=f"Stop Loss: {stop_loss}", annotation_position="bottom right")
+    fig.add_hline(y=target_1, line_dash="solid", line_color="green", annotation_text=f"Target 1: {target_1}", annotation_position="top right")
+
+    fig.update_layout(
+        title=f"{symbol} - Strategy A ({pattern_type}) Setup",
+        yaxis_title="Stock Price (INR)",
+        xaxis_title="Date",
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark"
+    )
+
+    chart_file = os.path.join(charts_dir, f"{symbol}_RBS.html")
+    fig.write_html(chart_file)
+    print(f"📊 Chart saved: {chart_file}")
+
+# -------------------------------------------------------------
+# SCANNER LOOP
+# -------------------------------------------------------------
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
         
-        # Performance/Data Fetching Optimization
         ticker_obj = yf.Ticker(symbol)
         df = ticker_obj.history(period="60d", interval="1d")
-        if df.empty or len(df) < 45: # Minimum 45 bars required for stable calculation
+        if df.empty or len(df) < 45:
             continue
 
         # Indicators Calculation
@@ -81,31 +123,27 @@ for symbol in clean_stocks:
         avg_vol = float(df['Vol_SMA20'].iloc[-1])
         avg_spread = float(df['Spread_SMA20'].iloc[-1])
 
-        # Yesterday's Candle Values (For Engulfing check)
+        # Yesterday's Candle Values
         prev_close = float(df['Close'].iloc[-2])
         prev_open = float(df['Open'].iloc[-2])
 
         # Liquidity Filters
         if math.isnan(avg_vol) or avg_vol < 40000 or last_close < 50 or math.isnan(avg_spread) or avg_spread <= 0:
             continue
-        if avg_vol * last_close < 4000000: # Minimum 40 Lakhs Daily Turnover
+        if avg_vol * last_close < 4000000:
             continue
 
         vol_ratio = last_vol / avg_vol
         total_spread = last_high - last_low
         last_spread_ratio = total_spread / avg_spread if avg_spread != 0 else 0
 
-        # -------------------------------------------------------------
-        # STEP 1: RESISTANCE IDENTIFICATION (Dynamic Indexing Safeguard)
-        # -------------------------------------------------------------
+        # STEP 1: RESISTANCE IDENTIFICATION
         total_len = len(df)
         start_idx = max(0, total_len - 45)
         end_idx = max(1, total_len - 10)
         past_resistance = float(df['High'].iloc[start_idx:end_idx].max())
 
-        # -------------------------------------------------------------
-        # STEP 2: BREAKOUT CONFIRMATION (Pichhle 10 dino me Volume se Breakout)
-        # -------------------------------------------------------------
+        # STEP 2: BREAKOUT CONFIRMATION
         recent_10_days = df.iloc[-10:-1]
         breakout_happened = False
         breakout_price = 0.0
@@ -123,14 +161,10 @@ for symbol in clean_stocks:
         if not breakout_happened:
             continue
 
-        # -------------------------------------------------------------
-        # STEP 3: RETEST ZONE CHECK (Price Support Zone ke paas ho)
-        # -------------------------------------------------------------
+        # STEP 3: RETEST ZONE CHECK
         is_at_support_zone = (last_low <= breakout_price * 1.025) and (last_close >= breakout_price * 0.975)
 
-        # -------------------------------------------------------------
-        # STEP 4: RETEST BULLISH CANDLE PATTERNS (RED/GREEN HAMMER, ENGULFING)
-        # -------------------------------------------------------------
+        # STEP 4: RETEST BULLISH CANDLE PATTERNS
         body_bottom = min(last_open, last_close)
         lower_wick = body_bottom - last_low
         is_hammer = (lower_wick >= 0.35 * total_spread) if total_spread > 0 else False
@@ -140,29 +174,26 @@ for symbol in clean_stocks:
 
         is_bullish_pattern = is_hammer or is_green or is_engulfing
 
-        # Volume Dry & Tight Compression Check
-        is_volume_dry = vol_ratio <= 1.10  # Low selling pressure
+        is_volume_dry = vol_ratio <= 1.10
         is_tight_spread = last_spread_ratio <= 1.30
 
-        # -------------------------------------------------------------
         # FINAL SETUP APPROVAL
-        # -------------------------------------------------------------
         if is_at_support_zone and is_volume_dry and is_tight_spread and is_bullish_pattern:
             
-            # Stop Loss: Support Zone ke pichhle 5-day low se 1.5% niche
             stop_loss = round(float(df['Low'].iloc[-5:].min() * 0.985), 2)
             entry_price = round(last_close, 2)
             
-            # Risk Safeguard (Entry and Stop Loss should not be equal)
             if entry_price > stop_loss:
                 risk = entry_price - stop_loss
                 target_1 = round(entry_price + (risk * 2.0), 2)
             else:
-                # Fallback if Stop Loss calculation goes out of alignment
-                stop_loss = round(entry_price * 0.97, 2) # Strict 3% Stop Loss fallback
-                target_1 = round(entry_price * 1.06, 2) # 6% Target fallback
+                stop_loss = round(entry_price * 0.97, 2)
+                target_1 = round(entry_price * 1.06, 2)
 
             pattern_type = "Hammer" if is_hammer else ("Engulfing" if is_engulfing else "Green Candle")
+
+            # Plot and Save Chart
+            plot_stock_chart(stock_clean, df, round(breakout_price, 2), entry_price, stop_loss, target_1, pattern_type)
 
             filtered_setups.append([
                 stock_clean,
@@ -177,20 +208,16 @@ for symbol in clean_stocks:
             print(f"🎯 Pattern Found: {stock_clean} | Type: RBS ({pattern_type})", flush=True)
 
     except Exception as e:
-        # Debug print can be enabled if needed for specific errors
-        # print(f"⚠️ Error in {symbol}: {str(e)}")
         continue
 
-# -------------------------------------------------------------
 # GOOGLE SHEET UPDATE
-# -------------------------------------------------------------
 ws_ready = get_or_create_worksheet("Ready_For_Today")
 ws_ready.clear()
 ws_ready.append_row(["Stock", "Pattern_Type", "Support_Level", "Entry_Price", "StopLoss", "Target_1", "Vol_Ratio", "Date"])
 
 if filtered_setups:
     ws_ready.append_rows(sanitize_rows(filtered_setups))
-    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} High-Quality Strategy A Setups Saved in Google Sheet!")
+    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} Setups Saved in Google Sheet & Charts generated!")
 else:
     ws_ready.append_row(["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
     print("\nℹ️ Aaj Strategy A ke hisaab se koi stock fit nahi hua.")
