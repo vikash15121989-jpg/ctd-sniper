@@ -7,9 +7,10 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
+# IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [NEXT-DAY ACTIONABLE VPA SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER (COMPLETE)] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -17,54 +18,61 @@ def sanitize_value(val):
             return 0.0
     return val
 
-def sanitize_rows(rows): 
+def sanitize_rows(rows):
     return [[sanitize_value(v) for v in row] for row in rows]
 
+# Google Sheets Connection
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
     sh = gc.open("CTD_Sniper")
-    print("✅ Connected to CTD_Sniper Sheet", flush=True)
+    print("✅ Google Sheets se Connect ho gaya!", flush=True)
 except Exception as e:
     print(f"❌ Connection Error: {e}")
     exit(1)
 
 def get_or_create_worksheet(title):
-    try: 
+    try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows="500", cols="12")
 
+# ETF Exclusion Filter
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
-def is_etf(s): 
+def is_etf(s):
     return any(kw in s.upper() for kw in ETF_KEYWORDS)
 
+# Load Watchlist
 raw_stocks = sh.worksheet("Watchlist").col_values(1)
 STOCKS = []
 for s in raw_stocks:
     if s and s.upper() not in ["STOCK", "SYMBOL", "NAME"]:
         clean_s = s.strip().upper()
-        if not clean_s.endswith(".NS"): 
+        if not clean_s.endswith(".NS"):
             clean_s += ".NS"
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks for Next-Day Entries...", flush=True)
+print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain...", flush=True)
 
 filtered_setups = []
 
 for symbol in clean_stocks:
     try:
-        stock_clean = symbol.replace(".NS","")
-        df = yf.Ticker(symbol).history(period="60d", interval="1d")
-        if df.empty or len(df) < 40: 
+        stock_clean = symbol.replace(".NS", "")
+        
+        # Performance/Data Fetching Optimization
+        ticker_obj = yf.Ticker(symbol)
+        df = ticker_obj.history(period="60d", interval="1d")
+        if df.empty or len(df) < 45: # Minimum 45 bars required for stable calculation
             continue
 
+        # Indicators Calculation
         df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
         df['Spread'] = df['High'] - df['Low']
         df['Spread_SMA20'] = df['Spread'].rolling(20).mean()
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
+        # Today's Candle Values
         last_close = float(df['Close'].iloc[-1])
         last_high = float(df['High'].iloc[-1])
         last_low = float(df['Low'].iloc[-1])
@@ -73,69 +81,116 @@ for symbol in clean_stocks:
         avg_vol = float(df['Vol_SMA20'].iloc[-1])
         avg_spread = float(df['Spread_SMA20'].iloc[-1])
 
-        # Basic Liquidity Filters
-        if math.isnan(avg_vol) or avg_vol < 40000 or last_close < 80 or math.isnan(avg_spread) or avg_spread <= 0: 
+        # Yesterday's Candle Values (For Engulfing check)
+        prev_close = float(df['Close'].iloc[-2])
+        prev_open = float(df['Open'].iloc[-2])
+
+        # Liquidity Filters
+        if math.isnan(avg_vol) or avg_vol < 40000 or last_close < 50 or math.isnan(avg_spread) or avg_spread <= 0:
             continue
-        if avg_vol * last_close < 5000000: # 50 Lakh daily turnover
+        if avg_vol * last_close < 4000000: # Minimum 40 Lakhs Daily Turnover
             continue
 
         vol_ratio = last_vol / avg_vol
-        last_spread = last_high - last_low
-        last_spread_ratio = last_spread / avg_spread if avg_spread != 0 else 0
+        total_spread = last_high - last_low
+        last_spread_ratio = total_spread / avg_spread if avg_spread != 0 else 0
 
-        # 1. RECENT RESISTANCE LEVEL (Last 20 Days High - Excluding Today)
-        recent_resistance = float(df['High'].iloc[-21:-1].max())
+        # -------------------------------------------------------------
+        # STEP 1: RESISTANCE IDENTIFICATION (Dynamic Indexing Safeguard)
+        # -------------------------------------------------------------
+        total_len = len(df)
+        start_idx = max(0, total_len - 45)
+        end_idx = max(1, total_len - 10)
+        past_resistance = float(df['High'].iloc[start_idx:end_idx].max())
 
-        # 2. POWER VOLUME BLAST IN RECENT 5 DAYS
-        # Dekhenge ki kya pichhle 5 dino me koi Volume Spike (>1.5x) aaya hai
-        recent_5_df = df.iloc[-6:-1]
-        has_recent_buying = False
-        for i in range(len(recent_5_df)):
-            r_vol = float(recent_5_df['Volume'].iloc[i])
-            r_vol_sma = float(recent_5_df['Vol_SMA20'].iloc[i])
-            r_close = float(recent_5_df['Close'].iloc[i])
-            r_open = float(recent_5_df['Open'].iloc[i])
-            
-            if r_vol_sma > 0 and (r_vol / r_vol_sma) >= 1.5 and r_close >= r_open:
-                has_recent_buying = True
+        # -------------------------------------------------------------
+        # STEP 2: BREAKOUT CONFIRMATION (Pichhle 10 dino me Volume se Breakout)
+        # -------------------------------------------------------------
+        recent_10_days = df.iloc[-10:-1]
+        breakout_happened = False
+        breakout_price = 0.0
+
+        for i in range(len(recent_10_days)):
+            c_close = float(recent_10_days['Close'].iloc[i])
+            c_vol = float(recent_10_days['Volume'].iloc[i])
+            c_vol_sma = float(recent_10_days['Vol_SMA20'].iloc[i])
+
+            if c_close > past_resistance and c_vol_sma > 0 and (c_vol / c_vol_sma) >= 1.3:
+                breakout_happened = True
+                breakout_price = past_resistance
                 break
 
-        if not has_recent_buying:
+        if not breakout_happened:
             continue
 
-        # 3. TODAY'S SETUP: DRY VOL & NARROW SPREAD NEAR BREAKOUT (READY TO EXPLODE)
-        is_near_breakout = (last_close >= recent_resistance * 0.98) # Resistance ke 2% me ho ya just cross kia ho
-        is_dry_volume = vol_ratio <= 1.10 # Aaj volume dry hai (Selling exhausted)
-        is_tight_range = last_spread_ratio <= 1.20 # Narrow Range Candle
-        is_above_ema20 = last_close > float(df['EMA20'].iloc[-1])
+        # -------------------------------------------------------------
+        # STEP 3: RETEST ZONE CHECK (Price Support Zone ke paas ho)
+        # -------------------------------------------------------------
+        is_at_support_zone = (last_low <= breakout_price * 1.025) and (last_close >= breakout_price * 0.975)
 
-        if is_near_breakout and is_dry_volume and is_tight_range and is_above_ema20:
+        # -------------------------------------------------------------
+        # STEP 4: RETEST BULLISH CANDLE PATTERNS (RED/GREEN HAMMER, ENGULFING)
+        # -------------------------------------------------------------
+        body_bottom = min(last_open, last_close)
+        lower_wick = body_bottom - last_low
+        is_hammer = (lower_wick >= 0.35 * total_spread) if total_spread > 0 else False
+
+        is_green = last_close > last_open
+        is_engulfing = (last_close > prev_open) and (last_open < prev_close) and is_green
+
+        is_bullish_pattern = is_hammer or is_green or is_engulfing
+
+        # Volume Dry & Tight Compression Check
+        is_volume_dry = vol_ratio <= 1.10  # Low selling pressure
+        is_tight_spread = last_spread_ratio <= 1.30
+
+        # -------------------------------------------------------------
+        # FINAL SETUP APPROVAL
+        # -------------------------------------------------------------
+        if is_at_support_zone and is_volume_dry and is_tight_spread and is_bullish_pattern:
+            
+            # Stop Loss: Support Zone ke pichhle 5-day low se 1.5% niche
             stop_loss = round(float(df['Low'].iloc[-5:].min() * 0.985), 2)
+            entry_price = round(last_close, 2)
+            
+            # Risk Safeguard (Entry and Stop Loss should not be equal)
+            if entry_price > stop_loss:
+                risk = entry_price - stop_loss
+                target_1 = round(entry_price + (risk * 2.0), 2)
+            else:
+                # Fallback if Stop Loss calculation goes out of alignment
+                stop_loss = round(entry_price * 0.97, 2) # Strict 3% Stop Loss fallback
+                target_1 = round(entry_price * 1.06, 2) # 6% Target fallback
+
+            pattern_type = "Hammer" if is_hammer else ("Engulfing" if is_engulfing else "Green Candle")
+
             filtered_setups.append([
-                stock_clean, 
-                "READY NEXT DAY", 
-                round(recent_resistance, 2), 
-                round(last_close, 2),
-                stop_loss, 
-                f"{round(vol_ratio, 1)}x Dry", 
-                int(avg_vol), 
+                stock_clean,
+                f"RBS ({pattern_type})",
+                round(breakout_price, 2),
+                entry_price,
+                stop_loss,
+                target_1,
+                f"{round(vol_ratio, 2)}x Dry",
                 now.strftime('%d-%b-%Y')
             ])
+            print(f"🎯 Pattern Found: {stock_clean} | Type: RBS ({pattern_type})", flush=True)
 
-    except Exception:
+    except Exception as e:
+        # Debug print can be enabled if needed for specific errors
+        # print(f"⚠️ Error in {symbol}: {str(e)}")
         continue
 
-# -----------------------------------------------------------------
-# UPDATE GOOGLE SHEET
-# -----------------------------------------------------------------
+# -------------------------------------------------------------
+# GOOGLE SHEET UPDATE
+# -------------------------------------------------------------
 ws_ready = get_or_create_worksheet("Ready_For_Today")
 ws_ready.clear()
-ws_ready.append_row(["Stock", "Tag", "Resistance", "Last_Close", "StopLoss", "Vol_Status", "Vol_SMA20", "Date"])
+ws_ready.append_row(["Stock", "Pattern_Type", "Support_Level", "Entry_Price", "StopLoss", "Target_1", "Vol_Ratio", "Date"])
 
 if filtered_setups:
     ws_ready.append_rows(sanitize_rows(filtered_setups))
-    print(f"🎯 SUCCESS! {len(filtered_setups)} High-Momentum Ready-to-Move Stocks Found!")
+    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} High-Quality Strategy A Setups Saved in Google Sheet!")
 else:
     ws_ready.append_row(["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
-    print("ℹ️ No instant breakout setups found today.")
-    
+    print("\nℹ️ Aaj Strategy A ke hisaab se koi stock fit nahi hua.")
