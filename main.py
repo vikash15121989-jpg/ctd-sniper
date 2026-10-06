@@ -6,17 +6,11 @@ import gspread
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import plotly.graph_objects as go
 
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER + CHART] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
-
-# Create Charts directory if it doesn't exist
-charts_dir = "charts"
-if not os.path.exists(charts_dir):
-    os.makedirs(charts_dir)
+print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER + HYPERLINK] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -63,43 +57,6 @@ print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain...", flush=True)
 
 filtered_setups = []
 
-# -------------------------------------------------------------
-# CHART GENERATION FUNCTION (Plotly Candlestick Chart)
-# -------------------------------------------------------------
-def plot_stock_chart(symbol, df, breakout_price, entry_price, stop_loss, target_1, pattern_type):
-    fig = go.Figure()
-
-    # Candlestick Chart
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        name="Price"
-    ))
-
-    # Horizontal Lines for Levels
-    fig.add_hline(y=breakout_price, line_dash="dash", line_color="orange", annotation_text="Breakout/Support", annotation_position="top left")
-    fig.add_hline(y=entry_price, line_dash="solid", line_color="blue", annotation_text=f"Entry: {entry_price}", annotation_position="top right")
-    fig.add_hline(y=stop_loss, line_dash="solid", line_color="red", annotation_text=f"Stop Loss: {stop_loss}", annotation_position="bottom right")
-    fig.add_hline(y=target_1, line_dash="solid", line_color="green", annotation_text=f"Target 1: {target_1}", annotation_position="top right")
-
-    fig.update_layout(
-        title=f"{symbol} - Strategy A ({pattern_type}) Setup",
-        yaxis_title="Stock Price (INR)",
-        xaxis_title="Date",
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark"
-    )
-
-    chart_file = os.path.join(charts_dir, f"{symbol}_RBS.html")
-    fig.write_html(chart_file)
-    print(f"📊 Chart saved: {chart_file}")
-
-# -------------------------------------------------------------
-# SCANNER LOOP
-# -------------------------------------------------------------
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
@@ -191,9 +148,10 @@ for symbol in clean_stocks:
                 target_1 = round(entry_price * 1.06, 2)
 
             pattern_type = "Hammer" if is_hammer else ("Engulfing" if is_engulfing else "Green Candle")
-
-            # Plot and Save Chart
-            plot_stock_chart(stock_clean, df, round(breakout_price, 2), entry_price, stop_loss, target_1, pattern_type)
+            
+            # TradingView Clickable Link Formula
+            tv_url = f"https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}"
+            chart_formula = f'=HYPERLINK("{tv_url}", "View Chart")'
 
             filtered_setups.append([
                 stock_clean,
@@ -203,7 +161,8 @@ for symbol in clean_stocks:
                 stop_loss,
                 target_1,
                 f"{round(vol_ratio, 2)}x Dry",
-                now.strftime('%d-%b-%Y')
+                now.strftime('%d-%b-%Y'),
+                chart_formula
             ])
             print(f"🎯 Pattern Found: {stock_clean} | Type: RBS ({pattern_type})", flush=True)
 
@@ -213,11 +172,23 @@ for symbol in clean_stocks:
 # GOOGLE SHEET UPDATE
 ws_ready = get_or_create_worksheet("Ready_For_Today")
 ws_ready.clear()
-ws_ready.append_row(["Stock", "Pattern_Type", "Support_Level", "Entry_Price", "StopLoss", "Target_1", "Vol_Ratio", "Date"])
+
+# Column Headers (I Header is 'Chart')
+ws_ready.append_row(
+    ["Stock", "Pattern_Type", "Support_Level", "Entry_Price", "StopLoss", "Target_1", "Vol_Ratio", "Date", "Chart"],
+    value_input_option="USER_ENTERED"
+)
 
 if filtered_setups:
-    ws_ready.append_rows(sanitize_rows(filtered_setups))
-    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} Setups Saved in Google Sheet & Charts generated!")
+    ws_ready.append_rows(
+        sanitize_rows(filtered_setups),
+        value_input_option="USER_ENTERED"
+    )
+    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} Setups Saved with Clickable Chart Links!")
 else:
-    ws_ready.append_row(["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y')])
+    ws_ready.append_row(
+        ["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y'), "-"],
+        value_input_option="USER_ENTERED"
+    )
     print("\nℹ️ Aaj Strategy A ke hisaab se koi stock fit nahi hua.")
+    
