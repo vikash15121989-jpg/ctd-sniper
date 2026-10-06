@@ -19,9 +19,8 @@ jobs:
           python-version: '3.10'
       - name: Install dependencies
         run: |
-          pip install pandas yfinance gspread numpy
+          pip install pandas yfinance gspread numpy plotly
       - name: Run Python Scanner
         env:
           GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
         run: python main.py
-        
