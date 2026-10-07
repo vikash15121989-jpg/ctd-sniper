@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [STRATEGY A: BREAKOUT + RETEST SCANNER + HYPERLINK] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [WEEKLY REVERSAL PATTERNS BACKTEST SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -35,14 +35,14 @@ def get_or_create_worksheet(title):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows="500", cols="12")
+        return sh.add_worksheet(title=title, rows="1000", cols="10")
 
 # ETF Exclusion Filter
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 def is_etf(s):
     return any(kw in s.upper() for kw in ETF_KEYWORDS)
 
-# Load Watchlist
+# Load Watchlist from Google Sheet
 raw_stocks = sh.worksheet("Watchlist").col_values(1)
 STOCKS = []
 for s in raw_stocks:
@@ -53,142 +53,118 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain...", flush=True)
+print(f"📥 Total {len(clean_stocks)} stocks par 2-Year Weekly Backtest chalu ho raha hai...\n", flush=True)
 
-filtered_setups = []
+backtest_results = []
 
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-        
         ticker_obj = yf.Ticker(symbol)
-        df = ticker_obj.history(period="60d", interval="1d")
-        if df.empty or len(df) < 45:
+        
+        # 2 Years of Weekly Data
+        df = ticker_obj.history(period="2y", interval="1wk")
+        if df.empty or len(df) < 52:
             continue
 
-        # Indicators Calculation
-        df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
-        df['Spread'] = df['High'] - df['Low']
-        df['Spread_SMA20'] = df['Spread'].rolling(20).mean()
-
-        # Today's Candle Values
-        last_close = float(df['Close'].iloc[-1])
-        last_high = float(df['High'].iloc[-1])
-        last_low = float(df['Low'].iloc[-1])
-        last_open = float(df['Open'].iloc[-1])
-        last_vol = float(df['Volume'].iloc[-1])
-        avg_vol = float(df['Vol_SMA20'].iloc[-1])
-        avg_spread = float(df['Spread_SMA20'].iloc[-1])
-
-        # Yesterday's Candle Values
-        prev_close = float(df['Close'].iloc[-2])
-        prev_open = float(df['Open'].iloc[-2])
-
-        # Liquidity Filters
-        if math.isnan(avg_vol) or avg_vol < 40000 or last_close < 50 or math.isnan(avg_spread) or avg_spread <= 0:
-            continue
-        if avg_vol * last_close < 4000000:
-            continue
-
-        vol_ratio = last_vol / avg_vol
-        total_spread = last_high - last_low
-        last_spread_ratio = total_spread / avg_spread if avg_spread != 0 else 0
-
-        # STEP 1: RESISTANCE IDENTIFICATION
-        total_len = len(df)
-        start_idx = max(0, total_len - 45)
-        end_idx = max(1, total_len - 10)
-        past_resistance = float(df['High'].iloc[start_idx:end_idx].max())
-
-        # STEP 2: BREAKOUT CONFIRMATION
-        recent_10_days = df.iloc[-10:-1]
-        breakout_happened = False
-        breakout_price = 0.0
-
-        for i in range(len(recent_10_days)):
-            c_close = float(recent_10_days['Close'].iloc[i])
-            c_vol = float(recent_10_days['Volume'].iloc[i])
-            c_vol_sma = float(recent_10_days['Vol_SMA20'].iloc[i])
-
-            if c_close > past_resistance and c_vol_sma > 0 and (c_vol / c_vol_sma) >= 1.3:
-                breakout_happened = True
-                breakout_price = past_resistance
-                break
-
-        if not breakout_happened:
-            continue
-
-        # STEP 3: RETEST ZONE CHECK
-        is_at_support_zone = (last_low <= breakout_price * 1.025) and (last_close >= breakout_price * 0.975)
-
-        # STEP 4: RETEST BULLISH CANDLE PATTERNS
-        body_bottom = min(last_open, last_close)
-        lower_wick = body_bottom - last_low
-        is_hammer = (lower_wick >= 0.35 * total_spread) if total_spread > 0 else False
-
-        is_green = last_close > last_open
-        is_engulfing = (last_close > prev_open) and (last_open < prev_close) and is_green
-
-        is_bullish_pattern = is_hammer or is_green or is_engulfing
-
-        is_volume_dry = vol_ratio <= 1.10
-        is_tight_spread = last_spread_ratio <= 1.30
-
-        # FINAL SETUP APPROVAL
-        if is_at_support_zone and is_volume_dry and is_tight_spread and is_bullish_pattern:
+        for i in range(15, len(df) - 8):
+            prev_week = df.iloc[i-1]   # Week 1 (Bearish Candle)
+            curr_week = df.iloc[i]     # Week 2 (Bullish Reversal Candle)
             
-            stop_loss = round(float(df['Low'].iloc[-5:].min() * 0.985), 2)
-            entry_price = round(last_close, 2)
+            # 1. Prior Downtrend Check (Min 8% Correction from 10-week High)
+            swing_high = df['High'].iloc[max(0, i-10):i-1].max()
+            if prev_week['Close'] >= swing_high * 0.92:
+                continue
+
+            # 2. Week 1 Attributes (Red Weekly Candle)
+            w1_open, w1_close = float(prev_week['Open']), float(prev_week['Close'])
+            w1_body = w1_open - w1_close
+            if w1_close >= w1_open or w1_body <= 0:
+                continue
+
+            # 3. Week 2 Attributes (Green Weekly Candle + Gap Down / Lower Open)
+            w2_open, w2_close = float(curr_week['Open']), float(curr_week['Close'])
+            w2_low = float(curr_week['Low'])
             
-            if entry_price > stop_loss:
+            if w2_close <= w2_open or w2_open > w1_close * 1.005:
+                continue
+
+            pattern_found = None
+            close_diff_pct = abs(w2_close - w1_close) / w1_close
+            w1_midpoint = w1_close + (w1_body * 0.50)
+
+            # Pattern Conditions
+            if close_diff_pct <= 0.007:
+                pattern_found = "Weekly Counterattack Line"
+            elif w1_midpoint <= w2_close < w1_open:
+                pattern_found = "Weekly Piercing Line"
+
+            if pattern_found:
+                entry_price = round(w2_close, 2)
+                stop_loss = round(w2_low * 0.985, 2)
                 risk = entry_price - stop_loss
-                target_1 = round(entry_price + (risk * 2.0), 2)
-            else:
-                stop_loss = round(entry_price * 0.97, 2)
-                target_1 = round(entry_price * 1.06, 2)
+                if risk <= 0:
+                    continue
 
-            pattern_type = "Hammer" if is_hammer else ("Engulfing" if is_engulfing else "Green Candle")
-            
-            # TradingView Clickable Link Formula
-            tv_url = f"https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}"
-            chart_formula = f'=HYPERLINK("{tv_url}", "View Chart")'
+                target_1 = round(entry_price + (risk * 2.0), 2)  # 1:2 R:R
 
-            filtered_setups.append([
-                stock_clean,
-                f"RBS ({pattern_type})",
-                round(breakout_price, 2),
-                entry_price,
-                stop_loss,
-                target_1,
-                f"{round(vol_ratio, 2)}x Dry",
-                now.strftime('%d-%b-%Y'),
-                chart_formula
-            ])
-            print(f"🎯 Pattern Found: {stock_clean} | Type: RBS ({pattern_type})", flush=True)
+                # Forward Simulation over next 8 weeks
+                future_weeks = df.iloc[i+1:i+9]
+                hit_target = False
+                hit_sl = False
+
+                for _, f_week in future_weeks.iterrows():
+                    if f_week['Low'] <= stop_loss:
+                        hit_sl = True
+                        break
+                    if f_week['High'] >= target_1:
+                        hit_target = True
+                        break
+
+                outcome = "Target 1:2 Hit 🎯" if hit_target else ("Stop Loss Hit ❌" if hit_sl else "No Result")
+
+                tv_url = f"https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}"
+                chart_formula = f'=HYPERLINK("{tv_url}", "View Chart")'
+
+                date_str = df.index[i].strftime('%d-%b-%Y')
+
+                backtest_results.append([
+                    stock_clean,
+                    pattern_found,
+                    entry_price,
+                    stop_loss,
+                    target_1,
+                    outcome,
+                    date_str,
+                    chart_formula
+                ])
+                print(f"📌 Found Trade: {stock_clean} | {pattern_found} | Date: {date_str} | Result: {outcome}", flush=True)
 
     except Exception as e:
         continue
 
+# -------------------------------------------------------------
 # GOOGLE SHEET UPDATE
-ws_ready = get_or_create_worksheet("Ready_For_Today")
-ws_ready.clear()
+# -------------------------------------------------------------
+ws_backtest = get_or_create_worksheet("Weekly_Backtest")
+ws_backtest.clear()
 
-# Column Headers (I Header is 'Chart')
-ws_ready.append_row(
-    ["Stock", "Pattern_Type", "Support_Level", "Entry_Price", "StopLoss", "Target_1", "Vol_Ratio", "Date", "Chart"],
+# Column Headers
+ws_backtest.append_row(
+    ["Stock", "Pattern_Type", "Entry_Price", "StopLoss", "Target_1:2", "Outcome", "Trigger_Date", "Chart"],
     value_input_option="USER_ENTERED"
 )
 
-if filtered_setups:
-    ws_ready.append_rows(
-        sanitize_rows(filtered_setups),
+if backtest_results:
+    ws_backtest.append_rows(
+        sanitize_rows(backtest_results),
         value_input_option="USER_ENTERED"
     )
-    print(f"\n🎯 SUCCESS! Total {len(filtered_setups)} Setups Saved with Clickable Chart Links!")
+    print(f"\n🎯 SUCCESS! Total {len(backtest_results)} Backtest Trades Exported to Google Sheet ('Weekly_Backtest')!")
 else:
-    ws_ready.append_row(
-        ["NO SETUPS TODAY", "-", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y'), "-"],
+    ws_backtest.append_row(
+        ["NO PATTERNS FOUND IN BACKTEST", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y'), "-"],
         value_input_option="USER_ENTERED"
     )
-    print("\nℹ️ Aaj Strategy A ke hisaab se koi stock fit nahi hua.")
+    print("\nℹ️ Backtest period me koi pattern match nahi hua.")
     
