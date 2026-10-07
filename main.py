@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [HIGH-LIQUIDITY WEEKLY BACKTEST SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [HIGH-CONVICTION WEEKLY REVERSAL BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -21,7 +21,9 @@ def sanitize_value(val):
 def sanitize_rows(rows):
     return [[sanitize_value(v) for v in row] for row in rows]
 
-# Google Sheets Connection
+# -------------------------------------------------------------
+# GOOGLE SHEETS CONNECTION & AUTO-SHEET CREATION
+# -------------------------------------------------------------
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -31,25 +33,21 @@ except Exception as e:
     print(f"❌ Connection Error: {e}")
     exit(1)
 
-# -------------------------------------------------------------
-# AUTO-SHEET CREATION LOGIC (Worksheet na ho toh khud bana le)
-# -------------------------------------------------------------
 def get_or_create_worksheet(title):
     try:
         ws = sh.worksheet(title)
-        print(f"ℹ️ Found existing sheet: '{title}'", flush=True)
+        print(f"ℹ️ Sheet '{title}' mil gayi hai.", flush=True)
         return ws
     except gspread.exceptions.WorksheetNotFound:
-        print(f"⚠️ Sheet '{title}' nahi mili. Automatic nayi sheet banayi ja rahi hai...", flush=True)
-        ws = sh.add_worksheet(title=title, rows="5000", cols="10")
-        return ws
+        print(f"⚠️ Sheet '{title}' nahi mili. Nayi sheet auto-create ki ja rahi hai...", flush=True)
+        return sh.add_worksheet(title=title, rows="5000", cols="10")
 
 # ETF Exclusion Filter
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 def is_etf(s):
     return any(kw in s.upper() for kw in ETF_KEYWORDS)
 
-# 1. Load Watchlist from Google Sheet
+# 1. READ WATCHLIST FROM GOOGLE SHEET
 raw_stocks = sh.worksheet("Watchlist").col_values(1)
 STOCKS = []
 for s in raw_stocks:
@@ -60,7 +58,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain...", flush=True)
+print(f"📥 Total {len(clean_stocks)} stocks scan ho rahe hain (>25% Fall Filter)...", flush=True)
 
 backtest_results = []
 
@@ -83,27 +81,25 @@ for symbol in clean_stocks:
             w2_turnover = w2_vol * w2_close
 
             # -------------------------------------------------------------
-            # STRICT LIQUIDITY FILTERS:
-            # 1. Weekly Volume >= 50 Lakh (5,000,000)
-            # 2. Weekly Turnover >= ₹15 Crore (150,000,000)
+            # FILTER 1: LIQUIDITY (Min 50 Lakh Vol AND Min ₹15 Cr Turnover)
             # -------------------------------------------------------------
             if w2_vol < 5000000 or w2_turnover < 150000000:
                 continue
 
             # -------------------------------------------------------------
-            # DOWNTREND CHECK: Minimum 15% Fall from 12-week high
+            # FILTER 2: DEEP DOWNTREND (Min 25% Fall from 12-week high)
             # -------------------------------------------------------------
             swing_high = df['High'].iloc[max(0, i-12):i-1].max()
-            if prev_week['Close'] >= swing_high * 0.85:
+            if prev_week['Close'] >= swing_high * 0.75:  # 25% Drop
                 continue
 
-            # Week 1 Attributes
+            # Week 1 Attributes (Red Candle)
             w1_open, w1_close = float(prev_week['Open']), float(prev_week['Close'])
             w1_body = w1_open - w1_close
             if w1_close >= w1_open or w1_body <= 0:
                 continue
 
-            # Week 2 Attributes
+            # Week 2 Attributes (Green Candle)
             w2_open = float(curr_week['Open'])
             w2_low = float(curr_week['Low'])
             
@@ -152,7 +148,7 @@ for symbol in clean_stocks:
                     stock_clean, pattern_found, entry_price, stop_loss,
                     target_1, outcome, date_str, chart_formula
                 ])
-                print(f"📌 High-Liquid Pattern Found: {stock_clean} | {pattern_found} | Result: {outcome}", flush=True)
+                print(f"🎯 High-Conviction Match: {stock_clean} | {pattern_found} | Result: {outcome}", flush=True)
 
     except Exception as e:
         continue
@@ -163,6 +159,7 @@ for symbol in clean_stocks:
 ws_backtest = get_or_create_worksheet("Weekly_Backtest")
 ws_backtest.clear()
 
+# Headers
 ws_backtest.append_row(
     ["Stock", "Pattern_Type", "Entry_Price", "StopLoss", "Target_1:2", "Outcome", "Trigger_Date", "Chart"],
     value_input_option="USER_ENTERED"
@@ -170,7 +167,7 @@ ws_backtest.append_row(
 
 if backtest_results:
     ws_backtest.append_rows(sanitize_rows(backtest_results), value_input_option="USER_ENTERED")
-    print(f"\n🎯 SUCCESS! Total {len(backtest_results)} High-Liquidity Backtest Trades Exported to 'Weekly_Backtest'!")
+    print(f"\n🎯 SUCCESS! Total {len(backtest_results)} Deep Downtrend (>25%) Trades Exported to 'Weekly_Backtest'!")
 else:
     ws_backtest.append_row(["NO PATTERNS FOUND IN BACKTEST", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y'), "-"], value_input_option="USER_ENTERED")
     print("\nℹ️ Criteria match karne wale koi setups nahi mile.")
