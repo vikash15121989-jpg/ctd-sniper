@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [WEEKLY VOLUME BREAKOUT: 6% TARGET & WEEK LOW SL BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [MULTI-TIMEFRAME: MONTHLY + WEEKLY STRATEGY BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -52,7 +52,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks on Weekly Timeframe (6% Target & Week Low SL)...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks with Multi-Layer (Monthly + Weekly) Filter...", flush=True)
 
 all_summary_rows = []
 all_trade_details = []
@@ -61,13 +61,22 @@ for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
         data = yf.Ticker(symbol).history(period="max", interval="1d")
-        if data.empty or len(data) < 250:
+        if data.empty or len(data) < 500:
             continue
         
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        # Resample to Weekly Candles (W-FRI)
+        # 1. Resample to Monthly
+        monthly = data.resample('ME').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+
+        # 2. Resample to Weekly
         weekly = data.resample('W-FRI').agg({
             'Open': 'first',
             'High': 'max',
@@ -76,35 +85,57 @@ for symbol in clean_stocks:
             'Volume': 'sum'
         }).dropna()
 
+        if len(monthly) < 6 or len(weekly) < 10:
+            continue
+
         trades = []
 
-        for i in range(4, len(weekly) - 1):
-            prev_week = weekly.iloc[i-1]    
-            setup_week = weekly.iloc[i]     
+        # Loop through weekly candles to check weekly setup, and verify monthly context
+        for j in range(4, len(weekly) - 1):
+            prev_w = weekly.iloc[j-1]
+            setup_w = weekly.iloc[j]
             
-            # Liquidity Filter (Weekly level)
-            setup_vol = float(setup_week['Volume'])
-            setup_close = float(setup_week['Close'])
-            setup_turnover = setup_vol * setup_close
-            
-            if setup_vol < 200000 or setup_turnover < 20000000:
+            # Liquidity Filter on Weekly candle
+            w_vol = float(setup_w['Volume'])
+            w_close = float(setup_w['Close'])
+            if w_vol < 200000 or (w_vol * w_close) < 20000000:
                 continue
 
-            cond_close_above_high = setup_close > prev_week['High']
-            prev_4_vols = weekly['Volume'].iloc[i-4:i]
-            cond_volume_surge = setup_vol > prev_4_vols.max()
+            # Weekly Conditions
+            w_cond_close = w_close > prev_w['High']
+            w_prev_vols = weekly['Volume'].iloc[j-4:j]
+            w_cond_vol = w_vol > w_prev_vols.max()
+
+            if not (w_cond_close and w_cond_vol):
+                continue
+
+            # Find corresponding Monthly candle for this week date
+            setup_w_date = weekly.index[j]
+            matching_months = monthly[monthly.index <= setup_w_date]
+            if len(matching_months) < 5:
+                continue
             
-            if cond_close_above_high and cond_volume_surge:
-                entry_level = setup_week['High']
-                initial_sl = setup_week['Low']  # Week Low Stop Loss
-                setup_date = weekly.index[i].strftime('%Y-%m-%d')
+            # Get the monthly index for this period
+            m_idx = len(matching_months) - 1
+            prev_m = monthly.iloc[m_idx - 1]
+            setup_m = monthly.iloc[m_idx]
+
+            # Monthly Filter Conditions (Layer 1)
+            m_cond_close = setup_m['Close'] > prev_m['High']
+            m_prev_vols = monthly['Volume'].iloc[m_idx-4:m_idx] if m_idx >= 4 else monthly['Volume'].iloc[0:m_idx]
+            m_cond_vol = setup_m['Volume'] > m_prev_vols.max() if len(m_prev_vols) > 0 else True
+
+            # BOTH LAYERS MUST MATCH
+            if m_cond_close and m_cond_vol:
+                entry_level = setup_w['High']
+                initial_sl = setup_w['Low']
+                setup_date = setup_w_date.strftime('%Y-%m-%d')
                 
-                trade_week_start = weekly.index[i] + timedelta(days=1)
-                trade_week_end = weekly.index[i+1] + timedelta(days=5)
-                
+                trade_week_start = weekly.index[j] + timedelta(days=1)
+                trade_week_end = weekly.index[j+1] + timedelta(days=5)
                 trade_start_str = trade_week_start.strftime('%Y-%m-%d')
                 trade_end_str = trade_week_end.strftime('%Y-%m-%d')
-                trade_date = weekly.index[i+1].strftime('%Y-%m-%d')
+                trade_date = weekly.index[j+1].strftime('%Y-%m-%d')
                 
                 daily_trade_df = data.loc[trade_start_str:trade_end_str]
                 if daily_trade_df.empty:
@@ -125,7 +156,6 @@ for symbol in clean_stocks:
                     if not triggered:
                         if d_high >= entry_level:
                             triggered = True
-                            # Check Target or SL on trigger day
                             if d_high >= target_price:
                                 exit_price = target_price
                                 status = '6% Target Hit'
@@ -137,13 +167,11 @@ for symbol in clean_stocks:
                                 pnl_pct = ((current_sl - entry_price) / entry_price) * 100
                                 break
                     else:
-                        # Check Target First
                         if d_high >= target_price:
                             exit_price = target_price
                             status = '6% Target Hit'
                             pnl_pct = 6.0
                             break
-                        # Check Week Low SL
                         elif d_low <= current_sl:
                             exit_price = current_sl
                             status = 'Stoploss Hit'
@@ -208,29 +236,29 @@ if all_trade_details:
     target_hit_pct = (target_hit_count / overall_total_trades) * 100 if overall_total_trades > 0 else 0
     loss_pct = (overall_losses / overall_total_trades) * 100 if overall_total_trades > 0 else 0
 
-    ws_overall = get_or_create_worksheet("Weekly_Overall_Summary")
+    ws_overall = get_or_create_worksheet("MultiLayer_Overall_Summary")
     ws_overall.clear()
     
     overall_data = [
         ["METRIC", "VALUE"],
         ["Total Stocks Scanned", len(clean_stocks)],
-        ["Total Trades Generated (Weekly)", overall_total_trades],
+        ["Total Trades Generated (Multi-Layer)", overall_total_trades],
         ["Trades Hit 6% Target", f"{target_hit_count} ({target_hit_pct:.2f}%)"],
-        ["Trades Hit Week Low SL", f"{overall_losses} ({loss_pct:.2f}%)"],
+        ["Trades Hit Stop Loss", f"{overall_losses} ({loss_pct:.2f}%)"],
         ["OVERALL WIN RATE (%)", f"{overall_win_rate:.2f}%"],
         ["Total Cumulative Return (%)", f"{df_all_trades['PnL_%'].sum():.2f}%"]
     ]
     ws_overall.append_rows(overall_data, value_input_option="USER_ENTERED")
-    print("🏆 Weekly Metrics (6% Target & Week Low SL) Exported Successfully!")
+    print("🏆 Multi-Layer (Monthly + Weekly) Metrics Exported Successfully!")
 
 # 3. EXPORT INDIVIDUAL & TRADE LOGS
-ws_summary = get_or_create_worksheet("Weekly_Strategy_Summary")
+ws_summary = get_or_create_worksheet("MultiLayer_Strategy_Summary")
 ws_summary.clear()
 ws_summary.append_row(["Stock", "Total_Trades", "Winning_Trades", "Losing_Trades", "Win_Rate_%", "Avg_PnL_%", "Total_Cumulative_PnL_%"], value_input_option="USER_ENTERED")
 if all_summary_rows:
     ws_summary.append_rows(sanitize_rows(all_summary_rows), value_input_option="USER_ENTERED")
 
-ws_logs = get_or_create_worksheet("Weekly_Trade_Logs")
+ws_logs = get_or_create_worksheet("MultiLayer_Trade_Logs")
 ws_logs.clear()
 ws_logs.append_row(["Stock", "Setup_Week", "Trade_Week", "Entry_Price", "Target_6%", "StopLoss", "Exit_Price", "Status", "PnL_%"], value_input_option="USER_ENTERED")
 if all_trade_details:
