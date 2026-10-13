@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [LIVE CTD_SNIPER: TURNOVER & CHART LINKS] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [LIVE CTD_SNIPER: COMPLETED MONTH BREAKOUT SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,7 +57,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks with Chart Links Integration...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks using completed closed months...", flush=True)
 
 live_signals = []
 
@@ -87,15 +87,20 @@ for symbol in clean_stocks:
             'Volume': 'sum'
         }).dropna()
 
-        if len(monthly) < 6:
+        if len(monthly) < 7:
             continue
 
-        prev_month = monthly.iloc[-2]    
-        setup_month = monthly.iloc[-1]     
+        # INDEX FIX: 
+        # index[-1] is the current running/incomplete month -> IGNORE IT!
+        # index[-2] is the last fully completed/closed month -> Setup Month
+        # index[-3] is the month before setup -> Previous Month
         
-        # 2. Monthly Breakout Conditions
+        prev_month = monthly.iloc[-3]    
+        setup_month = monthly.iloc[-2]     
+        
+        # 2. Monthly Breakout Conditions on Completed Month
         cond_close_above_high = setup_month['Close'] > prev_month['High']
-        prev_4_vols = monthly['Volume'].iloc[-5:-1]
+        prev_4_vols = monthly['Volume'].iloc[-6:-2]  # 4 completed months prior to setup month
         cond_volume_surge = setup_month['Volume'] > prev_4_vols.max()
         
         if cond_close_above_high and cond_volume_surge:
@@ -103,12 +108,11 @@ for symbol in clean_stocks:
             stoploss_level = round(setup_month['Low'], 2)
             target_level = round(entry_level * 1.06, 2)
             
-            # Google Sheets Hyperlink formula for TradingView Chart
             chart_link_formula = f'=HYPERLINK("https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}", "📊 Open Chart")'
             
             live_signals.append([
                 stock_clean,
-                setup_month.name.strftime('%Y-%m'),
+                setup_month.name.strftime('%Y-%m'),  # Now shows the correct completed past month
                 entry_level,
                 target_level,
                 stoploss_level,
@@ -120,19 +124,19 @@ for symbol in clean_stocks:
     except Exception:
         continue
 
-print(f"🚀 Live Breakouts Found: {len(live_signals)}", flush=True)
+print(f"🚀 Live Breakouts Found on Completed Months: {len(live_signals)}", flush=True)
 
 # 2. Export Live Signals to Google Sheet ("Live_Breakout_Signals")
 ws_live = get_or_create_worksheet("Live_Breakout_Signals")
 ws_live.clear()
 
-headers = ["Stock", "Setup_Month", "Entry_Trigger", "Target_6%", "StopLoss", "Current_Close", "Avg_Daily_Turnover_Cr", "TradingView_Chart"]
+headers = ["Stock", "Setup_Month", "Entry_Trigger", "Target_6%", "StopLoss", "Setup_Close", "Avg_Daily_Turnover_Cr", "TradingView_Chart"]
 ws_live.append_row(headers, value_input_option="USER_ENTERED")
 
 if live_signals:
     ws_live.append_rows(sanitize_rows(live_signals), value_input_option="USER_ENTERED")
-    print("✅ Live signals with Chart links successfully exported!")
+    print("✅ Corrected signals with completed months exported successfully!")
 else:
-    ws_live.append_row(["No stocks matching live setup today.", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
-    print("ℹ️ No stocks matched the live criteria today.")
+    ws_live.append_row(["No stocks matching setup on completed months today.", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    print("ℹ️ No stocks matched the criteria.")
     
