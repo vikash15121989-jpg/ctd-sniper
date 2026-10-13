@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [LIVE CTD_SNIPER: FIXED CURRENT MONTH DROP] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [LIVE CTD_SNIPER: UNADJUSTED RAW PRICES SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,14 +57,16 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks with unadjusted raw prices...", flush=True)
 
 live_signals = []
 
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-        data = yf.Ticker(symbol).history(period="2y", interval="1d")
+        
+        # CRITICAL FIX: auto_adjust=False fetches raw/unadjusted prices (matching Google Finance & real charts)
+        data = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=False)
         if data.empty or len(data) < 200:
             continue
         
@@ -78,7 +80,7 @@ for symbol in clean_stocks:
         if recent_daily_turnover < 20000000:
             continue
 
-        # Resample to Monthly Candles
+        # Resample to Monthly Candles using raw prices
         monthly = data.resample('ME').agg({
             'Open': 'first',
             'High': 'max',
@@ -90,26 +92,20 @@ for symbol in clean_stocks:
         if len(monthly) < 6:
             continue
 
-        # -------------------------------------------------------------
-        # CRITICAL FIX: Drop the current running/incomplete month explicitly
-        # -------------------------------------------------------------
-        # yfinance labels month-end with 31st (e.g. 2026-10-31 for October).
-        # We check the actual current year and month, and drop any row belonging to it.
+        # Exclude current running/incomplete month explicitly
         current_year = now.year
         current_month = now.month
-        
-        # Filter out rows where year and month match the current running month
         completed_monthly = monthly[~((monthly.index.year == current_year) & (monthly.index.month == current_month))]
 
         if len(completed_monthly) < 5:
             continue
 
-        # Now safely pick the last strictly completed month
+        # Setup Month & Previous Month
         setup_month = completed_monthly.iloc[-1]   # e.g., September
         prev_month = completed_monthly.iloc[-2]    # e.g., August
-        prev_4_vols = completed_monthly['Volume'].iloc[-5:-1] # 4 months prior to setup
+        prev_4_vols = completed_monthly['Volume'].iloc[-5:-1]
 
-        # 2. Conditions Check
+        # 2. Strict Conditions Check on Raw Prices
         cond_close_above_high = setup_month['Close'] > prev_month['High']
         cond_volume_surge = setup_month['Volume'] > prev_4_vols.max()
         
@@ -146,7 +142,7 @@ ws_live.append_row(headers, value_input_option="USER_ENTERED")
 
 if live_signals:
     ws_live.append_rows(sanitize_rows(live_signals), value_input_option="USER_ENTERED")
-    print("✅ Signals successfully exported with current month excluded!")
+    print("✅ Signals successfully exported using raw prices!")
 else:
     ws_live.append_row(["No stocks matching strict criteria today.", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No stocks matched the criteria today.")
