@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [LIVE WEEKLY GAP-DOWN REVERSAL SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [MONTHLY VOLUME BREAKOUT BACKTEST SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -35,13 +35,13 @@ def get_or_create_worksheet(title):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows="5000", cols="10")
+        return sh.add_worksheet(title=title, rows="5000", cols="15")
 
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 def is_etf(s):
     return any(kw in s.upper() for kw in ETF_KEYWORDS)
 
-# 1. Read Watchlist
+# 1. Read Watchlist from Sheet
 raw_stocks = sh.worksheet("Watchlist").col_values(1)
 STOCKS = []
 for s in raw_stocks:
@@ -52,110 +52,130 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks for live weekly setups...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks for Monthly Volume Breakout Strategy...", flush=True)
 
-live_signals = []
+all_summary_rows = []
+all_trade_details = []
 
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-        df = yf.Ticker(symbol).history(period="1y", interval="1wk")
-        if df.empty or len(df) < 15:
+        # Download Daily Data & Resample to Monthly
+        data = yf.Ticker(symbol).history(period="max", interval="1d")
+        if data.empty or len(data) < 250:
             continue
-
-        # We look at the latest completed weekly transition (last 2 rows: -2 and -1)
-        prev_week = df.iloc[-2]   # Week 1 (Red Candle)
-        curr_week = df.iloc[-1]   # Week 2 (Gap-Down Reversal Candle)
         
-        w2_vol = float(curr_week['Volume'])
-        w2_close = float(curr_week['Close'])
-        w2_turnover = w2_vol * w2_close
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
 
-        # -------------------------------------------------------------
-        # FILTER 1: LIQUIDITY (Min 50 Lakh Vol & ₹15 Cr Turnover)
-        # -------------------------------------------------------------
-        if w2_vol < 5000000 or w2_turnover < 150000000:
-            continue
+        monthly = data.resample('ME').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
 
-        # -------------------------------------------------------------
-        # FILTER 2: 15% MINIMUM CORRECTION FROM RECENT SWING HIGH
-        # -------------------------------------------------------------
-        swing_high = df['High'].iloc[:-2].max() if len(df) > 12 else df['High'].max()
-        current_high_ref = prev_week['Close']
-        drop_pct = (swing_high - current_high_ref) / swing_high
-        if drop_pct < 0.15:
-            continue
+        trades = []
 
-        # Week 1 Must be a Strong Red Candle
-        w1_open, w1_close = float(prev_week['Open']), float(prev_week['Close'])
-        w1_body = w1_open - w1_close
-        if w1_close >= w1_open or w1_body <= 0:
-            continue
+        # Loop through monthly candles starting from index 4
+        for i in range(4, len(monthly) - 1):
+            prev_month = monthly.iloc[i-1]    # e.g., 1st Month (August)
+            setup_month = monthly.iloc[i]     # e.g., 2nd Month (September)
+            
+            # Condition 1: Setup month close > Previous month high
+            cond_close_above_high = setup_month['Close'] > prev_month['High']
+            
+            # Condition 2: Setup month volume > Max volume of previous 4 months
+            prev_4_vols = monthly['Volume'].iloc[i-4:i]
+            cond_volume_surge = setup_month['Volume'] > prev_4_vols.max()
+            
+            if cond_close_above_high and cond_volume_surge:
+                entry_level = setup_month['High']
+                stoploss_level = setup_month['Low']
+                setup_date = monthly.index[i].strftime('%Y-%m')
+                
+                trade_month = monthly.iloc[i+1] # e.g., 3rd Month (October entry trigger)
+                trade_date = monthly.index[i+1].strftime('%Y-%m')
+                
+                # Entry condition: Next month high crosses setup month high
+                if trade_month['High'] > entry_level:
+                    entry_price = entry_level
+                    
+                    # Check if Stop Loss hit first or exit at close
+                    if trade_month['Low'] <= stoploss_level:
+                        exit_price = stoploss_level
+                        status = 'Loss'
+                    else:
+                        exit_price = trade_month['Close']
+                        status = 'Profit' if exit_price > entry_price else 'Loss'
+                    
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    
+                    trades.append({
+                        'Stock': stock_clean,
+                        'Setup_Month': setup_date,
+                        'Trade_Month': trade_date,
+                        'Entry_Price': round(entry_price, 2),
+                        'StopLoss': round(stoploss_level, 2),
+                        'Exit_Price': round(exit_price, 2),
+                        'Status': status,
+                        'PnL_%': round(pnl_pct, 2)
+                    })
 
-        # Week 2 Attributes
-        w2_open = float(curr_week['Open'])
-        w2_low = float(curr_week['Low'])
-        
-        # -------------------------------------------------------------
-        # FILTER 3: MINIMUM 1.0% GAP DOWN OPEN AFTER RED CANDLE CLOSE
-        # -------------------------------------------------------------
-        gap_down_pct = (w1_close - w2_open) / w1_close
-        if gap_down_pct < 0.01:
-            continue
-
-        # Week 2 must be Green (Close > Open)
-        if w2_close <= w2_open:
-            continue
-
-        pattern_found = None
-        w1_midpoint = w1_close + (w1_body * 0.50)
-        close_diff_pct = abs(w2_close - w1_close) / w1_close
-
-        # -------------------------------------------------------------
-        # FILTER 4: STRICT GEOMETRY MATCHING
-        # -------------------------------------------------------------
-        if close_diff_pct <= 0.003:
-            pattern_found = "Weekly Strict Counterattack"
-        elif w1_midpoint <= w2_close < w1_open:
-            pattern_found = "Weekly Strict Piercing Line"
-
-        if pattern_found:
-            entry_price = round(w2_close, 2)
-            stop_loss = round(w2_low * 0.98, 2)  # 2% buffer below weekly low
-            risk = entry_price - stop_loss
-            if risk <= 0:
-                continue
-
-            target_1 = round(entry_price + (risk * 2.5), 2)  # 1:2.5 Target
-
-            tv_url = f"https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}"
-            chart_formula = f'=HYPERLINK("{tv_url}", "View Chart")'
-            trigger_date = df.index[-1].strftime('%d-%b-%Y')
-
-            live_signals.append([
-                stock_clean, pattern_found, entry_price, stop_loss,
-                target_1, f"{gap_down_pct*100:.2f}%", trigger_date, chart_formula
+        if trades:
+            df_trades = pd.DataFrame(trades)
+            for _, tr in df_trades.iterrows():
+                all_trade_details.append([
+                    tr['Stock'], tr['Setup_Month'], tr['Trade_Month'], 
+                    tr['Entry_Price'], tr['StopLoss'], tr['Exit_Price'], 
+                    tr['Status'], tr['PnL_%']
+                ])
+            
+            # Performance metrics calculations per stock
+            total_trades = len(df_trades)
+            wins = len(df_trades[df_trades['Status'] == 'Profit'])
+            losses = len(df_trades[df_trades['Status'] == 'Loss'])
+            win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+            avg_pnl = df_trades['PnL_%'].mean()
+            total_cum_pnl = df_trades['PnL_%'].sum()
+            
+            all_summary_rows.append([
+                stock_clean, total_trades, wins, losses, 
+                round(win_rate, 2), round(avg_pnl, 2), round(total_cum_pnl, 2)
             ])
-            print(f"🚨 LIVE SETUP FOUND: {stock_clean} | {pattern_found} | Entry: {entry_price}", flush=True)
+            print(f"✅ {stock_clean}: {total_trades} Trades | Win Rate: {win_rate:.2f}%", flush=True)
 
-    except Exception:
+    except Exception as e:
         continue
 
-print(f"\n📊 TOTAL LIVE SIGNALS FOUND TODAY: {len(live_signals)}")
+# 2. Export Summary Results to Google Sheet (`Monthly_Strategy_Summary`)
+ws_summary = get_or_create_worksheet("Monthly_Strategy_Summary")
+ws_summary.clear()
 
-# GOOGLE SHEET UPDATE (`Ready_For_Today`)
-ws_ready = get_or_create_worksheet("Ready_For_Today")
-ws_ready.clear()
-
-ws_ready.append_row(
-    ["Stock", "Pattern_Type", "Entry_Price", "StopLoss", "Target_1:2.5", "Gap_Down_%", "Trigger_Date", "Chart"],
+ws_summary.append_row(
+    ["Stock", "Total_Trades", "Winning_Trades", "Losing_Trades", "Win_Rate_%", "Avg_PnL_%", "Total_Cumulative_PnL_%"],
     value_input_option="USER_ENTERED"
 )
 
-if live_signals:
-    ws_ready.append_rows(sanitize_rows(live_signals), value_input_option="USER_ENTERED")
-    print("\n✅ Live Signals Exported to 'Ready_For_Today' Tab Successfully!")
+if all_summary_rows:
+    ws_summary.append_rows(sanitize_rows(all_summary_rows), value_input_option="USER_ENTERED")
+    print("\n📊 Summary Report Exported to 'Monthly_Strategy_Summary' Tab Successfully!")
 else:
-    ws_ready.append_row(["NO LIVE SETUPS FOUND TODAY", "-", "-", "-", "-", "-", now.strftime('%d-%b-%Y'), "-"], value_input_option="USER_ENTERED")
-    print("\nℹ️ Aaj koi naya live setup match nahi hua.")
+    ws_summary.append_row(["NO STRATEGY MATCHES FOUND", "-", "-", "-", "-", "-", "-"], value_input_option="USER_ENTERED")
+
+# 3. Export Detailed Trade Log to Google Sheet (`Monthly_Trade_Logs`)
+ws_logs = get_or_create_worksheet("Monthly_Trade_Logs")
+ws_logs.clear()
+
+ws_logs.append_row(
+    ["Stock", "Setup_Month", "Trade_Month", "Entry_Price", "StopLoss", "Exit_Price", "Status", "PnL_%"],
+    value_input_option="USER_ENTERED"
+)
+
+if all_trade_details:
+    ws_logs.append_rows(sanitize_rows(all_trade_details), value_input_option="USER_ENTERED")
+    print("📝 Detailed Trade Logs Exported to 'Monthly_Trade_Logs' Tab Successfully!")
+else:
+    ws_logs.append_row(["NO TRADES RECORDED", "-", "-", "-", "-", "-", "-", "-"], value_input_option="USER_ENTERED")
     
