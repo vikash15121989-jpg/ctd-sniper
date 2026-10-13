@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [LIVE CTD_SNIPER: EXACT COMPLETED MONTH LOGIC] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [LIVE CTD_SNIPER: ROBUST COMPLETED MONTH SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,7 +57,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks with exact completed-month logic...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks with robust date filtering...", flush=True)
 
 live_signals = []
 
@@ -87,24 +87,29 @@ for symbol in clean_stocks:
             'Volume': 'sum'
         }).dropna()
 
-        if len(monthly) < 7:
+        if len(monthly) < 6:
             continue
 
-        # INDEX MAPPING (Assuming Current Month is Running, e.g., October):
-        # monthly.iloc[-1] -> Current running incomplete month (IGNORED)
-        # monthly.iloc[-2] -> Last completed month (e.g., September) -> SETUP MONTH
-        # monthly.iloc[-3] -> Month before setup (e.g., August) -> PREVIOUS MONTH
-        # monthly.iloc[-6 : -2] -> 4 completed months prior to setup (e.g., May, June, July, August)
-        
-        setup_month = monthly.iloc[-2]     # September
-        prev_month = monthly.iloc[-3]      # August
-        
-        # 2. Conditions Check
+        # ROBUST DATE FILTER: Exclude current running month completely
+        current_date = datetime.now(IST)
+        first_day_current_month = current_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        completed_monthly = monthly[monthly.index < first_day_current_month]
+
+        if len(completed_monthly) < 5:
+            continue
+
+        # Last completed month = Setup Month (e.g., September)
+        setup_month = completed_monthly.iloc[-1]
+        # Month before setup = Previous Month (e.g., August)
+        prev_month = completed_monthly.iloc[-2]
+        # 4 completed months prior to setup month for volume comparison
+        prev_4_vols = completed_monthly['Volume'].iloc[-5:-1]
+
+        # 2. Strict Conditions Check
         # Condition A: Setup Month Close > Previous Month High
         cond_close_above_high = setup_month['Close'] > prev_month['High']
         
-        # Condition B: Setup Month Volume > Max Volume of previous 4 completed months (May, June, July, August)
-        prev_4_vols = monthly['Volume'].iloc[-6:-2]
+        # Condition B: Setup Month Volume > Max Volume of previous 4 completed months
         cond_volume_surge = setup_month['Volume'] > prev_4_vols.max()
         
         if cond_close_above_high and cond_volume_surge:
@@ -116,7 +121,7 @@ for symbol in clean_stocks:
             
             live_signals.append([
                 stock_clean,
-                setup_month.name.strftime('%Y-%m'),  # Shows September (Setup Month)
+                setup_month.name.strftime('%Y-%m'),  # Exact Completed Setup Month
                 entry_level,
                 target_level,
                 stoploss_level,
@@ -140,8 +145,8 @@ ws_live.append_row(headers, value_input_option="USER_ENTERED")
 
 if live_signals:
     ws_live.append_rows(sanitize_rows(live_signals), value_input_option="USER_ENTERED")
-    print("✅ Signals successfully exported with exact completed-month logic!")
+    print("✅ Signals successfully exported with robust date filtering!")
 else:
-    ws_live.append_row(["No stocks matching exact criteria today.", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    ws_live.append_row(["No stocks matching strict criteria today.", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No stocks matched the criteria today.")
     
