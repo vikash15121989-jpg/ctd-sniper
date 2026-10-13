@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [LIQUIDITY & 6% TARGET MONTHLY BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [LIQUIDITY & CONTINUOUS 3% TRAILING STOPLOSS BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -52,7 +52,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Scanning {len(clean_stocks)} stocks with Liquidity & 6% Target Rule...", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks with Continuous 3% Trailing Stoploss...", flush=True)
 
 all_summary_rows = []
 all_trade_details = []
@@ -60,7 +60,6 @@ all_trade_details = []
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-        # Download Daily Data & Resample to Monthly
         data = yf.Ticker(symbol).history(period="max", interval="1d")
         if data.empty or len(data) < 250:
             continue
@@ -68,6 +67,7 @@ for symbol in clean_stocks:
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
+        # Resample to Monthly for Setup Identification
         monthly = data.resample('ME').agg({
             'Open': 'first',
             'High': 'max',
@@ -78,73 +78,91 @@ for symbol in clean_stocks:
 
         trades = []
 
-        # Loop through monthly candles starting from index 4
         for i in range(4, len(monthly) - 1):
             prev_month = monthly.iloc[i-1]    
             setup_month = monthly.iloc[i]     
             
-            # -------------------------------------------------------------
-            # FILTER 1: LIQUIDITY CHECK (Minimum monthly volume & turnover)
-            # -------------------------------------------------------------
+            # Liquidity Filter
             setup_vol = float(setup_month['Volume'])
             setup_close = float(setup_month['Close'])
             setup_turnover = setup_vol * setup_close
             
-            # Minimum liquidity filter: e.g., Min 10 Lakh Volume & ₹10 Cr monthly turnover
             if setup_vol < 1000000 or setup_turnover < 100000000:
                 continue
 
-            # Condition 2: Setup month close > Previous month high
             cond_close_above_high = setup_close > prev_month['High']
-            
-            # Condition 3: Setup month volume > Max volume of previous 4 months
             prev_4_vols = monthly['Volume'].iloc[i-4:i]
             cond_volume_surge = setup_vol > prev_4_vols.max()
             
             if cond_close_above_high and cond_volume_surge:
                 entry_level = setup_month['High']
-                stoploss_level = setup_month['Low']
+                initial_sl = setup_month['Low']
                 setup_date = monthly.index[i].strftime('%Y-%m')
                 
-                trade_month = monthly.iloc[i+1] 
+                trade_month_start = monthly.index[i+1].strftime('%Y-%m-01')
+                trade_month_end = (monthly.index[i+1] + pd.offsets.MonthEnd(0)).strftime('%Y-%m-%d')
                 trade_date = monthly.index[i+1].strftime('%Y-%m')
                 
-                # Entry condition: Next month high crosses setup month high
-                if trade_month['High'] > entry_level:
-                    entry_price = entry_level
-                    target_price = entry_price * 1.06  # Fixed 6% Profit Target
+                daily_trade_df = data.loc[trade_month_start:trade_month_end]
+                if daily_trade_df.empty:
+                    continue
+                
+                triggered = False
+                entry_price = entry_level
+                highest_price_seen = entry_price
+                current_sl = initial_sl
+                exit_price = entry_price
+                status = 'No Trigger'
+                pnl_pct = 0.0
+                
+                for idx, day in daily_trade_df.iterrows():
+                    d_high = float(day['High'])
+                    d_low = float(day['Low'])
+                    d_close = float(day['Close'])
                     
-                    # Check outcomes in trade month
-                    t_low = float(trade_month['Low'])
-                    t_high = float(trade_month['High'])
-                    t_close = float(trade_month['Close'])
-                    
-                    status = 'Loss'
-                    exit_price = stoploss_level
-                    pnl_pct = -100 * (entry_price - stoploss_level) / entry_price # approximate SL hit pct
-                    
-                    # Check if 6% Target hit before Stoploss
-                    if t_high >= target_price:
-                        status = '6% Target Hit (Profit)'
-                        exit_price = target_price
-                        pnl_pct = 6.0
-                    elif t_low <= stoploss_level:
-                        status = 'Stoploss Hit (Loss)'
-                        exit_price = stoploss_level
-                        pnl_pct = ((stoploss_level - entry_price) / entry_price) * 100
+                    if not triggered:
+                        if d_high >= entry_level:
+                            triggered = True
+                            highest_price_seen = max(entry_price, d_high)
+                            # Continuous 3% Trailing SL from high
+                            trail_sl = highest_price_seen * 0.97
+                            current_sl = max(initial_sl, trail_sl)
+                            
+                            # Initial Stoploss check on trigger day
+                            if d_low <= current_sl:
+                                exit_price = current_sl
+                                status = 'Stoploss Hit'
+                                pnl_pct = ((current_sl - entry_price) / entry_price) * 100
+                                break
                     else:
-                        # Exit at month close if neither hit
-                        exit_price = t_close
-                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                        status = '6% Target Hit (Profit)' if pnl_pct >= 6.0 else ('Stoploss Hit (Loss)' if pnl_pct < 0 else 'Closed in Profit')
+                        # Check Trailing Stoploss Hit
+                        if d_low <= current_sl:
+                            exit_price = current_sl
+                            status = 'Trailing 3% SL Hit' if current_sl > initial_sl else 'Initial SL Hit'
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                            break
+                        
+                        # Update Highest High & Trail SL by 3%
+                        if d_high > highest_price_seen:
+                            highest_price_seen = d_high
+                            new_trail_sl = highest_price_seen * 0.97 # 3% trail
+                            if new_trail_sl > current_sl:
+                                current_sl = new_trail_sl
 
+                # If month ended without hitting SL, exit at last day close
+                if triggered and (status == 'No Trigger' or 'SL Hit' not in status):
+                    final_close = float(daily_trade_df.iloc[-1]['Close'])
+                    exit_price = final_close
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    status = 'Closed at Month End'
+
+                if triggered:
                     trades.append({
                         'Stock': stock_clean,
                         'Setup_Month': setup_date,
                         'Trade_Month': trade_date,
                         'Entry_Price': round(entry_price, 2),
-                        'Target_6%': round(target_price, 2),
-                        'StopLoss': round(stoploss_level, 2),
+                        'StopLoss': round(initial_sl, 2),
                         'Exit_Price': round(exit_price, 2),
                         'Status': status,
                         'PnL_%': round(pnl_pct, 2)
@@ -155,7 +173,7 @@ for symbol in clean_stocks:
             for _, tr in df_trades.iterrows():
                 all_trade_details.append([
                     tr['Stock'], tr['Setup_Month'], tr['Trade_Month'], 
-                    tr['Entry_Price'], tr['Target_6%'], tr['StopLoss'], tr['Exit_Price'], 
+                    tr['Entry_Price'], tr['StopLoss'], tr['Exit_Price'], 
                     tr['Status'], tr['PnL_%']
                 ])
             
@@ -174,46 +192,33 @@ for symbol in clean_stocks:
     except Exception:
         continue
 
-# -------------------------------------------------------------
 # 2. OVERALL PORTFOLIO METRICS CALCULATION
-# -------------------------------------------------------------
 if all_trade_details:
     df_all_trades = pd.DataFrame(all_trade_details, columns=[
-        'Stock', 'Setup_Month', 'Trade_Month', 'Entry_Price', 'Target_6%', 'StopLoss', 'Exit_Price', 'Status', 'PnL_%'
+        'Stock', 'Setup_Month', 'Trade_Month', 'Entry_Price', 'StopLoss', 'Exit_Price', 'Status', 'PnL_%'
     ])
     
     overall_total_trades = len(df_all_trades)
-    target_hit_count = len(df_all_trades[df_all_trades['PnL_%'] >= 6.0])
-    stoploss_hit_count = len(df_all_trades[df_all_trades['PnL_%'] < 0])
-    other_wins = len(df_all_trades[(df_all_trades['PnL_%'] > 0) & (df_all_trades['PnL_%'] < 6.0)])
-    
     overall_wins = len(df_all_trades[df_all_trades['PnL_%'] > 0])
     overall_losses = len(df_all_trades[df_all_trades['PnL_%'] <= 0])
     overall_win_rate = (overall_wins / overall_total_trades) * 100 if overall_total_trades > 0 else 0
-    
-    target_hit_pct = (target_hit_count / overall_total_trades) * 100 if overall_total_trades > 0 else 0
-    loss_hit_pct = (overall_losses / overall_total_trades) * 100 if overall_total_trades > 0 else 0
 
-    # Export Overall Summary to Google Sheet
     ws_overall = get_or_create_worksheet("Monthly_Overall_Summary")
     ws_overall.clear()
     
     overall_data = [
         ["METRIC", "VALUE"],
-        ["Total Stocks Scanned (with Liquidity)", len(clean_stocks)],
-        ["Total Trades Generated", overall_total_trades],
-        ["Trades Hit 6% Target (Profit)", f"{target_hit_count} ({target_hit_pct:.2f}%)"],
-        ["Trades Hit Stoploss / Loss", f"{overall_losses} ({loss_hit_pct:.2f}%)"],
-        ["Other Profitable Trades", other_wins],
+        ["Total Stocks Scanned", len(clean_stocks)],
+        ["Total Trades Generated (3% Continuous Trail)", overall_total_trades],
+        ["Total Winning Trades", overall_wins],
+        ["Total Losing Trades", overall_losses],
         ["OVERALL WIN RATE (%)", f"{overall_win_rate:.2f}%"],
         ["Total Cumulative Return (%)", f"{df_all_trades['PnL_%'].sum():.2f}%"]
     ]
     ws_overall.append_rows(overall_data, value_input_option="USER_ENTERED")
-    print("🏆 Overall Metrics Exported with 6% Target Data!")
+    print("🏆 Overall Metrics Exported with Continuous 3% Trailing Stoploss!")
 
-# -------------------------------------------------------------
 # 3. EXPORT INDIVIDUAL & TRADE LOGS
-# -------------------------------------------------------------
 ws_summary = get_or_create_worksheet("Monthly_Strategy_Summary")
 ws_summary.clear()
 ws_summary.append_row(["Stock", "Total_Trades", "Winning_Trades", "Losing_Trades", "Win_Rate_%", "Avg_PnL_%", "Total_Cumulative_PnL_%"], value_input_option="USER_ENTERED")
@@ -222,7 +227,7 @@ if all_summary_rows:
 
 ws_logs = get_or_create_worksheet("Monthly_Trade_Logs")
 ws_logs.clear()
-ws_logs.append_row(["Stock", "Setup_Month", "Trade_Month", "Entry_Price", "Target_6%", "StopLoss", "Exit_Price", "Status", "PnL_%"], value_input_option="USER_ENTERED")
+ws_logs.append_row(["Stock", "Setup_Month", "Trade_Month", "Entry_Price", "StopLoss", "Exit_Price", "Status", "PnL_%"], value_input_option="USER_ENTERED")
 if all_trade_details:
     ws_logs.append_rows(sanitize_rows(all_trade_details), value_input_option="USER_ENTERED")
     
