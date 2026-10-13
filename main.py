@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [MONTHLY VOLUME BREAKOUT BACKTEST SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [OVERALL & INDIVIDUAL MONTHLY BACKTEST SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -146,10 +146,56 @@ for symbol in clean_stocks:
             ])
             print(f"✅ {stock_clean}: {total_trades} Trades | Win Rate: {win_rate:.2f}%", flush=True)
 
-    except Exception as e:
+    except Exception:
         continue
 
-# 2. Export Summary Results to Google Sheet (`Monthly_Strategy_Summary`)
+# -------------------------------------------------------------
+# 2. OVERALL PORTFOLIO METRICS CALCULATION
+# -------------------------------------------------------------
+if all_trade_details:
+    df_all_trades = pd.DataFrame(all_trade_details, columns=[
+        'Stock', 'Setup_Month', 'Trade_Month', 'Entry_Price', 'StopLoss', 'Exit_Price', 'Status', 'PnL_%'
+    ])
+    
+    overall_total_trades = len(df_all_trades)
+    overall_wins = len(df_all_trades[df_all_trades['Status'] == 'Profit'])
+    overall_losses = len(df_all_trades[df_all_trades['Status'] == 'Loss'])
+    overall_win_rate = (overall_wins / overall_total_trades) * 100 if overall_total_trades > 0 else 0
+    overall_loss_rate = (overall_losses / overall_total_trades) * 100 if overall_total_trades > 0 else 0
+    
+    avg_win_pnl = df_all_trades[df_all_trades['Status'] == 'Profit']['PnL_%'].mean() if overall_wins > 0 else 0
+    avg_loss_pnl = df_all_trades[df_all_trades['Status'] == 'Loss']['PnL_%'].mean() if overall_losses > 0 else 0
+    overall_avg_pnl = df_all_trades['PnL_%'].mean()
+    overall_cum_pnl = df_all_trades['PnL_%'].sum()
+
+    print(f"\n==========================================")
+    print(f"🎯 OVERALL STRATEGY WIN RATE: {overall_win_rate:.2f}% ({overall_wins}/{overall_total_trades})")
+    print(f"==========================================\n")
+
+    # Export Overall Summary to Google Sheet (`Monthly_Overall_Summary`)
+    ws_overall = get_or_create_worksheet("Monthly_Overall_Summary")
+    ws_overall.clear()
+    
+    overall_data = [
+        ["METRIC", "VALUE"],
+        ["Total Stocks Scanned", len(clean_stocks)],
+        ["Stocks Triggered Signals", len(all_summary_rows)],
+        ["Total Trades Generated (All Stocks)", overall_total_trades],
+        ["Total Winning Trades", overall_wins],
+        ["Total Losing Trades", overall_losses],
+        ["OVERALL WIN RATE (%)", f"{overall_win_rate:.2f}%"],
+        ["OVERALL LOSS RATE (%)", f"{overall_loss_rate:.2f}%"],
+        ["Average Profit per Winning Trade (%)", f"{avg_win_pnl:.2f}%"],
+        ["Average Loss per Losing Trade (%)", f"{avg_loss_pnl:.2f}%"],
+        ["Average Return per Trade (%)", f"{overall_avg_pnl:.2f}%"],
+        ["Total Cumulative Strategy Return (%)", f"{overall_cum_pnl:.2f}%"]
+    ]
+    ws_overall.append_rows(overall_data, value_input_option="USER_ENTERED")
+    print("🏆 Overall Metrics Exported to 'Monthly_Overall_Summary' Tab!")
+
+# -------------------------------------------------------------
+# 3. INDIVIDUAL STOCK SUMMARY EXPORT (`Monthly_Strategy_Summary`)
+# -------------------------------------------------------------
 ws_summary = get_or_create_worksheet("Monthly_Strategy_Summary")
 ws_summary.clear()
 
@@ -160,11 +206,11 @@ ws_summary.append_row(
 
 if all_summary_rows:
     ws_summary.append_rows(sanitize_rows(all_summary_rows), value_input_option="USER_ENTERED")
-    print("\n📊 Summary Report Exported to 'Monthly_Strategy_Summary' Tab Successfully!")
-else:
-    ws_summary.append_row(["NO STRATEGY MATCHES FOUND", "-", "-", "-", "-", "-", "-"], value_input_option="USER_ENTERED")
+    print("📊 Individual Stock Summary Exported to 'Monthly_Strategy_Summary' Tab!")
 
-# 3. Export Detailed Trade Log to Google Sheet (`Monthly_Trade_Logs`)
+# -------------------------------------------------------------
+# 4. DETAILED TRADE LOGS EXPORT (`Monthly_Trade_Logs`)
+# -------------------------------------------------------------
 ws_logs = get_or_create_worksheet("Monthly_Trade_Logs")
 ws_logs.clear()
 
@@ -175,7 +221,5 @@ ws_logs.append_row(
 
 if all_trade_details:
     ws_logs.append_rows(sanitize_rows(all_trade_details), value_input_option="USER_ENTERED")
-    print("📝 Detailed Trade Logs Exported to 'Monthly_Trade_Logs' Tab Successfully!")
-else:
-    ws_logs.append_row(["NO TRADES RECORDED", "-", "-", "-", "-", "-", "-", "-"], value_input_option="USER_ENTERED")
+    print("📝 Individual Trade Logs Exported to 'Monthly_Trade_Logs' Tab!")
     
