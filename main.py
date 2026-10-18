@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: 10-DAY MAX BREAKOUT & DOUBLE TARGET BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [CTD_SNIPER: HIGH-CONVICTION STRICT BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -124,17 +124,17 @@ for symbol in clean_stocks:
             recent_20_emas = hist['20_EMA'].iloc[-12:-1]
             had_shakeout = any(recent_lows < recent_20_emas)
 
-            # 4. NEW RULE: Volume > 10 Days Max Volume & Close > 10 Days Max Close
+            # 4. 10-Day Max Volume & 10-Day Max Close Breakout
             prev_10_max_vol = hist['Volume'].iloc[-11:-1].max()
             prev_10_max_close = hist['Close'].iloc[-11:-1].max()
 
             is_volume_spike = latest_vol > prev_10_max_vol
             is_price_breakout = latest_close > prev_10_max_close
 
-            # 5. Mansfield RS Positive Filter
-            is_rs_positive = latest_rs > 0
+            # 5. STRICT RELATIVE STRENGTH FILTER: Mansfield RS > 3.0 (High Outperformance)
+            is_rs_strong = latest_rs > 3.0
 
-            if is_uptrend and had_shakeout and is_volume_spike and is_price_breakout and is_rs_positive:
+            if is_uptrend and had_shakeout and is_volume_spike and is_price_breakout and is_rs_strong:
                 entry_date = df.index[i+1]
                 entry_price = df['Open'].iloc[i+1]
 
@@ -148,7 +148,7 @@ for symbol in clean_stocks:
 
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
                 
-                # NEW RULE: Target is double the stop loss risk (2:1 R:R)
+                # Target is double the stop loss risk distance (2:1 R:R)
                 target_price = round(entry_price + (2 * risk_per_share), 2)
 
                 future_df = df.loc[entry_date:].iloc[1:31]
@@ -191,8 +191,8 @@ for symbol in clean_stocks:
                     chart_link_formula
                 ])
                 
-                # Cooldown period of 30 days after taking a trade
-                i += 30
+                # 60-Day Cooldown to avoid over-trading the same stock
+                i += 60
             else:
                 i += 1
 
@@ -215,8 +215,8 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("         SNIPER BACKTEST PERFORMANCE SUMMARY")
-    print("=" .format(50))
+    print("         HIGH-CONVICTION BACKTEST SUMMARY")
+    print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
     print(f"Losing Trades          : {losing_trades}")
@@ -244,7 +244,7 @@ if total_trades > 0:
         f"Losing: {losing_trades}", 
         f"Total PnL: {total_pnl_pct}%", 
         f"Avg PnL: {avg_pnl_pct}%", 
-        "", "", "", "", "", ""
+        f"Total Rupee PnL: ₹{total_rupee_pnl}", "", "", "", "", ""
     ]
     ws_backtest.append_row(summary_header, value_input_option="USER_ENTERED")
     ws_backtest.append_row([], value_input_option="USER_ENTERED")
@@ -255,8 +255,8 @@ if total_trades > 0:
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ 10-Day Max Volume & Double Target Backtest results successfully exported to Google Sheet!")
+    print("✅ High-conviction backtest results successfully exported to Google Sheet!")
 else:
-    ws_backtest.append_row(["No historical trades matched the criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    ws_backtest.append_row(["No historical trades matched the high-conviction criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No historical trades matched the criteria.")
     
