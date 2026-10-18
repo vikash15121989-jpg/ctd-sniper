@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: DAILY BACKTEST WITH PERFORMANCE METRICS] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [CTD_SNIPER: 10-DAY MAX BREAKOUT & DOUBLE TARGET BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,7 +57,7 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Loaded {len(clean_stocks)} stocks from Google Sheet Watchlist for Backtesting...", flush=True)
+print(f"📥 Loaded {len(clean_stocks)} stocks from Google Sheet Watchlist...", flush=True)
 
 # Fetch Benchmark Nifty Data for Mansfield RS Calculation
 try:
@@ -78,7 +78,7 @@ allowed_rupee_risk = TOTAL_CAPITAL * RISK_PER_TRADE_PCT
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
-        print(f"Backtesting: {stock_clean}...", flush=True)
+        print(f"Scanning & Backtesting: {stock_clean}...", flush=True)
         
         df = yf.download(symbol, start="2024-01-01", end="2026-10-01", auto_adjust=False, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -89,7 +89,7 @@ for symbol in clean_stocks:
 
         df['20_EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['50_EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
-        df['Vol_20_MA'] = df['Volume'].rolling(window=20).mean()
+        df['Turnover'] = df['Close'] * df['Volume']
 
         combined = pd.DataFrame({
             'Stock': df['Close'],
@@ -100,42 +100,60 @@ for symbol in clean_stocks:
         df['RS'] = ((rel_ratio / base_ma) - 1) * 100
         df = df.reindex(combined.index).dropna()
 
-        for i in range(60, len(df) - 30):
+        i = 60
+        while i < len(df) - 30:
             hist = df.iloc[:i+1]
             
             latest_close = hist['Close'].iloc[-1]
             latest_20_ema = hist['20_EMA'].iloc[-1]
             latest_50_ema = hist['50_EMA'].iloc[-1]
             latest_vol = hist['Volume'].iloc[-1]
-            avg_vol = hist['Vol_20_MA'].iloc[-1]
             latest_rs = hist['RS'].iloc[-1]
+            avg_turnover = hist['Turnover'].iloc[-20:].mean()
 
+            # 1. Liquidity Filter: Minimum 5 Crore Daily Turnover
+            if avg_turnover < 50000000:
+                i += 1
+                continue
+
+            # 2. Trend Filter: 20 EMA > 50 EMA and Price above 20 EMA
             is_uptrend = (latest_20_ema > latest_50_ema) and (latest_close > latest_20_ema)
-            recent_lows = hist['Low'].iloc[-10:-1]
-            recent_20_emas = hist['20_EMA'].iloc[-10:-1]
+
+            # 3. Shakeout Check: Price dipped below 20 EMA within last 12 days and reclaimed
+            recent_lows = hist['Low'].iloc[-12:-1]
+            recent_20_emas = hist['20_EMA'].iloc[-12:-1]
             had_shakeout = any(recent_lows < recent_20_emas)
 
-            recent_20_high = hist['High'].iloc[-21:-1].max()
-            is_breakout = (latest_close > recent_20_high) and (latest_vol >= 1.5 * avg_vol)
+            # 4. NEW RULE: Volume > 10 Days Max Volume & Close > 10 Days Max Close
+            prev_10_max_vol = hist['Volume'].iloc[-11:-1].max()
+            prev_10_max_close = hist['Close'].iloc[-11:-1].max()
+
+            is_volume_spike = latest_vol > prev_10_max_vol
+            is_price_breakout = latest_close > prev_10_max_close
+
+            # 5. Mansfield RS Positive Filter
             is_rs_positive = latest_rs > 0
 
-            if is_uptrend and had_shakeout and is_breakout and is_rs_positive:
+            if is_uptrend and had_shakeout and is_volume_spike and is_price_breakout and is_rs_positive:
                 entry_date = df.index[i+1]
                 entry_price = df['Open'].iloc[i+1]
 
-                shakeout_low = hist['Low'].iloc[-10:].min()
-                stop_loss = round(min(shakeout_low, entry_price * 0.96), 2)
+                shakeout_low = hist['Low'].iloc[-12:].min()
+                stop_loss = round(min(shakeout_low, entry_price * 0.95), 2)  # Max 5% SL
 
                 risk_per_share = entry_price - stop_loss
                 if risk_per_share <= 0:
+                    i += 1
                     continue
 
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
-                target_6_pct = round(entry_price * 1.06, 2)
-                target_10_pct = round(entry_price * 1.10, 2)
+                
+                # NEW RULE: Target is double the stop loss risk (2:1 R:R)
+                target_price = round(entry_price + (2 * risk_per_share), 2)
 
-                future_df = df.loc[entry_date:].iloc[1:26]
+                future_df = df.loc[entry_date:].iloc[1:31]
                 if future_df.empty:
+                    i += 1
                     continue
 
                 exit_price = future_df['Close'].iloc[-1]
@@ -149,13 +167,9 @@ for symbol in clean_stocks:
                         exit_price = stop_loss
                         exit_reason = "SL Hit"
                         break
-                    elif day_high >= target_10_pct:
-                        exit_price = target_10_pct
-                        exit_reason = "10% Target Hit"
-                        break
-                    elif day_high >= target_6_pct:
-                        exit_price = target_6_pct
-                        exit_reason = "6% Target Hit"
+                    elif day_high >= target_price:
+                        exit_price = target_price
+                        exit_reason = "Target Hit (2x Risk)"
                         break
 
                 pnl_pct = round(((exit_price - entry_price) / entry_price) * 100, 2)
@@ -167,6 +181,7 @@ for symbol in clean_stocks:
                     entry_date.strftime('%Y-%m-%d'),
                     round(entry_price, 2),
                     round(stop_loss, 2),
+                    round(target_price, 2),
                     round(exit_price, 2),
                     shares_quantity,
                     exit_reason,
@@ -175,7 +190,11 @@ for symbol in clean_stocks:
                     round(latest_rs, 2),
                     chart_link_formula
                 ])
-                i += 10 
+                
+                # Cooldown period of 30 days after taking a trade
+                i += 30
+            else:
+                i += 1
 
     except Exception as e:
         continue
@@ -184,7 +203,7 @@ for symbol in clean_stocks:
 total_trades = len(all_backtest_trades)
 if total_trades > 0:
     df_results = pd.DataFrame(all_backtest_trades, columns=[
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Exit_Price", 
+        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
         "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
     ])
     
@@ -196,8 +215,8 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("         BACKTEST PERFORMANCE SUMMARY")
-    print("=" * 50)
+    print("         SNIPER BACKTEST PERFORMANCE SUMMARY")
+    print("=" .format(50))
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
     print(f"Losing Trades          : {losing_trades}")
@@ -213,7 +232,7 @@ else:
     total_pnl_pct = 0.0
     avg_pnl_pct = 0.0
 
-# 3. Export Backtest Results & Summary to Google Sheet (`Backtest_Results` tab)
+# 3. Export to Google Sheet (`Backtest_Results` tab)
 ws_backtest = get_or_create_worksheet("Backtest_Results")
 ws_backtest.clear()
 
@@ -225,19 +244,19 @@ if total_trades > 0:
         f"Losing: {losing_trades}", 
         f"Total PnL: {total_pnl_pct}%", 
         f"Avg PnL: {avg_pnl_pct}%", 
-        "", "", "", "", ""
+        "", "", "", "", "", ""
     ]
     ws_backtest.append_row(summary_header, value_input_option="USER_ENTERED")
     ws_backtest.append_row([], value_input_option="USER_ENTERED")
 
     headers = [
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Exit_Price", 
+        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
         "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ Backtest results and Performance Metrics successfully exported to Google Sheet!")
+    print("✅ 10-Day Max Volume & Double Target Backtest results successfully exported to Google Sheet!")
 else:
-    ws_backtest.append_row(["No historical trades matched the strict daily criteria.", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    ws_backtest.append_row(["No historical trades matched the criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No historical trades matched the criteria.")
     
