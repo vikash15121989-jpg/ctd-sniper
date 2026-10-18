@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: ULTRA-STRICT SNIPER BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [CTD_SNIPER: 10-DAY MAX HIGH BREAKOUT BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -106,6 +106,7 @@ for symbol in clean_stocks:
             hist = df.iloc[:i+1]
             
             latest_close = hist['Close'].iloc[-1]
+            latest_high = hist['High'].iloc[-1]
             latest_20_ema = hist['20_EMA'].iloc[-1]
             latest_50_ema = hist['50_EMA'].iloc[-1]
             latest_vol = hist['Volume'].iloc[-1]
@@ -113,7 +114,7 @@ for symbol in clean_stocks:
             latest_rs = hist['RS'].iloc[-1]
             avg_turnover = hist['Turnover'].iloc[-20:].mean()
 
-            # 1. ULTRA-STRICT LIQUIDITY: Minimum 10 Crore Daily Turnover
+            # 1. LIQUIDITY FILTER: Minimum 10 Crore Daily Turnover
             if avg_turnover < 100000000:
                 i += 1
                 continue
@@ -126,19 +127,19 @@ for symbol in clean_stocks:
             recent_20_emas = hist['20_EMA'].iloc[-12:-1]
             had_shakeout = any(recent_lows < recent_20_emas)
 
-            # 4. Volume Surge (10-Day Max + 2.0x 20-MA) & Close Breakout
+            # 4. EXACT RULE: Volume > 10-Day Max Volume & CLOSE > 10-DAY MAX HIGH
             prev_10_max_vol = hist['Volume'].iloc[-11:-1].max()
-            prev_10_max_close = hist['Close'].iloc[-11:-1].max()
+            prev_10_max_high = hist['High'].iloc[-11:-1].max()
 
             is_volume_spike = (latest_vol > prev_10_max_vol) and (latest_vol >= 2.0 * avg_vol_20)
-            is_price_breakout = latest_close > prev_10_max_close
+            is_close_above_max_high = latest_close > prev_10_max_high
 
-            # 5. ULTRA-STRICT MANSFIELD RS: RS > 5.0
-            is_rs_ultra_strong = latest_rs > 5.0
+            # 5. MANSFIELD RS >= 10.0
+            is_rs_elite = latest_rs >= 10.0
 
-            if is_uptrend and had_shakeout and is_volume_spike and is_price_breakout and is_rs_ultra_strong:
-                entry_date = df.index[i+1]
-                entry_price = df['Open'].iloc[i+1]
+            if is_uptrend and had_shakeout and is_volume_spike and is_close_above_max_high and is_rs_elite:
+                entry_date = df.index[i]
+                entry_price = latest_high  # ENTRY AT BREAKOUT CANDLE HIGH
 
                 shakeout_low = hist['Low'].iloc[-12:].min()
                 stop_loss = round(min(shakeout_low, entry_price * 0.95), 2)  # Max 5% SL
@@ -149,9 +150,7 @@ for symbol in clean_stocks:
                     continue
 
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
-                
-                # Target is double the stop loss risk distance (2:1 R:R)
-                target_price = round(entry_price + (2 * risk_per_share), 2)
+                target_price = round(entry_price + (2 * risk_per_share), 2)  # 2x Risk Target
 
                 future_df = df.loc[entry_date:].iloc[1:31]
                 if future_df.empty:
@@ -217,7 +216,7 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("         ULTRA-STRICT SNIPER BACKTEST SUMMARY")
+    print("     MAX HIGH BREAKOUT BACKTEST SUMMARY (RS >= 10)")
     print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
@@ -257,8 +256,8 @@ if total_trades > 0:
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ Ultra-strict results successfully exported to Google Sheet!")
+    print("✅ Max High Breakout results successfully exported to Google Sheet!")
 else:
-    ws_backtest.append_row(["No historical trades matched the ultra-strict criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    ws_backtest.append_row(["No historical trades matched the criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No historical trades matched the criteria.")
     
