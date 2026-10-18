@@ -10,9 +10,18 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: HISTORICAL BACKTEST ENGINE] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [LIVE CTD_SNIPER: UNADJUSTED RAW PRICES SCANNER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
-# Google Sheets Connection to read Watchlist
+def sanitize_value(val):
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+    return val
+
+def sanitize_rows(rows):
+    return [[sanitize_value(v) for v in row] for row in rows]
+
+# Google Sheets Connection
 try:
     gcp_json_creds = json.loads(os.environ["GSHEET_KEY"])
     gc = gspread.service_account_from_dict(gcp_json_creds)
@@ -21,6 +30,12 @@ try:
 except Exception as e:
     print(f"❌ Connection Error: {e}")
     exit(1)
+
+def get_or_create_worksheet(title):
+    try:
+        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows="1000", cols="15")
 
 ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF", "HANGSENG", "SENSEX", "MON100"]
 def is_etf(s):
@@ -42,130 +57,92 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Backtesting across {len(clean_stocks)} stocks from Watchlist (2 Years History)...\n", flush=True)
+print(f"📥 Scanning {len(clean_stocks)} stocks with unadjusted raw prices...", flush=True)
 
-all_backtest_trades = []
+live_signals = []
 
 for symbol in clean_stocks:
     try:
         stock_clean = symbol.replace(".NS", "")
         
-        # Fetch 2 years of unadjusted raw historical prices
+        # CRITICAL FIX: auto_adjust=False fetches raw/unadjusted prices (matching Google Finance & real charts)
         data = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=False)
-        if data.empty or len(data) < 100:
+        if data.empty or len(data) < 200:
             continue
         
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        # 1. Technical Indicators & Turnover Calculation
+        # 1. Daily Liquidity Check (>= ₹2 Cr Avg Daily Turnover)
         data['Turnover'] = data['Close'] * data['Volume']
-        data['Turnover20MA'] = data['Turnover'].rolling(window=20).mean()
-        data['MA20'] = data['Close'].rolling(window=20).mean()
-        data['MA50'] = data['Close'].rolling(window=50).mean()
+        recent_daily_turnover = data['Turnover'].iloc[-20:].mean()
         
-        # 10-Day Max High & Max Volume (shifted by 1 so today isn't included in the past max)
-        data['High_10_Max'] = data['High'].shift(1).rolling(window=10).max()
-        data['Vol_10_Max'] = data['Volume'].shift(1).rolling(window=10).max()
+        if recent_daily_turnover < 20000000:
+            continue
 
-        data.dropna(inplace=True)
+        # Resample to Monthly Candles using raw prices
+        monthly = data.resample('ME').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
 
-        # Loop through historical bars (leaving 25 days at the end to evaluate future trades)
-        for i in range(50, len(data) - 25):
-            row = data.iloc[i]
-            
-            # Rule 1: Liquidity Check (Avg Daily Turnover >= 3 Cr)
-            if row['Turnover20MA'] < 30000000:
-                continue
-            
-            ma20 = row['MA20']
-            ma50 = row['MA50']
-            if ma20 == 0 or ma50 == 0:
-                continue
+        if len(monthly) < 6:
+            continue
 
-            # Rule 2: 20 DMA and 50 DMA within 3% range of each other
-            ma_gap_pct = abs(ma20 - ma50) / min(ma20, ma50) * 100
-            if ma_gap_pct > 3.0:
-                continue
-                
-            # Rule 3: Close price within 5% of both 20 DMA and 50 DMA
-            price_to_ma20_pct = abs(row['Close'] - ma20) / ma20 * 100
-            price_to_ma50_pct = abs(row['Close'] - ma50) / ma50 * 100
-            if price_to_ma20_pct > 5.0 or price_to_ma50_pct > 5.0:
-                continue
-                
-            # Rule 4: Breakout Conditions (Close > 10D High AND Volume > 10D Volume)
-            if not (row['Close'] > row['High_10_Max'] and row['Volume'] > row['Vol_10_Max']):
-                continue
-                
-            # Setup Triggered!
-            entry_price = row['High']
-            stop_loss = row['Low']
-            target_6 = entry_price * 1.06
-            target_10 = entry_price * 1.10
-            sl_risk_pct = (entry_price - stop_loss) / entry_price * 100
-            
-            # Look forward up to 20 trading days to track outcome
-            future_data = data.iloc[i+1 : i+21]
-            
-            hit_6 = False
-            hit_10 = False
-            hit_sl = False
-            
-            first_6_bar = None
-            first_10_bar = None
-            first_sl_bar = None
-            
-            for idx_f, (f_date, f_row) in enumerate(future_data.iterrows()):
-                if f_row['Low'] <= stop_loss and first_sl_bar is None:
-                    first_sl_bar = idx_f
-                if f_row['High'] >= target_6 and first_6_bar is None:
-                    first_6_bar = idx_f
-                if f_row['High'] >= target_10 and first_10_bar is None:
-                    first_10_bar = idx_f
+        # Exclude current running/incomplete month explicitly
+        current_year = now.year
+        current_month = now.month
+        completed_monthly = monthly[~((monthly.index.year == current_year) & (monthly.index.month == current_month))]
 
-            # Determine path-dependent outcome (what happened first)
-            success_6 = (first_6_bar is not None) and (first_sl_bar is None or first_6_bar <= first_sl_bar)
-            success_10 = (first_10_bar is not None) and (first_sl_bar is None or first_10_bar <= first_sl_bar)
-            sl_first = (first_sl_bar is not None) and (first_6_bar is None or first_sl_bar < first_6_bar)
+        if len(completed_monthly) < 5:
+            continue
 
-            all_backtest_trades.append({
-                'Stock': stock_clean,
-                'Date': data.index[i].strftime('%Y-%m-%d'),
-                'Entry': round(entry_price, 2),
-                'SL': round(stop_loss, 2),
-                'SL_Risk_%': round(sl_risk_pct, 2),
-                'Hit_6%': success_6,
-                'Hit_10%': success_10,
-                'Hit_SL_First': sl_first
-            })
+        # Setup Month & Previous Month
+        setup_month = completed_monthly.iloc[-1]   # e.g., September
+        prev_month = completed_monthly.iloc[-2]    # e.g., August
+        prev_4_vols = completed_monthly['Volume'].iloc[-5:-1]
 
-    except Exception as e:
+        # 2. Strict Conditions Check on Raw Prices
+        cond_close_above_high = setup_month['Close'] > prev_month['High']
+        cond_volume_surge = setup_month['Volume'] > prev_4_vols.max()
+        
+        if cond_close_above_high and cond_volume_surge:
+            entry_level = round(setup_month['High'], 2)
+            stoploss_level = round(setup_month['Low'], 2)
+            target_level = round(entry_level * 1.06, 2)
+            
+            chart_link_formula = f'=HYPERLINK("https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}", "📊 Open Chart")'
+            
+            live_signals.append([
+                stock_clean,
+                setup_month.name.strftime('%Y-%m'),
+                entry_level,
+                target_level,
+                stoploss_level,
+                round(setup_month['Close'], 2),
+                round(prev_month['High'], 2),
+                round(recent_daily_turnover / 10000000, 2),
+                chart_link_formula
+            ])
+
+    except Exception:
         continue
 
-# --- Results Compilation & Reporting ---
-df_res = pd.DataFrame(all_backtest_trades)
+print(f"🚀 Valid Breakouts Found: {len(live_signals)}", flush=True)
 
-print("=" * 60)
-print("📊 BACKTEST PERFORMANCE REPORT")
-print("=" * 60)
+# 2. Export Live Signals to Google Sheet
+ws_live = get_or_create_worksheet("Live_Breakout_Signals")
+ws_live.clear()
 
-if not df_res.empty:
-    total_trades = len(df_res)
-    wins_6 = df_res['Hit_6%'].sum()
-    wins_10 = df_res['Hit_10%'].sum()
-    sl_hits = df_res['Hit_SL_First'].sum()
-    
-    print(f"Total Trades Generated    : {total_trades}")
-    print(f"Average SL Risk           : {df_res['SL_Risk_%'].mean():.2f}%")
-    print("-" * 60)
-    print(f"6% Target Winning Rate    : {(wins_6 / total_trades) * 100:.2f}% ({wins_6} / {total_trades})")
-    print(f"10% Target Winning Rate   : {(wins_10 / total_trades) * 100:.2f}% ({wins_10} / {total_trades})")
-    print(f"SL Hit First Rate         : {(sl_hits / total_trades) * 100:.2f}% ({sl_hits} / {total_trades})")
-    print("=" * 60)
-    print("\n📋 Sample Trades Breakdown:")
-    print(df_res.head(15).to_string(index=False))
+headers = ["Stock", "Setup_Month", "Entry_Trigger", "Target_6%", "StopLoss", "Setup_Close", "Prev_Month_High", "Avg_Daily_Turnover_Cr", "TradingView_Chart"]
+ws_live.append_row(headers, value_input_option="USER_ENTERED")
+
+if live_signals:
+    ws_live.append_rows(sanitize_rows(live_signals), value_input_option="USER_ENTERED")
+    print("✅ Signals successfully exported using raw prices!")
 else:
-    print("❌ No trades matched your strict criteria across the watchlist historical data.")
-    print("Tip: Criteria (MA Squeeze within 3% + Price within 5% + Volume/Price Breakout) boht tight hai, aap chahe toh MA gap ko 4-5% kar sakte hain.")
-            
+    ws_live.append_row(["No stocks matching strict criteria today.", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    print("ℹ️ No stocks matched the criteria today.")
