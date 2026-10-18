@@ -181,16 +181,16 @@ for symbol in clean_stocks:
         continue
 
 # 2. Calculate Performance Metrics
-if all_backtest_trades:
+total_trades = len(all_backtest_trades)
+if total_trades > 0:
     df_results = pd.DataFrame(all_backtest_trades, columns=[
         "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Exit_Price", 
         "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
     ])
     
-    total_trades = len(df_results)
     winning_trades = len(df_results[df_results['PnL_Pct'] > 0])
     losing_trades = len(df_results[df_results['PnL_Pct'] <= 0])
-    win_rate = round((winning_trades / total_trades) * 100, 2) if total_trades > 0 else 0
+    win_rate = round((winning_trades / total_trades) * 100, 2)
     total_pnl_pct = round(df_results['PnL_Pct'].sum(), 2)
     avg_pnl_pct = round(df_results['PnL_Pct'].mean(), 2)
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
@@ -206,11 +206,38 @@ if all_backtest_trades:
     print(f"Average PnL per Trade  : {avg_pnl_pct}%")
     print(f"Total Rupee PnL        : ₹{total_rupee_pnl}")
     print("=" * 50 + "\n")
+else:
+    winning_trades = 0
+    losing_trades = 0
+    win_rate = 0.0
+    total_pnl_pct = 0.0
+    avg_pnl_pct = 0.0
 
 # 3. Export Backtest Results & Summary to Google Sheet (`Backtest_Results` tab)
 ws_backtest = get_or_create_worksheet("Backtest_Results")
 ws_backtest.clear()
 
-if all_backtest_trades:
-    # Top par Summary rows push kar sakte hain ya direct headers
+if total_trades > 0:
+    summary_header = [
+        f"Total Trades: {total_trades}", 
+        f"Win Rate: {win_rate}%", 
+        f"Winning: {winning_trades}", 
+        f"Losing: {losing_trades}", 
+        f"Total PnL: {total_pnl_pct}%", 
+        f"Avg PnL: {avg_pnl_pct}%", 
+        "", "", "", "", ""
+    ]
+    ws_backtest.append_row(summary_header, value_input_option="USER_ENTERED")
+    ws_backtest.append_row([], value_input_option="USER_ENTERED")
+
+    headers = [
+        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Exit_Price", 
+        "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
+    ]
+    ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
+    ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
+    print("✅ Backtest results and Performance Metrics successfully exported to Google Sheet!")
+else:
+    ws_backtest.append_row(["No historical trades matched the strict daily criteria.", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
+    print("ℹ️ No historical trades matched the criteria.")
     
