@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: 10-DAY MAX HIGH BREAKOUT BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [CTD_SNIPER: PULLBACK & RETEST ENTRY BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -102,11 +102,10 @@ for symbol in clean_stocks:
         df = df.reindex(combined.index).dropna()
 
         i = 60
-        while i < len(df) - 30:
+        while i < len(df) - 40:
             hist = df.iloc[:i+1]
             
             latest_close = hist['Close'].iloc[-1]
-            latest_high = hist['High'].iloc[-1]
             latest_20_ema = hist['20_EMA'].iloc[-1]
             latest_50_ema = hist['50_EMA'].iloc[-1]
             latest_vol = hist['Volume'].iloc[-1]
@@ -127,7 +126,7 @@ for symbol in clean_stocks:
             recent_20_emas = hist['20_EMA'].iloc[-12:-1]
             had_shakeout = any(recent_lows < recent_20_emas)
 
-            # 4. EXACT RULE: Volume > 10-Day Max Volume & CLOSE > 10-DAY MAX HIGH
+            # 4. Breakout Setup Condition: Volume > 10-Day Max Volume & CLOSE > 10-DAY MAX HIGH
             prev_10_max_vol = hist['Volume'].iloc[-11:-1].max()
             prev_10_max_high = hist['High'].iloc[-11:-1].max()
 
@@ -138,126 +137,36 @@ for symbol in clean_stocks:
             is_rs_elite = latest_rs >= 10.0
 
             if is_uptrend and had_shakeout and is_volume_spike and is_close_above_max_high and is_rs_elite:
-                entry_date = df.index[i]
-                entry_price = latest_high  # ENTRY AT BREAKOUT CANDLE HIGH
-
                 shakeout_low = hist['Low'].iloc[-12:].min()
-                stop_loss = round(min(shakeout_low, entry_price * 0.95), 2)  # Max 5% SL
-
-                risk_per_share = entry_price - stop_loss
-                if risk_per_share <= 0:
-                    i += 1
-                    continue
-
-                shares_quantity = int(allowed_rupee_risk / risk_per_share)
-                target_price = round(entry_price + (2 * risk_per_share), 2)  # 2x Risk Target
-
-                future_df = df.loc[entry_date:].iloc[1:31]
-                if future_df.empty:
-                    i += 1
-                    continue
-
-                exit_price = future_df['Close'].iloc[-1]
-                exit_reason = "Time Exit"
-
-                for f_idx in range(len(future_df)):
-                    day_low = future_df['Low'].iloc[f_idx]
-                    day_high = future_df['High'].iloc[f_idx]
-
-                    if day_low <= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = "SL Hit"
-                        break
-                    elif day_high >= target_price:
-                        exit_price = target_price
-                        exit_reason = "Target Hit (2x Risk)"
-                        break
-
-                pnl_pct = round(((exit_price - entry_price) / entry_price) * 100, 2)
-                trade_rupee_pnl = round(shares_quantity * (exit_price - entry_price), 2)
-                chart_link_formula = f'=HYPERLINK("https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}", "📊 Open Chart")'
-
-                all_backtest_trades.append([
-                    stock_clean,
-                    entry_date.strftime('%Y-%m-%d'),
-                    round(entry_price, 2),
-                    round(stop_loss, 2),
-                    round(target_price, 2),
-                    round(exit_price, 2),
-                    shares_quantity,
-                    exit_reason,
-                    pnl_pct,
-                    trade_rupee_pnl,
-                    round(latest_rs, 2),
-                    chart_link_formula
-                ])
                 
-                # 60-Day Cooldown
-                i += 60
-            else:
-                i += 1
+                # PULLBACK & RE-TEST ENTRY LOGIC:
+                # Look into the next 10 days for a dip/pullback followed by a bounce above previous high
+                forward_window = df.iloc[i+1 : i+11]
+                entry_triggered = False
+                entry_date = None
+                entry_price = 0.0
 
-    except Exception as e:
-        continue
+                has_pulled_back = False
+                for f_idx in range(len(forward_window)):
+                    bar = forward_window.iloc[f_idx]
+                    
+                    # Pullback condition: price dips below breakout close or towards 20 EMA
+                    if bar['Low'] <= bar['20_EMA'] or bar['Close'] < latest_close:
+                        has_pulled_back = True
 
-# 2. Calculate Performance Metrics
-total_trades = len(all_backtest_trades)
-if total_trades > 0:
-    df_results = pd.DataFrame(all_backtest_trades, columns=[
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
-    ])
-    
-    winning_trades = len(df_results[df_results['PnL_Pct'] > 0])
-    losing_trades = len(df_results[df_results['PnL_Pct'] <= 0])
-    win_rate = round((winning_trades / total_trades) * 100, 2)
-    total_pnl_pct = round(df_results['PnL_Pct'].sum(), 2)
-    avg_pnl_pct = round(df_results['PnL_Pct'].mean(), 2)
-    total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
+                    # Entry trigger: after a pullback, price crosses above the previous day's high
+                    if has_pulled_back and f_idx > 0:
+                        prev_bar = forward_window.iloc[f_idx - 1]
+                        if bar['High'] > prev_bar['High']:
+                            entry_date = forward_window.index[f_idx]
+                            entry_price = prev_bar['High']  # Buy stop at prev high
+                            entry_triggered = True
+                            entry_idx_in_df = df.index.get_loc(entry_date)
+                            break
 
-    print("\n" + "=" * 50)
-    print("     MAX HIGH BREAKOUT BACKTEST SUMMARY (RS >= 10)")
-    print("=" * 50)
-    print(f"Total Trades Taken     : {total_trades}")
-    print(f"Winning Trades         : {winning_trades}")
-    print(f"Losing Trades          : {losing_trades}")
-    print(f"Win Rate (%)           : {win_rate}%")
-    print(f"Total Cumulative PnL   : {total_pnl_pct}%")
-    print(f"Average PnL per Trade  : {avg_pnl_pct}%")
-    print(f"Total Rupee PnL        : ₹{total_rupee_pnl}")
-    print("=" * 50 + "\n")
-else:
-    winning_trades = 0
-    losing_trades = 0
-    win_rate = 0.0
-    total_pnl_pct = 0.0
-    avg_pnl_pct = 0.0
+                if entry_triggered:
+                    stop_loss = round(min(shakeout_low, entry_price * 0.95), 2)  # Max 5% SL
+                    risk_per_share = entry_price - stop_loss
 
-# 3. Export to Google Sheet (`Backtest_Results` tab)
-ws_backtest = get_or_create_worksheet("Backtest_Results")
-ws_backtest.clear()
-
-if total_trades > 0:
-    summary_header = [
-        f"Total Trades: {total_trades}", 
-        f"Win Rate: {win_rate}%", 
-        f"Winning: {winning_trades}", 
-        f"Losing: {losing_trades}", 
-        f"Total PnL: {total_pnl_pct}%", 
-        f"Avg PnL: {avg_pnl_pct}%", 
-        f"Total Rupee PnL: ₹{total_rupee_pnl}", "", "", "", "", ""
-    ]
-    ws_backtest.append_row(summary_header, value_input_option="USER_ENTERED")
-    ws_backtest.append_row([], value_input_option="USER_ENTERED")
-
-    headers = [
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "PnL_Pct", "Rupee_PnL", "RS_Score", "TradingView_Chart"
-    ]
-    ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
-    ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ Max High Breakout results successfully exported to Google Sheet!")
-else:
-    ws_backtest.append_row(["No historical trades matched the criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
-    print("ℹ️ No historical trades matched the criteria.")
-    
+                    if risk_per_share
+                    
