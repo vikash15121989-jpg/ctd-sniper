@@ -5,7 +5,7 @@ from datetime import datetime
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print(f"=== TRUE DELIVERY & SMART MONEY FLOW SCANNER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
+print(f"=== INSTITUTIONAL FLOW SNIPER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
 
 gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
 sh = gc.open("CTD_Sniper")
@@ -19,10 +19,8 @@ for sym in STOCKS:
         if len(d) < 100: continue
         if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
         
-        # Indicators
         d['Vol20'] = d['Volume'].rolling(20).mean()
         d['SMA50'] = d['Close'].rolling(50).mean()
-        d['SMA20'] = d['Close'].rolling(20).mean()
         
         i = 50
         n_rows = len(d)
@@ -30,7 +28,6 @@ for sym in STOCKS:
             close = d['Close'].iloc[i]
             high = d['High'].iloc[i]
             low = d['Low'].iloc[i]
-            open_p = d['Open'].iloc[i]
             vol = d['Volume'].iloc[i]
             vol_ma = d['Vol20'].iloc[i]
             sma50 = d['SMA50'].iloc[i]
@@ -39,41 +36,40 @@ for sym in STOCKS:
                 i += 1
                 continue
             
-            # --- DELIVERY ACCUMULATION PROXY LOGIC ---
-            # 1. Volume Surge: Volume 20-day average se kam se kam 1.5x ho
-            vol_spike = vol >= (1.5 * vol_ma)
+            # 1. Base Dry Volume Check (Pichle 10 dino mein volume shaant tha)
+            prior_vol_avg = d['Volume'].iloc[i-10:i].mean()
+            vol_compression = prior_vol_avg <= (1.2 * vol_ma)
             
-            # 2. Strong Delivery Close: Close din ke High ke bilkul paas ho (Top 15% range)
+            # 2. Institutional Explosion (Volume 2.5x + Close near High > 88%)
+            vol_surge = vol >= (2.5 * vol_ma)
             day_range = high - low
             range_pos = (close - low) / day_range if day_range > 0 else 0
-            delivery_close = range_pos >= 0.85
+            clean_close = range_pos >= 0.88
             
-            # 3. Tight Body / Absorption: Candle body choti ho ya strong bullish ho, lekin price ne rejection na diya ho
-            body_size = abs(close - open_p) / open_p * 100
+            # 3. Structural Strength (Above SMA50 & 20-Day High Breakout)
+            max_20d_high = d['High'].iloc[i-20:i].max()
+            breakout = close >= max_20d_high
+            trend = close > sma50
             
-            # 4. Trend Filter: Price 50 SMA ke upar ho
-            trend_ok = close > sma50
-            
-            if vol_spike and delivery_close and trend_ok:
+            if vol_surge and clean_close and breakout and trend and vol_compression:
                 entry = close
                 min_low = d['Low'].iloc[i-5:i].min()
                 sl = min_low * 0.98
                 risk = (entry - sl) / entry * 100
                 
-                # Risk guardrail: 1.5% se 5.5% tak ka risk
-                if not (1.5 <= risk <= 5.5):
+                if not (1.5 <= risk <= 6.0):
                     i += 1
                     continue
                 
-                # Forward 15-day simulation for 6% target
-                future = d.iloc[i+1:i+16]
+                # 20-day horizon for 8% target
+                future = d.iloc[i+1:i+21]
                 hit = False
                 days_taken = 0
                 
                 for idx, (_, r) in enumerate(future.iterrows(), 1):
                     if r['Low'] <= sl: 
                         break
-                    if r['High'] >= entry * 1.06:
+                    if r['High'] >= entry * 1.08:
                         hit = True
                         days_taken = idx
                         break
@@ -87,25 +83,25 @@ for sym in STOCKS:
                     days_taken
                 ])
                 
-                i += max(days_taken, 12)
+                i += max(days_taken, 15)
             else:
                 i += 1
     except Exception as e:
         continue
 
-df = pd.DataFrame(trades, columns=["Stock", "Date", "Entry", "Risk%", "Hit_6%", "Days"])
+df = pd.DataFrame(trades, columns=["Stock", "Date", "Entry", "Risk%", "Hit_8%", "Days"])
 if len(df) > 0:
-    win = df['Hit_6%'].sum() / len(df) * 100
-    avg_days = df[df['Hit_6%']]['Days'].mean() if win > 0 else 0
-    print(f"\nDELIVERY PROXY SCANNER RESULTS: Total {len(df)} | 6% Win {win:.1f}% | Avg Days {avg_days:.1f}")
+    win = df['Hit_8%'].sum() / len(df) * 100
+    avg_days = df[df['Hit_8%']]['Days'].mean() if win > 0 else 0
+    print(f"\nINSTITUTIONAL FLOW SCANNER: Total {len(df)} | 8% Win {win:.1f}% | Avg Days {avg_days:.1f}")
     print(df.tail(20).to_string(index=False))
     
-    ws = sh.worksheet("DELIVERY_FLOW") if "DELIVERY_FLOW" in [x.title for x in sh.worksheets()] else sh.add_worksheet("DELIVERY_FLOW", 5000, 10)
+    ws = sh.worksheet("SMART_FLOW_VCP") if "SMART_FLOW_VCP" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SMART_FLOW_VCP", 5000, 10)
     ws.clear()
-    ws.append_row([f"Delivery Proxy Flow Scanner | Total {len(df)} | Win {win:.1f}% | Avg {avg_days:.1f}d | {datetime.now(IST).strftime('%d-%b')}"])
-    ws.append_row(["Stock", "Date", "Entry", "Risk%", "Hit_6%", "Days"])
+    ws.append_row([f"Institutional VCP Flow | Total {len(df)} | Win {win:.1f}% | Avg {avg_days:.1f}d | {datetime.now(IST).strftime('%d-%b')}"])
+    ws.append_row(["Stock", "Date", "Entry", "Risk%", "Hit_8%", "Days"])
     ws.append_rows(df.sort_values("Date", ascending=False).values.tolist())
-    print("✅ Results successfully exported to Google Sheet!")
+    print("✅ Results exported to Google Sheet!")
 else:
-    print("No trades found matching delivery accumulation criteria.")
+    print("No clean institutional setups found.")
     
