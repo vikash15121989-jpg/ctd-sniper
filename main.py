@@ -1,21 +1,31 @@
 import yfinance as yf
+import gspread, json, os, math
 import pandas as pd
 from datetime import datetime
+import pytz
 
-print("=== STARTING LOCAL TRANSITION LAUNCHPAD BACKTEST ===")
+IST = pytz.timezone("Asia/Kolkata")
+print(f"=== TRUE FLOAT TURNOVER & DELIVERY FLOW SCANNER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
 
-# Aap apniwatchlist ke kuch stocks yahan daal kar local test kar sakte hain
-STOCKS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "LT.NS", "SBIN.NS", "AXISBANK.NS", "ICICIBANK.NS", "TITAN.NS"]
+gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
+sh = gc.open("CTD_Sniper")
+raw = sh.worksheet("Watchlist").col_values(1)
+STOCKS = [s.strip().upper()+".NS" for s in raw if s and len(s.strip())>2 and s.upper() not in ["STOCK","SYMBOL"]][:100]
 
-all_trades = []
-
+trades=[]
 for sym in STOCKS:
     try:
-        print(f"Backtesting {sym}...")
-        d = yf.Ticker(sym).history(period="1y", auto_adjust=True)
+        t = yf.Ticker(sym)
+        d = t.history(period="1y", auto_adjust=True)
         if len(d) < 100: continue
         if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
         
+        # Get total shares outstanding for turnover calculation
+        info = t.info
+        shares_out = info.get('sharesOutstanding', None)
+        if not shares_out or shares_out == 0:
+            shares_out = d['Volume'].mean() * 100
+            
         d['Vol20'] = d['Volume'].rolling(20).mean()
         d['SMA50'] = d['Close'].rolling(50).mean()
         
@@ -33,67 +43,51 @@ for sym in STOCKS:
                 i += 1
                 continue
             
-            # 1. Accumulation Base (Last 15 days tight range <= 10%)
-            max_15d = d['High'].iloc[i-15:i].max()
-            min_15d = d['Low'].iloc[i-15:i].min()
-            tight_base = ((max_15d - min_15d) / min_15d) <= 0.10
+            # 1. Free Float Turnover %: Daily volume vs Total Shares
+            turnover_pct = (vol / shares_out) * 100
             
-            # 2. Transition Launchpad Push
-            vol_push = vol >= (3.0 * vol_ma)
-            breakout_trigger = close >= max_15d
+            # Heavy institutional delivery condition (High turnover + volume spike)
+            heavy_turnover = turnover_pct >= 0.4 or vol >= (2.5 * vol_ma)
             
-            # 3. Clean Delivery Close (Top 15% of day range)
+            # 2. Clean Delivery Close (Top 18% of day range - no selling pressure)
             day_range = high - low
             range_pos = (close - low) / day_range if day_range > 0 else 0
-            clean_close = range_pos >= 0.85
+            delivery_close = range_pos >= 0.82
             
-            # 4. Trend Filter
+            # 3. Trend Filter
             trend_ok = close > sma50
             
-            if tight_base and vol_push and breakout_trigger and clean_close and trend_ok:
+            if heavy_turnover and delivery_close and trend_ok:
                 entry = close
-                sl = min_15d * 0.98
-                risk_pct = (entry - sl) / entry * 100
+                min_low = d['Low'].iloc[i-5:i].min()
+                sl = min_low * 0.98
+                risk = (entry - sl) / entry * 100
                 
-                if not (1.5 <= risk_pct <= 6.0):
+                if not (1.5 <= risk <= 6.0):
                     i += 1
                     continue
                 
-                # Forward 15-day simulation for 7% Target
+                # Forward 15-day simulation for 7% target
                 future = d.iloc[i+1:i+16]
-                hit_target = False
-                hit_sl = False
-                exit_price = entry
+                hit = False
                 days_taken = 0
                 
                 for idx, (_, r) in enumerate(future.iterrows(), 1):
-                    if r['Low'] <= sl:
-                        hit_sl = True
-                        exit_price = sl
-                        days_taken = idx
+                    if r['Low'] <= sl: 
                         break
                     if r['High'] >= entry * 1.07:
-                        hit_target = True
-                        exit_price = entry * 1.07
+                        hit = True
                         days_taken = idx
                         break
                 
-                if not hit_target and not hit_sl:
-                    # Exit at close of 15th day if neither hit
-                    exit_price = future.iloc[-1]['Close']
-                    days_taken = 15
-                
-                pnl_pct = (exit_price - entry) / entry * 100
-                
-                all_trades.append({
-                    "Stock": sym.replace(".NS", ""),
-                    "Date": d.index[i].strftime('%Y-%m-%d'),
-                    "Entry": round(entry, 2),
-                    "Risk%": round(risk_pct, 2),
-                    "Target_Hit": hit_target,
-                    "PnL%": round(pnl_pct, 2),
-                    "Days": days_taken
-                })
+                trades.append([
+                    sym.replace(".NS",""), 
+                    d.index[i].strftime('%Y-%m-%d'), 
+                    round(entry, 2),
+                    round(risk, 2),
+                    hit, 
+                    days_taken
+                ])
                 
                 i += max(days_taken, 12)
             else:
@@ -101,24 +95,19 @@ for sym in STOCKS:
     except Exception as e:
         continue
 
-# Backtest Performance Summary
-df_res = pd.DataFrame(all_trades)
-if len(df_res) > 0:
-    total_trades = len(df_res)
-    winning_trades = df_res['Target_Hit'].sum()
-    win_rate = (winning_trades / total_trades) * 100
-    avg_pnl = df_res['PnL%'].mean()
+df = pd.DataFrame(trades, columns=["Stock", "Date", "Entry", "Risk%", "Hit_7%", "Days"])
+if len(df) > 0:
+    win = df['Hit_7%'].sum() / len(df) * 100
+    avg_days = df[df['Hit_7%']]['Days'].mean() if win > 0 else 0
+    print(f"\nFLOAT TURNOVER SCANNER: Total {len(df)} | 7% Win {win:.1f}% | Avg Days {avg_days:.1f}")
+    print(df.tail(20).to_string(index=False))
     
-    print("\n" + "="*40)
-    print("       BACKTEST PERFORMANCE REPORT       ")
-    print("="*40)
-    print(f"Total Trades Executed : {total_trades}")
-    print(f"Winning Trades (7%)   : {winning_trades}")
-    print(f"Win Rate              : {win_rate:.2f}%")
-    print(f"Average PnL per Trade : {avg_pnl:.2f}%")
-    print("="*40)
-    print("\nDetailed Trade Log:")
-    print(df_res.to_string(index=False))
+    ws = sh.worksheet("FLOAT_TURNOVER") if "FLOAT_TURNOVER" in [x.title for x in sh.worksheets()] else sh.add_worksheet("FLOAT_TURNOVER", 5000, 10)
+    ws.clear()
+    ws.append_row([f"Float Turnover Flow | Total {len(df)} | Win {win:.1f}% | Avg {avg_days:.1f}d | {datetime.now(IST).strftime('%d-%b')}"])
+    ws.append_row(["Stock", "Date", "Entry", "Risk%", "Hit_7%", "Days"])
+    ws.append_rows(df.sort_values("Date", ascending=False).values.tolist())
+    print("✅ Results exported to Google Sheet!")
 else:
-    print("No trades triggered during backtest.")
+    print("No float turnover accumulation setups found.")
     
