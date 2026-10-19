@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [RSI DIVERGENCE + VOLUME DRY BOX BREAKOUT BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [INSTITUTIONAL OPTIMIZED BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -57,15 +57,16 @@ for s in raw_stocks:
         STOCKS.append(clean_s)
 
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
-print(f"📥 Loaded {len(clean_stocks)} stocks from Google Sheet Watchlist...", flush=True)
+print(f"📥 Loaded {len(clean_stocks)} stocks from Watchlist...", flush=True)
 
-# Helper function to calculate RSI
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+# Fetch Nifty Data
+try:
+    nifty_df = yf.download("^NSEI", start="2024-01-01", end="2026-10-01", auto_adjust=False, progress=False)
+    if isinstance(nifty_df.columns, pd.MultiIndex):
+        nifty_df = nifty_df.xs("^NSEI", level=1, axis=1)
+except Exception as e:
+    print(f"❌ Nifty Fetch Error: {e}")
+    exit(1)
 
 all_backtest_trades = []
 TOTAL_CAPITAL = 1000000  # 10 Lakh Capital
@@ -82,57 +83,61 @@ for symbol in clean_stocks:
         if df.empty or len(df) < 100:
             continue
 
-        df['RSI'] = calculate_rsi(df['Close'], 14)
+        df['20_EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['50_EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
         df['Vol_20_MA'] = df['Volume'].rolling(window=20).mean()
         df['Turnover'] = df['Close'] * df['Volume']
 
-        i = 30
+        combined = pd.DataFrame({'Stock': df['Close'], 'Nifty': nifty_df['Close']}).dropna()
+        rel_ratio = combined['Stock'] / combined['Nifty']
+        base_ma = rel_ratio.rolling(window=50).mean()
+        df['RS'] = ((rel_ratio / base_ma) - 1) * 100
+        df = df.reindex(combined.index).dropna()
+
+        i = 50
         while i < len(df) - 15:
             hist = df.iloc[:i+1]
             
-            # Liquidity Filter (Min 15 Cr turnover)
+            latest_close = hist['Close'].iloc[-1]
+            latest_20_ema = hist['20_EMA'].iloc[-1]
+            latest_50_ema = hist['50_EMA'].iloc[-1]
+            latest_vol = hist['Volume'].iloc[-1]
+            avg_vol_20 = hist['Vol_20_MA'].iloc[-1]
+            latest_rs = hist['RS'].iloc[-1]
             avg_turnover = hist['Turnover'].iloc[-20:].mean()
+
+            # Liquidity Filter (Min 15 Cr turnover)
             if avg_turnover < 150000000:
                 i += 1
                 continue
 
-            # 1. 10-Day Box (Consolidation Range)
-            box_slice = hist.iloc[-11:-1] # Previous 10 days before breakout day
+            # Trend & RS Filters
+            is_uptrend = (latest_20_ema > latest_50_ema) and (latest_close > latest_20_ema)
+            is_rs_strong = latest_rs >= 10.0
+
+            # 10-Day Consolidation Box
+            box_slice = hist.iloc[-11:-1]
             box_high = box_slice['High'].max()
             box_low = box_slice['Low'].min()
             box_height = box_high - box_low
             box_height_pct = (box_height / box_low) * 100
 
-            # Filter box: too tight or too wide invalid
-            if box_height_pct < 1.0 or box_height_pct > 15.0:
+            if box_height_pct < 1.0 or box_height_pct > 12.0:
                 i += 1
                 continue
 
-            # 2. Volume Dry-up inside the Box (Average volume of box should be lower than overall 20 MA)
-            box_avg_vol = box_slice['Volume'].mean()
-            current_vol_ma = hist['Vol_20_MA'].iloc[-2]
-            is_volume_dry = box_avg_vol < (0.8 * current_vol_ma)
+            # Breakout + Volume Surge (2.5x)
+            is_breakout = (latest_close > box_high) and (latest_vol >= 2.5 * avg_vol_20)
 
-            # 3. RSI Divergence Check (Simplified: Price made lower low in box, but RSI made higher low)
-            rsi_slice = box_slice['RSI']
-            price_slice = box_slice['Close']
-            # Check if recent part of box has rising RSI while price was flat/dipping
-            is_rsi_divergence = (rsi_slice.iloc[-1] > rsi_slice.iloc[0]) and (price_slice.iloc[-1] <= price_slice.iloc[0] * 1.02)
-
-            # 4. Breakout Condition: Today's Close > Box High AND Volume >= 2.5x Box Average Volume
-            latest_close = hist['Close'].iloc[-1]
-            latest_vol = hist['Volume'].iloc[-1]
-            is_breakout = (latest_close > box_high) and (latest_vol >= 2.5 * box_avg_vol) and is_volume_dry and is_rsi_divergence
-
-            if is_breakout:
+            if is_uptrend and is_rs_strong and is_breakout:
                 entry_date = df.index[i]
                 entry_price = latest_close
                 
                 # Stop-Loss: Box Low
                 stop_loss = round(box_low, 2)
                 
-                # Target: Box Height added to Entry Price (1:1 or greater reward based on box size)
-                target_price = round(entry_price + box_height, 2)
+                # Target: 1.5x Box Height for better Risk-to-Reward ratio
+                target_price = round(entry_price + (1.5 * box_height), 2)
                 
                 risk_per_share = entry_price - stop_loss
                 if risk_per_share <= 0:
@@ -141,7 +146,7 @@ for symbol in clean_stocks:
 
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
                 
-                # Forward Simulation (Max 15 days time-stop or Target/SL hit)
+                # Forward Simulation (Max 15 days time-stop)
                 future_df = df.iloc[i+1:]
                 if future_df.empty:
                     i += 1
@@ -159,17 +164,17 @@ for symbol in clean_stocks:
 
                     if day_low <= stop_loss:
                         exit_price = stop_loss
-                        exit_reason = "SL Hit (Box Low)"
+                        exit_reason = "SL Hit"
                         days_in_trade = f_idx + 1
                         break
                     elif day_high >= target_price:
                         exit_price = target_price
-                        exit_reason = "Target Hit (Box Height)"
+                        exit_reason = "Target Hit (1.5x R:R)"
                         days_in_trade = f_idx + 1
                         break
                     elif f_idx == max_hold_days - 1:
                         exit_price = day_close
-                        exit_reason = "Time Exit (15 Days)"
+                        exit_reason = "Time Exit"
                         days_in_trade = f_idx + 1
                         break
 
@@ -217,7 +222,7 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("      RSI BOX BREAKOUT BACKTEST RESULTS")
+    print("   OPTIMIZED INSTITUTIONAL BACKTEST RESULTS")
     print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
@@ -251,5 +256,5 @@ if total_trades > 0:
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ RSI Box Breakout backtest results successfully exported to Google Sheet!")
+    print("✅ Optimized backtest results successfully exported to Google Sheet!")
     
