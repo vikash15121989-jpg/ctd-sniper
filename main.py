@@ -5,7 +5,7 @@ from datetime import datetime
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print(f"=== INSTITUTIONAL FLOW SNIPER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
+print(f"=== TRANSITION LAUNCHPAD SCANNER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
 
 gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
 sh = gc.open("CTD_Sniper")
@@ -36,40 +36,41 @@ for sym in STOCKS:
                 i += 1
                 continue
             
-            # 1. Base Dry Volume Check (Pichle 10 dino mein volume shaant tha)
-            prior_vol_avg = d['Volume'].iloc[i-10:i].mean()
-            vol_compression = prior_vol_avg <= (1.2 * vol_ma)
+            # 1. Prior Base / Accumulation Phase: Last 15 days range was tight (max 10% span)
+            max_15d = d['High'].iloc[i-15:i].max()
+            min_15d = d['Low'].iloc[i-15:i].min()
+            tight_base = ((max_15d - min_15d) / min_15d) <= 0.10
             
-            # 2. Institutional Explosion (Volume 2.5x + Close near High > 88%)
-            vol_surge = vol >= (2.5 * vol_ma)
+            # 2. Transition Push (The Launchpad): Volume is 3x+ of average, breaking out of the 15-day range
+            vol_push = vol >= (3.0 * vol_ma)
+            breakout_trigger = close >= max_15d
+            
+            # 3. Clean Delivery Close: Close near day's high (Top 15%)
             day_range = high - low
             range_pos = (close - low) / day_range if day_range > 0 else 0
-            clean_close = range_pos >= 0.88
+            clean_close = range_pos >= 0.85
             
-            # 3. Structural Strength (Above SMA50 & 20-Day High Breakout)
-            max_20d_high = d['High'].iloc[i-20:i].max()
-            breakout = close >= max_20d_high
-            trend = close > sma50
+            # 4. Trend Filter: Above SMA50
+            trend_ok = close > sma50
             
-            if vol_surge and clean_close and breakout and trend and vol_compression:
+            if tight_base and vol_push and breakout_trigger and clean_close and trend_ok:
                 entry = close
-                min_low = d['Low'].iloc[i-5:i].min()
-                sl = min_low * 0.98
+                sl = min_15d * 0.98  # Stop loss just below the base
                 risk = (entry - sl) / entry * 100
                 
                 if not (1.5 <= risk <= 6.0):
                     i += 1
                     continue
                 
-                # 20-day horizon for 8% target
-                future = d.iloc[i+1:i+21]
+                # Forward 15-day simulation for 7% target
+                future = d.iloc[i+1:i+16]
                 hit = False
                 days_taken = 0
                 
                 for idx, (_, r) in enumerate(future.iterrows(), 1):
                     if r['Low'] <= sl: 
                         break
-                    if r['High'] >= entry * 1.08:
+                    if r['High'] >= entry * 1.07:
                         hit = True
                         days_taken = idx
                         break
@@ -83,25 +84,25 @@ for sym in STOCKS:
                     days_taken
                 ])
                 
-                i += max(days_taken, 15)
+                i += max(days_taken, 12)
             else:
                 i += 1
     except Exception as e:
         continue
 
-df = pd.DataFrame(trades, columns=["Stock", "Date", "Entry", "Risk%", "Hit_8%", "Days"])
+df = pd.DataFrame(trades, columns=["Stock", "Date", "Entry", "Risk%", "Hit_7%", "Days"])
 if len(df) > 0:
-    win = df['Hit_8%'].sum() / len(df) * 100
-    avg_days = df[df['Hit_8%']]['Days'].mean() if win > 0 else 0
-    print(f"\nINSTITUTIONAL FLOW SCANNER: Total {len(df)} | 8% Win {win:.1f}% | Avg Days {avg_days:.1f}")
+    win = df['Hit_7%'].sum() / len(df) * 100
+    avg_days = df[df['Hit_7%']]['Days'].mean() if win > 0 else 0
+    print(f"\nLAUNCHPAD TRANSITION SCANNER: Total {len(df)} | 7% Win {win:.1f}% | Avg Days {avg_days:.1f}")
     print(df.tail(20).to_string(index=False))
     
-    ws = sh.worksheet("SMART_FLOW_VCP") if "SMART_FLOW_VCP" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SMART_FLOW_VCP", 5000, 10)
+    ws = sh.worksheet("LAUNCHPAD_TRANSITION") if "LAUNCHPAD_TRANSITION" in [x.title for x in sh.worksheets()] else sh.add_worksheet("LAUNCHPAD_TRANSITION", 5000, 10)
     ws.clear()
-    ws.append_row([f"Institutional VCP Flow | Total {len(df)} | Win {win:.1f}% | Avg {avg_days:.1f}d | {datetime.now(IST).strftime('%d-%b')}"])
-    ws.append_row(["Stock", "Date", "Entry", "Risk%", "Hit_8%", "Days"])
+    ws.append_row([f"Launchpad Transition | Total {len(df)} | Win {win:.1f}% | Avg {avg_days:.1f}d | {datetime.now(IST).strftime('%d-%b')}"])
+    ws.append_row(["Stock", "Date", "Entry", "Risk%", "Hit_7%", "Days"])
     ws.append_rows(df.sort_values("Date", ascending=False).values.tolist())
     print("✅ Results exported to Google Sheet!")
 else:
-    print("No clean institutional setups found.")
+    print("No transition launchpad setups found.")
     
