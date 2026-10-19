@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [WEEKLY SHAKEOUT -> NEXT WEEK DAILY MAX VOL BREAKOUT] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [EMA PULLBACK + BULLISH CANDLESTICK BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -59,6 +59,15 @@ for s in raw_stocks:
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
 print(f"📥 Loaded {len(clean_stocks)} stocks from Watchlist...", flush=True)
 
+# Fetch Nifty Data for RS calculation
+try:
+    nifty_df = yf.download("^NSEI", start="2024-01-01", end="2026-10-01", auto_adjust=False, progress=False)
+    if isinstance(nifty_df.columns, pd.MultiIndex):
+        nifty_df = nifty_df.xs("^NSEI", level=1, axis=1)
+except Exception as e:
+    print(f"❌ Nifty Fetch Error: {e}")
+    exit(1)
+
 all_backtest_trades = []
 TOTAL_CAPITAL = 1000000  # 10 Lakh Capital
 RISK_PER_TRADE_PCT = 0.01  # 1% Risk per trade
@@ -74,73 +83,83 @@ for symbol in clean_stocks:
         if df.empty or len(df) < 120:
             continue
 
+        df['20_EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['50_EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
         df['Turnover'] = df['Close'] * df['Volume']
 
-        # Weekly Resample Data
-        weekly_df = df.resample('W').agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }).dropna()
-        
-        weekly_df['20_EMA'] = weekly_df['Close'].ewm(span=20, adjust=False).mean()
+        # Relative Strength calculation
+        combined = pd.DataFrame({'Stock': df['Close'], 'Nifty': nifty_df['Close']}).dropna()
+        rel_ratio = combined['Stock'] / combined['Nifty']
+        base_ma = rel_ratio.rolling(window=50).mean()
+        df['RS'] = ((rel_ratio / base_ma) - 1) * 100
+        df = df.reindex(combined.index).dropna()
 
         i = 60
         while i < len(df) - 15:
             hist_daily = df.iloc[:i+1]
             current_date = df.index[i]
             
-            # Liquidity Filter (Min 15 Cr turnover)
+            # Liquidity Filter: Min ₹8 Cr to Max ₹25 Cr Daily Turnover
             avg_turnover = hist_daily['Turnover'].iloc[-20:].mean()
-            if avg_turnover < 150000000:
+            if avg_turnover < 80000000 or avg_turnover > 250000000:
                 i += 1
                 continue
 
-            # Get weekly data up to current date
-            hist_weekly = weekly_df[weekly_df.index <= current_date]
-            if len(hist_weekly) < 15:
+            # Check Relative Strength (RS >= 10.0)
+            latest_rs = hist_daily['RS'].iloc[-1]
+            if latest_rs < 10.0:
                 i += 1
                 continue
 
-            # 1. Check if PREVIOUS week had a Shakeout (Low < 20 EMA)
-            prev_week = hist_weekly.iloc[-2]
-            is_prev_week_shakeout = prev_week['Low'] < prev_week['20_EMA']
+            # Current and previous candle data for pattern identification
+            curr = hist_daily.iloc[-1]
+            prev = hist_daily.iloc[-2]
 
-            if not is_prev_week_shakeout:
+            c_open, c_high, c_low, c_close = curr['Open'], curr['High'], curr['Low'], curr['Close']
+            p_open, p_close = prev['Open'], prev['Close']
+            ema_20 = curr['20_EMA']
+            ema_50 = curr['50_EMA']
+
+            # 1. Pullback Condition: Price is near 20 EMA or 50 EMA (within 2% range)
+            near_20ema = abs(c_close - ema_20) / ema_20 <= 0.02
+            near_50ema = abs(c_close - ema_50) / ema_50 <= 0.02
+            is_pullback = near_20ema or near_50ema
+
+            if not is_pullback:
                 i += 1
                 continue
 
-            # 2. In the current daily timeframe (following week/days):
-            box_slice = hist_daily.iloc[-11:-1]
-            prev_10_max_vol = box_slice['Volume'].max()
-            prev_10_max_high = box_slice['High'].max()
-            prev_10_min_low = box_slice['Low'].min()
+            # 2. Bullish Candlestick Pattern Identification
+            body = abs(c_close - c_open)
+            total_range = c_high - c_low
+            if total_range == 0:
+                i += 1
+                continue
 
-            latest_vol = hist_daily['Volume'].iloc[-1]
-            latest_close = hist_daily['Close'].iloc[-1]
+            lower_wick = min(c_open, c_close) - c_low
+            upper_wick = c_high - max(c_open, c_close)
 
-            # Volume greater than 10-day max volume AND Breakout above 10-day max high
-            has_max_vol = latest_vol > prev_10_max_vol
-            is_breakout = latest_close > prev_10_max_high
+            # Hammer Definition: Small body at the top, long lower wick (at least 2x body), short upper wick
+            is_hammer = (c_close > c_open) and (lower_wick >= 2 * body) and (upper_wick < body * 0.5)
 
-            if has_max_vol and is_breakout:
+            # Bullish Engulfing Definition: Previous candle was red, current candle is green and completely engulfs previous body
+            is_engulfing = (p_close < p_open) and (c_close > c_open) and (c_open <= p_close) and (c_close >= p_open)
+
+            if is_hammer or is_engulfing:
                 entry_date = current_date
-                entry_price = latest_close
+                entry_price = c_close
                 
-                # Stop-Loss: 10-day box low
-                stop_loss = round(prev_10_min_low, 2)
-                box_height = entry_price - stop_loss
+                # Stop-Loss: Low of the signal candle
+                stop_loss = round(c_low, 2)
+                risk_per_share = entry_price - stop_loss
                 
-                if box_height <= 0:
+                if risk_per_share <= 0:
                     i += 1
                     continue
 
-                # Target: 1.5x Risk-to-Reward
-                target_price = round(entry_price + (1.5 * box_height), 2)
+                # Target: Minimum 10% target or 2x Risk-to-Reward
+                target_price = round(max(entry_price * 1.10, entry_price + (2.0 * risk_per_share)), 2)
                 
-                risk_per_share = entry_price - stop_loss
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
                 
                 # Forward Simulation (Max 15 days time-stop)
@@ -166,7 +185,7 @@ for symbol in clean_stocks:
                         break
                     elif day_high >= target_price:
                         exit_price = target_price
-                        exit_reason = "Target Hit (1.5x)"
+                        exit_reason = "Target Hit (10%+)"
                         days_in_trade = f_idx + 1
                         break
                     elif f_idx == max_hold_days - 1:
@@ -179,10 +198,12 @@ for symbol in clean_stocks:
                     pnl_pct = round(((exit_price - entry_price) / entry_price) * 100, 2)
                     trade_rupee_pnl = round(shares_quantity * (exit_price - entry_price), 2)
                     chart_link = f'=HYPERLINK("https://in.tradingview.com/chart/?symbol=NSE:{stock_clean}", "📊 Chart")'
+                    pattern_name = "Hammer" if is_hammer else "Bullish Engulfing"
 
                     all_backtest_trades.append([
                         stock_clean,
                         entry_date.strftime('%Y-%m-%d'),
+                        pattern_name,
                         round(entry_price, 2),
                         round(stop_loss, 2),
                         round(target_price, 2),
@@ -192,10 +213,10 @@ for symbol in clean_stocks:
                         days_in_trade,
                         pnl_pct,
                         trade_rupee_pnl,
-                        round((box_height/entry_price)*100, 2),
                         chart_link
                     ])
-                    i += days_in_trade
+                    # Skip ahead to space out trades per stock
+                    i += max(days_in_trade, 15)
                 else:
                     i += 1
             else:
@@ -207,8 +228,8 @@ for symbol in clean_stocks:
 total_trades = len(all_backtest_trades)
 if total_trades > 0:
     df_results = pd.DataFrame(all_backtest_trades, columns=[
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Risk_Pct", "TradingView_Chart"
+        "Stock", "Entry_Date", "Pattern", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
+        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "TradingView_Chart"
     ])
     
     winning_trades = len(df_results[df_results['PnL_Pct'] > 0])
@@ -219,7 +240,7 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("   WEEKLY SHAKEOUT -> DAILY MAX VOL + BREAKOUT RESULTS")
+    print("   EMA PULLBACK + CANDLESTICK BACKTEST RESULTS")
     print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
@@ -248,10 +269,10 @@ if total_trades > 0:
     ws_backtest.append_row([], value_input_option="USER_ENTERED")
 
     headers = [
-        "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Risk_Pct", "TradingView_Chart"
+        "Stock", "Entry_Date", "Pattern", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
+        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "TradingView_Chart"
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ Backtest results successfully exported to Google Sheet!")
+    print("✅ EMA Pullback candlestick backtest results successfully exported to Google Sheet!")
     
