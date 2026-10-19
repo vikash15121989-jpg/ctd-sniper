@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [CTD_SNIPER: REALISTIC LIVE-LOGIC BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [CTD_SNIPER: INSTITUTIONAL SHAKEOT & SPRING SNIPER] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -121,25 +121,25 @@ for symbol in clean_stocks:
             # 2. Trend Filter: 20 EMA > 50 EMA and Price above 20 EMA
             is_uptrend = (latest_20_ema > latest_50_ema) and (latest_close > latest_20_ema)
 
-            # 3. Shakeout Check: Price dipped below 20 EMA within last 12 days and reclaimed
+            # 3. SHAKEOUT PATTERN: Price dipped below 20 EMA within last 12 days and successfully reclaimed
             recent_lows = hist['Low'].iloc[-12:-1]
             recent_20_emas = hist['20_EMA'].iloc[-12:-1]
             had_shakeout = any(recent_lows < recent_20_emas)
 
-            # 4. 20-DAY HIGH & VOLUME SURGE (3.0x 20-MA)
+            # 4. INSTITUTIONAL SPRING / VOLUME SURGE: 20-Day Max Volume & Close > 20-Day Max High
             prev_20_max_vol = hist['Volume'].iloc[-21:-1].max()
             prev_20_max_high = hist['High'].iloc[-21:-1].max()
 
             is_volume_spike = (latest_vol > prev_20_max_vol) and (latest_vol >= 3.0 * avg_vol_20)
             is_close_above_max_high = latest_close > prev_20_max_high
 
-            # 5. HIGH RELATIVE STRENGTH: Mansfield RS >= 12.0
+            # 5. ELITE MANSFIELD RS >= 12.0
             is_rs_elite = latest_rs >= 12.0
 
             if is_uptrend and had_shakeout and is_volume_spike and is_close_above_max_high and is_rs_elite:
                 shakeout_low = hist['Low'].iloc[-12:].min()
                 
-                # PULLBACK & RE-TEST ENTRY LOGIC
+                # PULLBACK & RE-TEST ENTRY CONFIRMATION
                 forward_window = df.iloc[i+1 : i+11]
                 entry_triggered = False
                 entry_date = None
@@ -170,7 +170,7 @@ for symbol in clean_stocks:
                         continue
 
                     shares_quantity = int(allowed_rupee_risk / risk_per_share)
-                    target_price = round(entry_price + (2.5 * risk_per_share), 2)  # 2.5x Risk Target
+                    target_price = round(entry_price + (2.5 * risk_per_share), 2)  # 2.5x R:R Target
 
                     future_df = df.iloc[entry_idx_in_df + 1 : entry_idx_in_df + 31]
                     if future_df.empty:
@@ -215,7 +215,6 @@ for symbol in clean_stocks:
                         chart_link_formula
                     ])
                     
-                    # No Artificial Cooldown: Move index past the trade duration only
                     i = entry_idx_in_df + days_in_trade
                 else:
                     i += 10
@@ -241,7 +240,7 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("     NO-COOLDOWN REALISTIC SNIPER BACKTEST SUMMARY")
+    print("     INSTITUTIONAL SHAKEOUT & SPRING BACKTEST SUMMARY")
     print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
@@ -281,7 +280,7 @@ if total_trades > 0:
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ No-cooldown backtest results successfully exported to Google Sheet!")
+    print("✅ Institutional Spring results successfully exported to Google Sheet!")
 else:
     ws_backtest.append_row(["No historical trades matched the criteria.", "", "", "", "", "", "", "", "", "", "", ""], value_input_option="USER_ENTERED")
     print("ℹ️ No historical trades matched the criteria.")
