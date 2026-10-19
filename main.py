@@ -10,7 +10,7 @@ import yfinance as yf
 # IST Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 now = datetime.now(IST)
-print(f"=== [INSTITUTIONAL OPTIMIZED BACKTEST] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
+print(f"=== [WEEKLY SHAKEOUT -> NEXT WEEK DAILY MAX VOL BREAKOUT] | {now.strftime('%d-%b-%Y %H:%M IST')} ===", flush=True)
 
 def sanitize_value(val):
     if isinstance(val, float):
@@ -41,7 +41,7 @@ ETF_KEYWORDS = ["BEES", "ETF", "GOLD", "SILVER", "NIFTY", "NAV", "LIQUID", "IETF
 def is_etf(s):
     return any(kw in s.upper() for kw in ETF_KEYWORDS)
 
-# 1. Read Watchlist
+# Read Watchlist
 try:
     raw_stocks = sh.worksheet("Watchlist").col_values(1)
 except Exception:
@@ -59,15 +59,6 @@ for s in raw_stocks:
 clean_stocks = list(set([s for s in STOCKS if not is_etf(s.replace(".NS",""))]))
 print(f"📥 Loaded {len(clean_stocks)} stocks from Watchlist...", flush=True)
 
-# Fetch Nifty Data
-try:
-    nifty_df = yf.download("^NSEI", start="2024-01-01", end="2026-10-01", auto_adjust=False, progress=False)
-    if isinstance(nifty_df.columns, pd.MultiIndex):
-        nifty_df = nifty_df.xs("^NSEI", level=1, axis=1)
-except Exception as e:
-    print(f"❌ Nifty Fetch Error: {e}")
-    exit(1)
-
 all_backtest_trades = []
 TOTAL_CAPITAL = 1000000  # 10 Lakh Capital
 RISK_PER_TRADE_PCT = 0.01  # 1% Risk per trade
@@ -80,70 +71,76 @@ for symbol in clean_stocks:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        if df.empty or len(df) < 100:
+        if df.empty or len(df) < 120:
             continue
 
-        df['20_EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['50_EMA'] = df['Close'].ewm(span=50, adjust=False).mean()
-        df['Vol_20_MA'] = df['Volume'].rolling(window=20).mean()
         df['Turnover'] = df['Close'] * df['Volume']
 
-        combined = pd.DataFrame({'Stock': df['Close'], 'Nifty': nifty_df['Close']}).dropna()
-        rel_ratio = combined['Stock'] / combined['Nifty']
-        base_ma = rel_ratio.rolling(window=50).mean()
-        df['RS'] = ((rel_ratio / base_ma) - 1) * 100
-        df = df.reindex(combined.index).dropna()
+        # Weekly Resample Data
+        weekly_df = df.resample('W').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+        
+        weekly_df['20_EMA'] = weekly_df['Close'].ewm(span=20, adjust=False).mean()
 
-        i = 50
+        i = 60
         while i < len(df) - 15:
-            hist = df.iloc[:i+1]
+            hist_daily = df.iloc[:i+1]
+            current_date = df.index[i]
             
-            latest_close = hist['Close'].iloc[-1]
-            latest_20_ema = hist['20_EMA'].iloc[-1]
-            latest_50_ema = hist['50_EMA'].iloc[-1]
-            latest_vol = hist['Volume'].iloc[-1]
-            avg_vol_20 = hist['Vol_20_MA'].iloc[-1]
-            latest_rs = hist['RS'].iloc[-1]
-            avg_turnover = hist['Turnover'].iloc[-20:].mean()
-
             # Liquidity Filter (Min 15 Cr turnover)
+            avg_turnover = hist_daily['Turnover'].iloc[-20:].mean()
             if avg_turnover < 150000000:
                 i += 1
                 continue
 
-            # Trend & RS Filters
-            is_uptrend = (latest_20_ema > latest_50_ema) and (latest_close > latest_20_ema)
-            is_rs_strong = latest_rs >= 10.0
-
-            # 10-Day Consolidation Box
-            box_slice = hist.iloc[-11:-1]
-            box_high = box_slice['High'].max()
-            box_low = box_slice['Low'].min()
-            box_height = box_high - box_low
-            box_height_pct = (box_height / box_low) * 100
-
-            if box_height_pct < 1.0 or box_height_pct > 12.0:
+            # Get weekly data up to current date
+            hist_weekly = weekly_df[weekly_df.index <= current_date]
+            if len(hist_weekly) < 15:
                 i += 1
                 continue
 
-            # Breakout + Volume Surge (2.5x)
-            is_breakout = (latest_close > box_high) and (latest_vol >= 2.5 * avg_vol_20)
+            # 1. Check if PREVIOUS week had a Shakeout (Low < 20 EMA)
+            prev_week = hist_weekly.iloc[-2]
+            is_prev_week_shakeout = prev_week['Low'] < prev_week['20_EMA']
 
-            if is_uptrend and is_rs_strong and is_breakout:
-                entry_date = df.index[i]
+            if not is_prev_week_shakeout:
+                i += 1
+                continue
+
+            # 2. In the current daily timeframe (following week/days):
+            box_slice = hist_daily.iloc[-11:-1]
+            prev_10_max_vol = box_slice['Volume'].max()
+            prev_10_max_high = box_slice['High'].max()
+            prev_10_min_low = box_slice['Low'].min()
+
+            latest_vol = hist_daily['Volume'].iloc[-1]
+            latest_close = hist_daily['Close'].iloc[-1]
+
+            # Volume greater than 10-day max volume AND Breakout above 10-day max high
+            has_max_vol = latest_vol > prev_10_max_vol
+            is_breakout = latest_close > prev_10_max_high
+
+            if has_max_vol and is_breakout:
+                entry_date = current_date
                 entry_price = latest_close
                 
-                # Stop-Loss: Box Low
-                stop_loss = round(box_low, 2)
+                # Stop-Loss: 10-day box low
+                stop_loss = round(prev_10_min_low, 2)
+                box_height = entry_price - stop_loss
                 
-                # Target: 1.5x Box Height for better Risk-to-Reward ratio
-                target_price = round(entry_price + (1.5 * box_height), 2)
-                
-                risk_per_share = entry_price - stop_loss
-                if risk_per_share <= 0:
+                if box_height <= 0:
                     i += 1
                     continue
 
+                # Target: 1.5x Risk-to-Reward
+                target_price = round(entry_price + (1.5 * box_height), 2)
+                
+                risk_per_share = entry_price - stop_loss
                 shares_quantity = int(allowed_rupee_risk / risk_per_share)
                 
                 # Forward Simulation (Max 15 days time-stop)
@@ -169,7 +166,7 @@ for symbol in clean_stocks:
                         break
                     elif day_high >= target_price:
                         exit_price = target_price
-                        exit_reason = "Target Hit (1.5x R:R)"
+                        exit_reason = "Target Hit (1.5x)"
                         days_in_trade = f_idx + 1
                         break
                     elif f_idx == max_hold_days - 1:
@@ -195,7 +192,7 @@ for symbol in clean_stocks:
                         days_in_trade,
                         pnl_pct,
                         trade_rupee_pnl,
-                        round(box_height_pct, 2),
+                        round((box_height/entry_price)*100, 2),
                         chart_link
                     ])
                     i += days_in_trade
@@ -211,7 +208,7 @@ total_trades = len(all_backtest_trades)
 if total_trades > 0:
     df_results = pd.DataFrame(all_backtest_trades, columns=[
         "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Box_Height_Pct", "TradingView_Chart"
+        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Risk_Pct", "TradingView_Chart"
     ])
     
     winning_trades = len(df_results[df_results['PnL_Pct'] > 0])
@@ -222,7 +219,7 @@ if total_trades > 0:
     total_rupee_pnl = round(df_results['Rupee_PnL'].sum(), 2)
 
     print("\n" + "=" * 50)
-    print("   OPTIMIZED INSTITUTIONAL BACKTEST RESULTS")
+    print("   WEEKLY SHAKEOUT -> DAILY MAX VOL + BREAKOUT RESULTS")
     print("=" * 50)
     print(f"Total Trades Taken     : {total_trades}")
     print(f"Winning Trades         : {winning_trades}")
@@ -252,9 +249,9 @@ if total_trades > 0:
 
     headers = [
         "Stock", "Entry_Date", "Entry_Price", "StopLoss", "Target_Price", "Exit_Price", 
-        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Box_Height_Pct", "TradingView_Chart"
+        "Quantity", "Result", "Days_Held", "PnL_Pct", "Rupee_PnL", "Risk_Pct", "TradingView_Chart"
     ]
     ws_backtest.append_row(headers, value_input_option="USER_ENTERED")
     ws_backtest.append_rows(sanitize_rows(all_backtest_trades), value_input_option="USER_ENTERED")
-    print("✅ Optimized backtest results successfully exported to Google Sheet!")
+    print("✅ Backtest results successfully exported to Google Sheet!")
     
