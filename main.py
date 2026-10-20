@@ -4,10 +4,12 @@ from nselib import capital_market
 import gspread
 import json
 import os
+import pytz
 
-print("=== 100% SHEET-DRIVEN QUIET ACCUMULATION BACKTESTER ===")
+IST = pytz.timezone("Asia/Kolkata")
+print("=== 100% SHEET-DRIVEN QUIET ACCUMULATION BACKTESTER WITH GSHEET EXPORT ===")
 
-# Google Sheets Connection via GitHub Secrets to fetch Watchlist (Zero Hardcoding)
+# Google Sheets Connection via GitHub Secrets
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
     sh = gc.open("CTD_Sniper")
@@ -16,11 +18,10 @@ try:
     print(f"Loaded {len(STOCKS)} stocks from Google Sheet Watchlist.")
 except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
-    STOCKS = [] # No hardcoded fallback, empty list if sheet fails
+    STOCKS = []
 
 def run_backtest(symbol):
     try:
-        print(f"Backtesting {symbol}...")
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
         
@@ -29,11 +30,9 @@ def run_backtest(symbol):
         if df is None or df.empty or len(df) < 60:
             return []
             
-        # Clean and remove duplicate columns
         df.columns = [str(c).strip().title() for c in df.columns]
         df = df.loc[:, ~df.columns.duplicated()]
         
-        # Column mapping
         col_map = {}
         for c in df.columns:
             clow = c.lower()
@@ -65,7 +64,6 @@ def run_backtest(symbol):
                 
         df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
-        # Calculations
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
@@ -94,7 +92,6 @@ def run_backtest(symbol):
                 i += 1
                 continue
             
-            # Rules with Structure Filter:
             trend_ok = close > sma50
             stealth_buying = avg_size >= (1.3 * avg_size_ma)
             price_is_quiet = -1.0 <= daily_ret <= 3.5
@@ -103,8 +100,8 @@ def run_backtest(symbol):
             
             if trend_ok and stealth_buying and price_is_quiet and volume_ok and near_resistance:
                 entry = close
-                sl = low * 0.98  # 2% below low
-                target = entry * 1.07 # 7% target
+                sl = low * 0.98
+                target = entry * 1.07
                 
                 future = df.iloc[i+1:i+21]
                 hit_target = False
@@ -144,34 +141,50 @@ def run_backtest(symbol):
                 i += 1
         return trades
     except Exception as e:
-        print(f"Error backtesting {symbol}: {e}")
         return []
 
 all_trades = []
 if len(STOCKS) > 0:
-    for sym in STOCKS:
+    for idx, sym in enumerate(STOCKS, 1):
+        print(f"[{idx}/{len(STOCKS)}] Backtesting {sym}...")
         res = run_backtest(sym)
         if res:
             all_trades.extend(res)
-else:
-    print("Watchlist is empty or could not be loaded from Google Sheet.")
 
 df_results = pd.DataFrame(all_trades)
+
 if not df_results.empty:
     total_trades = len(df_results)
-    wins = df_results['Target_Hit'].sum()
-    win_rate = (wins / total_trades) * 100
-    avg_pnl = df_results['PnL%'].mean()
+    wins = int(df_results['Target_Hit'].sum())
+    win_rate = round((wins / total_trades) * 100, 2)
+    avg_pnl = round(df_results['PnL%'].mean(), 2)
     
     print("\n" + "="*50)
-    print("   SHEET-DRIVEN BACKTEST PERFORMANCE REPORT   ")
+    print("   BACKTEST PERFORMANCE SUMMARY   ")
     print("="*50)
     print(f"Total Filtered Signals      : {total_trades}")
     print(f"Successful Breakouts (7%)   : {wins}")
-    print(f"Win Rate                    : {win_rate:.2f}%")
-    print(f"Average Return per Trade    : {avg_pnl:.2f}%")
+    print(f"Win Rate                    : {win_rate}%")
+    print(f"Average Return per Trade    : {avg_pnl}%")
     print("="*50)
-    print(df_results.to_string(index=False))
+
+    # Export to Google Sheet
+    try:
+        ws = sh.worksheet("BACKTEST_REPORT") if "BACKTEST_REPORT" in [x.title for x in sh.worksheets()] else sh.add_worksheet("BACKTEST_REPORT", 2000, 10)
+        ws.clear()
+        
+        # Summary Header
+        ws.append_row([f"QUIET ACCUMULATION BACKTEST REPORT | Updated: {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Total Signals", "Successful Breakouts (7%)", "Win Rate %", "Average PnL %"])
+        ws.append_row([total_trades, wins, f"{win_rate}%", f"{avg_pnl}%"])
+        ws.append_row([]) # Blank row
+        
+        # Details Header & Rows
+        ws.append_row(["Stock", "Date", "Entry", "Target Hit", "PnL %", "Days Taken"])
+        ws.append_rows(df_results.values.tolist())
+        print("✅ Results successfully exported to Google Sheet tab 'BACKTEST_REPORT'!")
+    except Exception as e:
+        print(f"Failed to export to Google Sheet: {e}")
 else:
     print("No trades triggered from sheet watchlist.")
-            
+    
