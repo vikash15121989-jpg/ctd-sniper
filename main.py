@@ -7,20 +7,19 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== 100% SHEET-DRIVEN QUIET ACCUMULATION BACKTESTER WITH GSHEET EXPORT ===")
+print("=== SMART MONEY FLOW & POST-SURGE ANALYTICAL BACKTESTER ===")
 
-# Google Sheets Connection via GitHub Secrets
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
     sh = gc.open("CTD_Sniper")
     raw = sh.worksheet("Watchlist").col_values(1)
     STOCKS = [s.strip().upper() for s in raw if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]]
-    print(f"Loaded {len(STOCKS)} stocks from Google Sheet Watchlist.")
+    print(f"Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def run_backtest(symbol):
+def analyze_smart_money(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -64,127 +63,124 @@ def run_backtest(symbol):
                 
         df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
+        # Calculations
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        df['SMA50'] = df['Close'].rolling(50).mean()
         df['Prev_Close'] = df['Close'].shift(1)
         df['Daily_Return'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close'] * 100
-        df['High_20'] = df['High'].rolling(20).max()
         
-        trades = []
-        i = 50
+        records = []
+        i = 20
         n_rows = len(df)
         
-        while i < n_rows - 20:
+        while i < n_rows - 15:
             close = df['Close'].iloc[i]
-            high = df['High'].iloc[i]
-            low = df['Low'].iloc[i]
             vol = df['Volume'].iloc[i]
             vol_ma = df['Vol_MA20'].iloc[i]
             avg_size = df['Avg_Order_Size'].iloc[i]
             avg_size_ma = df['Avg_Size_MA20'].iloc[i]
-            sma50 = df['SMA50'].iloc[i]
             daily_ret = df['Daily_Return'].iloc[i]
-            high_20 = df['High_20'].iloc[i]
             
-            if pd.isna(sma50) or pd.isna(avg_size_ma) or avg_size_ma == 0 or pd.isna(vol_ma) or pd.isna(high_20):
+            if pd.isna(avg_size_ma) or avg_size_ma == 0 or pd.isna(vol_ma):
                 i += 1
                 continue
             
-            trend_ok = close > sma50
-            stealth_buying = avg_size >= (1.3 * avg_size_ma)
-            price_is_quiet = -1.0 <= daily_ret <= 3.5
-            volume_ok = vol >= (0.8 * vol_ma)
-            near_resistance = close >= (0.95 * high_20)
+            # --- SMART MONEY ACCUMULATION CONDITION ---
+            # 1. Order Size Spike (>= 1.5x of 20MA)
+            # 2. Quiet Price Movement (-1.5% to +2.0%)
+            is_stealth_buy = (avg_size >= 1.5 * avg_size_ma) and (-1.5 <= daily_ret <= 2.0)
             
-            if trend_ok and stealth_buying and price_is_quiet and volume_ok and near_resistance:
-                entry = close
-                sl = low * 0.98
-                target = entry * 1.07
+            if is_stealth_buy:
+                signal_date = df['Date'].iloc[i].strftime('%Y-%m-%d')
+                signal_price = close
                 
-                future = df.iloc[i+1:i+21]
-                hit_target = False
-                hit_sl = False
-                exit_price = entry
-                days_taken = 0
+                # Look ahead for Volume Surge (Within next 10 trading days)
+                future = df.iloc[i+1:i+11]
+                surge_found = False
+                days_to_surge = 0
+                outcome = "No Surge"
+                max_move_pct = 0.0
                 
-                for idx, (_, r) in enumerate(future.iterrows(), 1):
-                    if r['Low'] <= sl:
-                        hit_sl = True
-                        exit_price = sl
-                        days_taken = idx
+                for idx, (_, f_row) in enumerate(future.iterrows(), 1):
+                    # Volume Surge defined as >= 2.5x of 20MA Volume
+                    if f_row['Volume'] >= (2.5 * f_row['Vol_MA20']):
+                        surge_found = True
+                        days_to_surge = idx
+                        
+                        # Check price reaction after surge (10 days after surge)
+                        post_surge = df.iloc[i+1+idx : i+11+idx]
+                        if not post_surge.empty:
+                            max_high = post_surge['High'].max()
+                            min_low = post_surge['Low'].min()
+                            
+                            up_move = (max_high - signal_price) / signal_price * 100
+                            down_move = (min_low - signal_price) / signal_price * 100
+                            
+                            if up_move > abs(down_move):
+                                outcome = "Breakout (UP)"
+                                max_move_pct = round(up_move, 2)
+                            else:
+                                outcome = "Breakdown (DOWN)"
+                                max_move_pct = round(down_move, 2)
                         break
-                    if r['High'] >= target:
-                        hit_target = True
-                        exit_price = target
-                        days_taken = idx
-                        break
                 
-                if not hit_target and not hit_sl:
-                    exit_price = future.iloc[-1]['Close']
-                    days_taken = 20
-                
-                pnl_pct = (exit_price - entry) / entry * 100
-                
-                trades.append({
+                records.append({
                     "Stock": symbol,
-                    "Date": df['Date'].iloc[i].strftime('%Y-%m-%d'),
-                    "Entry": round(entry, 2),
-                    "Target_Hit": hit_target,
-                    "PnL%": round(pnl_pct, 2),
-                    "Days": days_taken
+                    "Accumulation_Date": signal_date,
+                    "Price_At_Signal": round(signal_price, 2),
+                    "Order_Size_Multiple": round(avg_size / avg_size_ma, 2),
+                    "Volume_Surge_Happened": "YES" if surge_found else "NO",
+                    "Days_To_Surge": days_to_surge if surge_found else "-",
+                    "Post_Surge_Direction": outcome,
+                    "Max_Move_%": max_move_pct
                 })
                 
-                i += max(days_taken, 5)
+                i += 10 # Jump ahead to avoid tracking duplicate contiguous signals
             else:
                 i += 1
-        return trades
+                
+        return records
     except Exception as e:
         return []
 
-all_trades = []
+all_study_data = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Backtesting {sym}...")
-        res = run_backtest(sym)
+        print(f"[{idx}/{len(STOCKS)}] Analyzing Smart Money Flow for {sym}...")
+        res = analyze_smart_money(sym)
         if res:
-            all_trades.extend(res)
+            all_study_data.extend(res)
 
-df_results = pd.DataFrame(all_trades)
+df_study = pd.DataFrame(all_study_data)
 
-if not df_results.empty:
-    total_trades = len(df_results)
-    wins = int(df_results['Target_Hit'].sum())
-    win_rate = round((wins / total_trades) * 100, 2)
-    avg_pnl = round(df_results['PnL%'].mean(), 2)
+if not df_study.empty:
+    print("\n" + "="*60)
+    print("   SMART MONEY & VOLUME SURGE ANALYSIS REPORT   ")
+    print("="*60)
+    print(f"Total Smart Money Footprints Detected : {len(df_study)}")
     
-    print("\n" + "="*50)
-    print("   BACKTEST PERFORMANCE SUMMARY   ")
-    print("="*50)
-    print(f"Total Filtered Signals      : {total_trades}")
-    print(f"Successful Breakouts (7%)   : {wins}")
-    print(f"Win Rate                    : {win_rate}%")
-    print(f"Average Return per Trade    : {avg_pnl}%")
-    print("="*50)
+    surges = df_study[df_study['Volume_Surge_Happened'] == 'YES']
+    print(f"Cases Where Volume Surge Followed     : {len(surges)}")
+    
+    if not surges.empty:
+        up_cases = len(surges[surges['Post_Surge_Direction'] == 'Breakout (UP)'])
+        down_cases = len(surges[surges['Post_Surge_Direction'] == 'Breakdown (DOWN)'])
+        print(f"  └─ Lead to Upward Breakouts        : {up_cases}")
+        print(f"  └─ Lead to Downward Breakdowns     : {down_cases}")
+    print("="*60)
 
-    # Export to Google Sheet
+    # Export Study to Google Sheet
     try:
-        ws = sh.worksheet("BACKTEST_REPORT") if "BACKTEST_REPORT" in [x.title for x in sh.worksheets()] else sh.add_worksheet("BACKTEST_REPORT", 2000, 10)
+        ws = sh.worksheet("SMART_MONEY_STUDY") if "SMART_MONEY_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SMART_MONEY_STUDY", 2000, 10)
         ws.clear()
         
-        # Summary Header
-        ws.append_row([f"QUIET ACCUMULATION BACKTEST REPORT | Updated: {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Total Signals", "Successful Breakouts (7%)", "Win Rate %", "Average PnL %"])
-        ws.append_row([total_trades, wins, f"{win_rate}%", f"{avg_pnl}%"])
-        ws.append_row([]) # Blank row
-        
-        # Details Header & Rows
-        ws.append_row(["Stock", "Date", "Entry", "Target Hit", "PnL %", "Days Taken"])
-        ws.append_rows(df_results.values.tolist())
-        print("✅ Results successfully exported to Google Sheet tab 'BACKTEST_REPORT'!")
+        ws.append_row([f"SMART MONEY ACCUMULATION & SURGE BEHAVIOR STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Stock", "Accumulation Date", "Price At Signal", "Order Size Multiple", "Volume Surge Happened", "Days To Surge", "Post Surge Direction", "Max Move %"])
+        ws.append_rows(df_study.values.tolist())
+        print("✅ Analysis exported to Google Sheet tab 'SMART_MONEY_STUDY'!")
     except Exception as e:
-        print(f"Failed to export to Google Sheet: {e}")
+        print(f"Failed to export study to Google Sheet: {e}")
 else:
-    print("No trades triggered from sheet watchlist.")
+    print("No Smart Money footprints detected.")
     
