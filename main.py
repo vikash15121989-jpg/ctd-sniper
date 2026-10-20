@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== METHOD 5 (10D RANGE HIGH BREAKOUT) DEEP DIVE ANALYZER ===")
+print("=== PRE-ENTRY CLUE FINDER (WINNERS VS LOSERS 10-DAY FOOTPRINT) ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,7 +19,7 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def analyze_method_5_details(symbol):
+def extract_pre_entry_clues(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -45,8 +45,6 @@ def analyze_method_5_details(symbol):
                 col_map[c] = 'High'
             elif 'low' in clow:
                 col_map[c] = 'Low'
-            elif 'open' in clow:
-                col_map[c] = 'Open'
             elif 'date' in clow:
                 col_map[c] = 'Date'
 
@@ -68,8 +66,10 @@ def analyze_method_5_details(symbol):
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
+        df['EMA20'] = df['Close'].ewm(span=20).mean()
+        df['Candle_Range_%'] = (df['High'] - df['Low']) / df['Low'] * 100
         
-        m5_records = []
+        clue_records = []
         n_rows = len(df)
         
         for i in range(25, n_rows - 20):
@@ -79,11 +79,8 @@ def analyze_method_5_details(symbol):
             if pd.isna(vol_ma) or vol_ma == 0:
                 continue
                 
-            # Volume Surge Trigger (Min 2.5x of 20MA)
+            # Volume Surge Trigger
             if vol >= (2.5 * vol_ma):
-                surge_vol_mult = round(vol / vol_ma, 2)
-                
-                # Check preceding 10 days Smart Money Footprint
                 pre_10 = df.iloc[i-10:i]
                 if len(pre_10) < 10:
                     continue
@@ -91,112 +88,96 @@ def analyze_method_5_details(symbol):
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 net_price_chg = (pre_10['Close'].iloc[-1] - pre_10['Close'].iloc[0]) / pre_10['Close'].iloc[0] * 100
                 
-                # Smart Money Condition
+                # Smart Money Consolidation Condition
                 if max_order_mult >= 1.8 and -2.0 <= net_price_chg <= 3.0:
-                    
-                    # METHOD 5 LOGIC: 10-Day Consolidation High Breakout
                     range_high = pre_10['High'].max()
                     
-                    # Look ahead for breakout entry
                     for idx_ahead in range(i+1, min(i+8, n_rows - 15)):
                         if df['Close'].iloc[idx_ahead] > range_high:
-                            entry_date = df['Date'].iloc[idx_ahead].strftime('%Y-%m-%d')
                             entry_price = range_high
-                            stop_loss = entry_price * 0.97 # 3% SL
-                            target_price = entry_price * 1.06 # 6% Target
+                            stop_loss = entry_price * 0.97
+                            target_price = entry_price * 1.06
                             
-                            # Track performance post entry
                             future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
                             if future_15.empty:
                                 break
                                 
                             outcome = "EXPIRED"
-                            days_to_result = 0
-                            max_up_pct = 0.0
+                            for _, f_row in future_15.iterrows():
+                                if f_row['High'] >= target_price:
+                                    outcome = "WIN"
+                                    break
+                                elif f_row['Low'] <= stop_loss:
+                                    outcome = "LOSS"
+                                    break
                             
-                            for d_count, (_, f_row) in enumerate(future_15.iterrows(), 1):
-                                f_high = f_row['High']
-                                f_low = f_row['Low']
+                            if outcome in ["WIN", "LOSS"]:
+                                # --- EXTRACT PRE-ENTRY CLUES (10 DAYS BEFORE ENTRY) ---
+                                min_vol_ratio = round(pre_10['Volume'].min() / pre_10['Vol_MA20'].mean(), 2)
+                                avg_tightness = round(pre_10['Candle_Range_%'].mean(), 2)
+                                days_above_ema20 = (pre_10['Close'] > pre_10['EMA20']).sum()
+                                spike_days_cnt = ((pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']) >= 1.5).sum()
                                 
-                                up_move = (f_high - entry_price) / entry_price * 100
-                                if up_move > max_up_pct:
-                                    max_up_pct = round(up_move, 2)
-                                    
-                                if f_high >= target_price:
-                                    outcome = "PROFIT (>=6%)"
-                                    days_to_result = d_count
-                                    break
-                                elif f_low <= stop_loss:
-                                    outcome = "LOSS (SL Hit)"
-                                    days_to_result = d_count
-                                    break
-                            
-                            m5_records.append({
-                                "Stock": symbol,
-                                "Entry_Date": entry_date,
-                                "Entry_Price": round(entry_price, 2),
-                                "Surge_Vol_Mult": surge_vol_mult,
-                                "Pre_10D_Order_Mult": round(max_order_mult, 2),
-                                "Outcome": outcome,
-                                "Days_Taken": days_to_result if days_to_result > 0 else "-",
-                                "Max_Gain_%": max_up_pct
-                            })
+                                # Up day vs Down day vol ratio
+                                green_vol = pre_10[pre_10['Close'] >= pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
+                                red_vol = pre_10[pre_10['Close'] < pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
+                                green_red_vol_ratio = round(green_vol / red_vol, 2) if red_vol > 0 else 1.0
+                                
+                                clue_records.append({
+                                    "Stock": symbol,
+                                    "Outcome": outcome,
+                                    "Pre_Vol_Dry_Ratio": min_vol_ratio,         # Lower is better (dry volume)
+                                    "Pre_Candle_Tightness_%": avg_tightness,   # Lower is better (tight consolidation)
+                                    "Days_Above_EMA20": days_above_ema20,      # Higher is better (holding EMA20 support)
+                                    "Order_Spike_Days_Cnt": spike_days_cnt,    # Number of days with order size spike
+                                    "Green_vs_Red_Vol_Ratio": green_red_vol_ratio # Up day volume vs down day volume
+                                })
                             break
                     i += 15
-        return m5_records
+        return clue_records
     except Exception as e:
         return []
 
-all_m5 = []
+all_clues = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Analyzing Method 5 trades for {sym}...")
-        res = analyze_method_5_details(sym)
+        print(f"[{idx}/{len(STOCKS)}] Extracting pre-entry clues for {sym}...")
+        res = extract_pre_entry_clues(sym)
         if res:
-            all_m5.extend(res)
+            all_clues.extend(res)
 
-df_m5 = pd.DataFrame(all_m5)
+df_clues = pd.DataFrame(all_clues)
 
-if not df_m5.empty:
-    total_trades = len(df_m5)
-    profits = df_m5[df_m5['Outcome'] == 'PROFIT (>=6%)']
-    losses = df_m5[df_m5['Outcome'] == 'LOSS (SL Hit)']
-    
-    win_cnt = len(profits)
-    loss_cnt = len(losses)
-    win_pct = round((win_cnt / total_trades) * 100, 2)
-    
-    avg_win_days = round(pd.to_numeric(profits['Days_Taken'], errors='coerce').mean(), 1)
-    avg_max_gain = round(profits['Max_Gain_%'].mean(), 2)
-    avg_surge_vol_win = round(profits['Surge_Vol_Mult'].mean(), 2)
-    avg_surge_vol_loss = round(losses['Surge_Vol_Mult'].mean(), 2)
+if not df_clues.empty:
+    win_clues = df_clues[df_clues['Outcome'] == 'WIN']
+    loss_clues = df_clues[df_clues['Outcome'] == 'LOSS']
     
     print("\n" + "="*65)
-    print("   METHOD 5 (10D RANGE HIGH BREAKOUT) DEEP ANALYSIS REPORT   ")
+    print("   PRE-ENTRY FOOTPRINT CLUES: WINNERS VS LOSERS   ")
     print("="*65)
-    print(f"Total Method 5 Trades                  : {total_trades}")
-    print(f"Profit Trades (Target >= 6% Hit)       : {win_cnt} ({win_pct}%)")
-    print(f"Loss Trades (Stop Loss Hit)            : {loss_cnt}")
-    print(f"Average Days to Hit 6% Profit          : {avg_win_days} Days")
-    print(f"Average Max Gain in Winning Trades     : +{avg_max_gain}%")
-    print(f"Average Surge Vol Multiple in WIN Trades: {avg_surge_vol_win}x")
-    print(f"Average Surge Vol Multiple in LOSS Trades: {avg_surge_vol_loss}x")
+    print(f"1. Lowest Vol Dry Ratio      | Winners: {round(win_clues['Pre_Vol_Dry_Ratio'].mean(),2)}x  | Losers: {round(loss_clues['Pre_Vol_Dry_Ratio'].mean(),2)}x")
+    print(f"2. Daily Candle Tightness % | Winners: {round(win_clues['Pre_Candle_Tightness_%'].mean(),2)}%  | Losers: {round(loss_clues['Pre_Candle_Tightness_%'].mean(),2)}%")
+    print(f"3. Days Above 20 EMA (out of 10)| Winners: {round(win_clues['Days_Above_EMA20'].mean(),1)} Days | Losers: {round(loss_clues['Days_Above_EMA20'].mean(),1)} Days")
+    print(f"4. Order Spike Days Count   | Winners: {round(win_clues['Order_Spike_Days_Cnt'].mean(),1)} Days | Losers: {round(loss_clues['Order_Spike_Days_Cnt'].mean(),1)} Days")
+    print(f"5. Green vs Red Vol Ratio   | Winners: {round(win_clues['Green_vs_Red_Vol_Ratio'].mean(),2)}x  | Losers: {round(loss_clues['Green_vs_Red_Vol_Ratio'].mean(),2)}x")
     print("="*65)
 
     try:
-        ws = sh.worksheet("METHOD_5_DEEP_DIVE") if "METHOD_5_DEEP_DIVE" in [x.title for x in sh.worksheets()] else sh.add_worksheet("METHOD_5_DEEP_DIVE", 2000, 10)
+        ws = sh.worksheet("PRE_ENTRY_CLUES_STUDY") if "PRE_ENTRY_CLUES_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("PRE_ENTRY_CLUES_STUDY", 2000, 10)
         ws.clear()
         
-        ws.append_row([f"METHOD 5 DEEP ANALYSIS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Total Trades", "Profits (>=6%)", "Win Rate %", "Losses (SL Hit)", "Avg Days to Profit", "Avg Max Gain %", "Avg Vol Mult (Win)", "Avg Vol Mult (Loss)"])
-        ws.append_row([total_trades, win_cnt, f"{win_pct}%", loss_cnt, avg_win_days, f"{avg_max_gain}%", f"{avg_surge_vol_win}x", f"{avg_surge_vol_loss}x"])
+        ws.append_row([f"PRE-ENTRY CLUES STUDY (WINNERS VS LOSERS) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Metric", "Winners Avg", "Losers Avg", "Difference / Actionable Clue"])
+        ws.append_row(["Lowest Vol Dry Ratio", round(win_clues['Pre_Vol_Dry_Ratio'].mean(),2), round(loss_clues['Pre_Vol_Dry_Ratio'].mean(),2), "Drier volume before surge"])
+        ws.append_row(["Daily Candle Tightness %", round(win_clues['Pre_Candle_Tightness_%'].mean(),2), round(loss_clues['Pre_Candle_Tightness_%'].mean(),2), "Tighter price range"])
+        ws.append_row(["Days Above 20 EMA", round(win_clues['Days_Above_EMA20'].mean(),1), round(loss_clues['Days_Above_EMA20'].mean(),1), "Price holding above 20 EMA"])
+        ws.append_row(["Order Spike Days Count", round(win_clues['Order_Spike_Days_Cnt'].mean(),1), round(loss_clues['Order_Spike_Days_Cnt'].mean(),1), "Multiple order size spike days"])
+        ws.append_row(["Green vs Red Vol Ratio", round(win_clues['Green_vs_Red_Vol_Ratio'].mean(),2), round(loss_clues['Green_vs_Red_Vol_Ratio'].mean(),2), "Buying volume dominance"])
         ws.append_row([])
         
-        ws.append_row(["Stock", "Entry Date", "Entry Price", "Surge Vol Mult", "Pre 10D Order Mult", "Outcome", "Days Taken", "Max Gain %"])
-        ws.append_rows(df_m5.values.tolist())
-        print("✅ Deep analysis exported to Google Sheet tab 'METHOD_5_DEEP_DIVE'!")
+        ws.append_row(["Stock", "Outcome", "Pre Vol Dry Ratio", "Pre Candle Tightness %", "Days Above EMA20", "Order Spike Days Cnt", "Green vs Red Vol Ratio"])
+        ws.append_rows(df_clues.values.tolist())
+        print("✅ Pre-entry clues study exported to Google Sheet tab 'PRE_ENTRY_CLUES_STUDY'!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
-else:
-    print("No Method 5 trades found.")
-    
+        
