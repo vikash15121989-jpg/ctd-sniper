@@ -1,41 +1,25 @@
 import pandas as pd
 from datetime import datetime, timedelta
 from nselib import capital_market
-import gspread
-import json
-import os
-import pytz
 
-IST = pytz.timezone("Asia/Kolkata")
-print(f"=== NSE SMART MONEY SCANNER | {datetime.now(IST).strftime('%d-%b %H:%M')} ===")
+print("=== INSTITUTIONAL SMART MONEY BACKTESTER ===")
 
-# Google Sheets Connection via GitHub Secrets
-try:
-    gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
-    sh = gc.open("CTD_Sniper")
-    raw = sh.worksheet("Watchlist").col_values(1)
-    STOCKS = [s.strip().upper() for s in raw if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]][:50]
-except Exception as e:
-    print(f"Google Sheet Connection Error: {e}")
-    STOCKS = ["RELIANCE", "TCS", "SBIN", "INFY", "LT"] # Fallback list
-
-scans = []
-to_date = datetime.now().strftime('%d-%m-%Y')
-from_date = (datetime.now() - timedelta(days=120)).strftime('%d-%m-%Y')
-
-for symbol in STOCKS:
+def run_backtest(symbol):
     try:
-        print(f"Fetching data for {symbol}...")
+        print(f"Backtesting {symbol}...")
+        to_date = datetime.now().strftime('%d-%m-%Y')
+        from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
+        
         df = capital_market.price_volume_data(symbol=symbol, from_date=from_date, to_date=to_date)
         
-        if df is None or df.empty or len(df) < 30:
-            print(f"Insufficient data for {symbol}")
-            continue
+        if df is None or df.empty or len(df) < 60:
+            return []
             
-        # Clean column names (Remove spaces and standardize)
+        # Clean and remove duplicate columns
         df.columns = [str(c).strip().title() for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated()]
         
-        # Mapping column variations safely
+        # Column mapping
         col_map = {}
         for c in df.columns:
             clow = c.lower()
@@ -53,83 +37,125 @@ for symbol in STOCKS:
                 col_map[c] = 'Date'
 
         df = df.rename(columns=col_map)
+        df = df.loc[:, ~df.columns.duplicated()]
         
         required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Date']
         if not all(col in df.columns for col in required_cols):
-            print(f"Missing required columns in {symbol}. Found: {list(df.columns)}")
-            continue
+            return []
 
-        # Convert date and sort
         df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
         df = df.sort_values('Date').reset_index(drop=True)
         
-        # Numeric conversion
         for col in ['Volume', 'Trades', 'Close', 'High', 'Low']:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
                 
         df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
-        if len(df) < 25:
-            continue
-
-        # 1. Calculate Average Order Size (Volume / No. of Trades)
+        # 1. Indicators Calculation
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
-        
-        # 2. Moving Averages
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['SMA50'] = df['Close'].rolling(50).mean()
         
-        # Latest row
-        last_row = df.iloc[-1]
+        trades = []
+        i = 50
+        n_rows = len(df)
         
-        close = last_row['Close']
-        high = last_row['High']
-        low = last_row['Low']
-        vol = last_row['Volume']
-        vol_ma = last_row['Vol_MA20']
-        avg_size = last_row['Avg_Order_Size']
-        avg_size_ma = last_row['Avg_Size_MA20']
-        sma50 = last_row['SMA50']
-        
-        if pd.isna(vol_ma) or vol_ma == 0 or pd.isna(avg_size_ma) or avg_size_ma == 0:
-            continue
-        
-        # Smart Money Logic Conditions:
-        vol_surge = vol >= (1.8 * vol_ma)
-        big_order_size = avg_size >= (1.4 * avg_size_ma)
-        
-        day_range = high - low
-        range_pos = (close - low) / day_range if day_range > 0 else 0
-        delivery_close = range_pos >= 0.75
-        
-        trend_ok = (not pd.isna(sma50)) and (close > sma50)
-        
-        if vol_surge and big_order_size and delivery_close and trend_ok:
-            scans.append([
-                symbol,
-                last_row['Date'].strftime('%Y-%m-%d'),
-                round(close, 2),
-                round(vol / 100000, 2), # Volume in Lakhs
-                round(vol / vol_ma, 2), # Volume Multiple
-                round(avg_size / avg_size_ma, 2) # Order Size Multiple
-            ])
+        while i < n_rows - 15:
+            close = df['Close'].iloc[i]
+            high = df['High'].iloc[i]
+            low = df['Low'].iloc[i]
+            vol = df['Volume'].iloc[i]
+            vol_ma = df['Vol_MA20'].iloc[i]
+            avg_size = df['Avg_Order_Size'].iloc[i]
+            avg_size_ma = df['Avg_Size_MA20'].iloc[i]
+            sma50 = df['SMA50'].iloc[i]
+            
+            if pd.isna(sma50) or vol_ma == 0 or avg_size_ma == 0:
+                i += 1
+                continue
+            
+            # Smart Money Trigger Rules:
+            vol_surge = vol >= (1.8 * vol_ma)
+            big_order_size = avg_size >= (1.4 * avg_size_ma)
+            
+            day_range = high - low
+            range_pos = (close - low) / day_range if day_range > 0 else 0
+            delivery_close = range_pos >= 0.75
+            
+            trend_ok = close > sma50
+            
+            if vol_surge and big_order_size and delivery_close and trend_ok:
+                entry = close
+                sl = low * 0.98  # 2% below day low
+                
+                # Forward simulation for 15 days (6% Target vs SL)
+                future = df.iloc[i+1:i+16]
+                hit_target = False
+                hit_sl = False
+                exit_price = entry
+                days_taken = 0
+                
+                for idx, (_, r) in enumerate(future.iterrows(), 1):
+                    if r['Low'] <= sl:
+                        hit_sl = True
+                        exit_price = sl
+                        days_taken = idx
+                        break
+                    if r['High'] >= entry * 1.06:
+                        hit_target = True
+                        exit_price = entry * 1.06
+                        days_taken = idx
+                        break
+                
+                if not hit_target and not hit_sl:
+                    exit_price = future.iloc[-1]['Close']
+                    days_taken = 15
+                
+                pnl_pct = (exit_price - entry) / entry * 100
+                
+                trades.append({
+                    "Stock": symbol,
+                    "Date": df['Date'].iloc[i].strftime('%Y-%m-%d'),
+                    "Entry": round(entry, 2),
+                    "Target_Hit": hit_target,
+                    "PnL%": round(pnl_pct, 2),
+                    "Days": days_taken
+                })
+                
+                i += max(days_taken, 5) # Cooldown after trade
+            else:
+                i += 1
+        return trades
     except Exception as e:
-        print(f"Error processing {symbol}: {e}")
-        continue
+        print(f"Error backtesting {symbol}: {e}")
+        return []
 
-# Export to Google Sheet
-try:
-    if len(scans) > 0:
-        df_out = pd.DataFrame(scans, columns=["Stock", "Date", "Close", "Volume_Lakhs", "Vol_Multiple", "Avg_Size_Multiple"])
-        ws = sh.worksheet("SMART_MONEY_SIGNALS") if "SMART_MONEY_SIGNALS" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SMART_MONEY_SIGNALS", 1000, 10)
-        ws.clear()
-        ws.append_row([f"Smart Money Accumulation Signals (nselib) | Updated: {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Stock", "Date", "Close", "Volume (Lakhs)", "Vol Multiple", "Avg Size Multiple"])
-        ws.append_rows(df_out.values.tolist())
-        print(f"✅ Success! Found {len(scans)} signals and updated Google Sheet.")
-    else:
-        print("No institutional accumulation signals found for today.")
-except Exception as e:
-    print(f"Error updating Google Sheet: {e}")
+# Test sample watchlist
+watchlist = ["RELIANCE", "TCS", "SBIN", "INFY", "LT", "AXISBANK"]
+all_trades = []
+
+for sym in watchlist:
+    res = run_backtest(sym)
+    if res:
+        all_trades.extend(res)
+
+df_results = pd.DataFrame(all_trades)
+if not df_results.empty:
+    total_trades = len(df_results)
+    wins = df_results['Target_Hit'].sum()
+    win_rate = (wins / total_trades) * 100
+    avg_pnl = df_results['PnL%'].mean()
+    
+    print("\n" + "="*50)
+    print("      BACKTEST PERFORMANCE REPORT (1 YEAR)     ")
+    print("="*50)
+    print(f"Total Institutional Signals : {total_trades}")
+    print(f"Winning Trades (6% Target)  : {wins}")
+    print(f"Win Rate                    : {win_rate:.2f}%")
+    print(f"Average Return per Trade    : {avg_pnl:.2f}%")
+    print("="*50)
+    print(df_results.to_string(index=False))
+else:
+    print("No trades triggered with current strict criteria.")
     
