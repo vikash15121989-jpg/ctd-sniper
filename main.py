@@ -28,42 +28,65 @@ for symbol in STOCKS:
         print(f"Fetching data for {symbol}...")
         df = capital_market.price_volume_data(symbol=symbol, from_date=from_date, to_date=to_date)
         
-        if df is None or len(df) < 30:
+        if df is None or df.empty or len(df) < 30:
+            print(f"Insufficient data for {symbol}")
             continue
             
-        # Clean column names
-        df.columns = [c.strip().title() for c in df.columns]
+        # Clean column names (Remove spaces and standardize)
+        df.columns = [str(c).strip().title() for c in df.columns]
         
+        # Mapping column variations safely
+        col_map = {}
+        for c in df.columns:
+            clow = c.lower()
+            if 'total traded quantity' in clow or 'quantity' in clow:
+                col_map[c] = 'Volume'
+            elif 'no. of trades' in clow or 'trades' in clow:
+                col_map[c] = 'Trades'
+            elif 'close' in clow:
+                col_map[c] = 'Close'
+            elif 'high' in clow:
+                col_map[c] = 'High'
+            elif 'low' in clow:
+                col_map[c] = 'Low'
+            elif 'date' in clow:
+                col_map[c] = 'Date'
+
+        df = df.rename(columns=col_map)
+        
+        required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Date']
+        if not all(col in df.columns for col in required_cols):
+            print(f"Missing required columns in {symbol}. Found: {list(df.columns)}")
+            continue
+
         # Convert date and sort
         df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
         df = df.sort_values('Date').reset_index(drop=True)
         
-        # Numeric conversion for columns
-        numeric_cols = ['Total Traded Quantity', 'No. Of Trades', 'Close Price', 'High Price', 'Low Price']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+        # Numeric conversion
+        for col in ['Volume', 'Trades', 'Close', 'High', 'Low']:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
                 
-        df = df.dropna(subset=['Total Traded Quantity', 'No. Of Trades', 'Close Price', 'High Price', 'Low Price'])
+        df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
         if len(df) < 25:
             continue
 
         # 1. Calculate Average Order Size (Volume / No. of Trades)
-        df['Avg_Order_Size'] = df['Total Traded Quantity'] / df['No. Of Trades']
+        df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         
-        # 2. Moving Averages for Baseline Comparison
-        df['Vol_MA20'] = df['Total Traded Quantity'].rolling(20).mean()
+        # 2. Moving Averages
+        df['Vol_MA20'] = df['Volume'].rolling(20).mean()
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
-        df['SMA50'] = df['Close Price'].rolling(50).mean()
+        df['SMA50'] = df['Close'].rolling(50).mean()
         
-        # Check the latest row
+        # Latest row
         last_row = df.iloc[-1]
         
-        close = last_row['Close Price']
-        high = last_row['High Price']
-        low = last_row['Low Price']
-        vol = last_row['Total Traded Quantity']
+        close = last_row['Close']
+        high = last_row['High']
+        low = last_row['Low']
+        vol = last_row['Volume']
         vol_ma = last_row['Vol_MA20']
         avg_size = last_row['Avg_Order_Size']
         avg_size_ma = last_row['Avg_Size_MA20']
@@ -73,12 +96,12 @@ for symbol in STOCKS:
             continue
         
         # Smart Money Logic Conditions:
-        vol_surge = vol >= (2.0 * vol_ma)
-        big_order_size = avg_size >= (1.5 * avg_size_ma)
+        vol_surge = vol >= (1.8 * vol_ma)
+        big_order_size = avg_size >= (1.4 * avg_size_ma)
         
         day_range = high - low
         range_pos = (close - low) / day_range if day_range > 0 else 0
-        delivery_close = range_pos >= 0.85
+        delivery_close = range_pos >= 0.75
         
         trend_ok = (not pd.isna(sma50)) and (close > sma50)
         
