@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== ULTIMATE FILTERED DELAYED BREAKOUT BACKTESTER ===")
+print("=== LIVE DELAYED BREAKOUT SETUP SCANNER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,14 +19,14 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def run_ultimate_delayed_backtest(symbol):
+def scan_live_delayed_setups(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
-        from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
+        from_date = (datetime.now() - timedelta(days=60)).strftime('%d-%m-%Y')
         
         df = capital_market.price_volume_data(symbol=symbol, from_date=from_date, to_date=to_date)
-        if df is None or df.empty or len(df) < 60:
-            return []
+        if df is None or df.empty or len(df) < 25:
+            return None
             
         df.columns = [str(c).strip().title() for c in df.columns]
         df = df.loc[:, ~df.columns.duplicated()]
@@ -52,7 +52,7 @@ def run_ultimate_delayed_backtest(symbol):
         
         required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Date']
         if not all(col in df.columns for col in required_cols):
-            return []
+            return None
 
         df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
         df = df.sort_values('Date').reset_index(drop=True)
@@ -67,10 +67,12 @@ def run_ultimate_delayed_backtest(symbol):
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Candle_Range_%'] = (df['High'] - df['Low']) / df['Low'] * 100
         
-        trade_rows = []
         n_rows = len(df)
-        
-        for i in range(15, n_rows - 20):
+        if n_rows < 15:
+            return None
+            
+        # Check in the last 10 trading sessions for the volume surge setup
+        for i in range(n_rows - 10, n_rows - 1):
             pre_10 = df.iloc[i-10:i]
             if len(pre_10) < 10:
                 continue
@@ -89,104 +91,66 @@ def run_ultimate_delayed_backtest(symbol):
             # Condition: Volume > 10D Max Volume, but Close < 10D High
             if current_vol > max_10d_vol and current_close < max_10d_high:
                 
-                # Filter 2: Smart Money Accumulation Metrics
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 avg_tightness = pre_10['Candle_Range_%'].mean()
                 
-                # Filter 3: Pre-Surge Green/Red Volume Ratio & Trend Check
                 green_vol = pre_10[pre_10['Close'] >= pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
                 red_vol = pre_10[pre_10['Close'] < pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
                 gr_ratio = green_vol / red_vol if red_vol > 0 else 10.0
                 
                 pre_net_chg = (pre_10['Close'].iloc[-1] - pre_10['Close'].iloc[0]) / pre_10['Close'].iloc[0] * 100
                 
-                # Applying all High-Conviction Edge Criteria
                 if (max_order_mult >= 1.8 and 
                     avg_tightness <= 4.0 and 
                     gr_ratio >= 2.5 and 
                     pre_net_chg > 0):
                     
-                    subsequent_10 = df.iloc[i+1 : i+11]
-                    if subsequent_10.empty:
-                        continue
+                    surge_date = df['Date'].iloc[i].strftime('%Y-%m-%d')
+                    entry_p = round(max_10d_high, 2)
+                    sl_p = round(entry_p * 0.97, 2)
+                    tgt_p = round(entry_p * 1.06, 2)
+                    chart_link = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
                     
-                    for idx_ahead, f_row in subsequent_10.iterrows():
-                        if f_row['Close'] > max_10d_high:
-                            entry_date = f_row['Date'].strftime('%Y-%m-%d')
-                            entry_p = max_10d_high
-                            
-                            future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
-                            if future_15.empty:
-                                break
-                                
-                            sl = entry_p * 0.97
-                            tgt = entry_p * 1.06
-                            outcome = "EXPIRED"
-                            
-                            for _, fut in future_15.iterrows():
-                                if fut['High'] >= tgt:
-                                    outcome = "WIN"
-                                    break
-                                elif fut['Low'] <= sl:
-                                    outcome = "LOSS"
-                                    break
-                            
-                            if outcome in ["WIN", "LOSS"]:
-                                trade_rows.append({
-                                    "Stock": symbol,
-                                    "Surge_Date": df['Date'].iloc[i].strftime('%Y-%m-%d'),
-                                    "Breakout_Date": entry_date,
-                                    "Entry_Price": round(entry_p, 2),
-                                    "Outcome": outcome,
-                                    "GR_Ratio": round(gr_ratio, 2),
-                                    "Pre_Net_Chg_%": round(pre_net_chg, 2)
-                                })
-                            break
-            i += 1
-        return trade_rows
+                    return {
+                        "Surge_Date": surge_date,
+                        "Symbol": symbol,
+                        "Entry_P": entry_p,
+                        "SL_P": sl_p,
+                        "Tgt_P": tgt_p,
+                        "Chart": chart_link
+                    }
+        return None
     except Exception as e:
-        return []
+        return None
 
-all_ultimate_trades = []
+scanned_setups = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Running ultimate backtest for {sym}...")
-        res = run_ultimate_delayed_backtest(sym)
+        print(f"[{idx}/{len(STOCKS)}] Scanning live delayed setup for {sym}...")
+        res = scan_live_delayed_setups(sym)
         if res:
-            all_ultimate_trades.extend(res)
+            scanned_setups.append(res)
 
-df_ult = pd.DataFrame(all_ultimate_trades)
-
-if not df_ult.empty:
-    tot = len(df_ult)
-    wins = len(df_ult[df_ult['Outcome'] == 'WIN'])
-    losses = len(df_ult[df_ult['Outcome'] == 'LOSS'])
-    win_rate = round((wins / tot) * 100, 2) if tot > 0 else 0
-    total_pnl = round((wins * 6.0) - (losses * 3.0), 2)
+if len(scanned_setups) > 0:
+    # Convert to DataFrame for sorting by Recent Date
+    df_setups = pd.DataFrame(scanned_setups)
     
-    print("\n" + "="*65)
-    print("   ULTIMATE FILTERED DELAYED BREAKOUT REPORT   ")
-    print("="*65)
-    print(f"Total Qualified Trades         : {tot}")
-    print(f"Wins (Target >= 6% Hit)        : {wins} ({win_rate}%)")
-    print(f"Losses (Stop Loss Hit)         : {losses}")
-    print(f"Cumulative Fixed P&L           : +{total_pnl}% (Avg: +{round(total_pnl/tot,2)}% per trade)")
-    print("="*65)
+    # Sort by Surge_Date DESCENDING (Latest date on top)
+    df_setups['Surge_Date_dt'] = pd.to_datetime(df_setups['Surge_Date'])
+    df_setups = df_setups.sort_values(by='Surge_Date_dt', ascending=False).drop(columns=['Surge_Date_dt'])
+    
+    formatted_rows = df_setups.values.tolist()
 
     try:
-        ws = sh.worksheet("ULTIMATE_DELAYED_STUDY") if "ULTIMATE_DELAYED_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("ULTIMATE_DELAYED_STUDY", 2000, 10)
+        ws = sh.worksheet("READY_FOR_TOMORROW") if "READY_FOR_TOMORROW" in [x.title for x in sh.worksheets()] else sh.add_worksheet("READY_FOR_TOMORROW", 2000, 10)
         ws.clear()
         
-        ws.append_row([f"ULTIMATE DELAYED BREAKOUT STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Total Trades", "Wins", "Win Rate %", "Losses", "Total P&L %"])
-        ws.append_row([tot, wins, f"{win_rate}%", losses, f"+{total_pnl}%"])
-        ws.append_row([])
-        
-        ws.append_row(["Stock", "Surge Date", "Breakout Date", "Entry Price", "Outcome", "Green/Red Vol Ratio", "Pre Net Chg %"])
-        ws.append_rows(df_ult.values.tolist())
-        print("✅ Ultimate delayed study exported to Google Sheet tab 'ULTIMATE_DELAYED_STUDY'!")
+        ws.append_row([f"LIVE DELAYED BREAKOUT SETUPS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["A: Surge Date", "B: Share Name", "C: Entry Price", "D: SL Price", "E: Target Price", "F: Chart"])
+        ws.append_rows(formatted_rows)
+        print("✅ Sorted Live Delayed Setups (Newest Date on Top) successfully exported to Google Sheet tab 'READY_FOR_TOMORROW'!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
 else:
-    print("No trades matched the ultimate delayed criteria.")
+    print("No live delayed setups found matching criteria today.")
     
