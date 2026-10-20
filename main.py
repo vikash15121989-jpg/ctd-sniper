@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== PRE-ENTRY CLUE FINDER (WINNERS VS LOSERS 10-DAY FOOTPRINT) ===")
+print("=== MULTI-FILTER PRE-SURGE COMBINATION BACKTESTER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,7 +19,7 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def extract_pre_entry_clues(symbol):
+def run_multi_filter_backtest(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -66,10 +66,9 @@ def extract_pre_entry_clues(symbol):
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        df['EMA20'] = df['Close'].ewm(span=20).mean()
         df['Candle_Range_%'] = (df['High'] - df['Low']) / df['Low'] * 100
         
-        clue_records = []
+        filtered_trades = []
         n_rows = len(df)
         
         for i in range(25, n_rows - 20):
@@ -79,7 +78,7 @@ def extract_pre_entry_clues(symbol):
             if pd.isna(vol_ma) or vol_ma == 0:
                 continue
                 
-            # Volume Surge Trigger
+            # Volume Surge Trigger (Min 2.5x of 20MA)
             if vol >= (2.5 * vol_ma):
                 pre_10 = df.iloc[i-10:i]
                 if len(pre_10) < 10:
@@ -88,96 +87,97 @@ def extract_pre_entry_clues(symbol):
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 net_price_chg = (pre_10['Close'].iloc[-1] - pre_10['Close'].iloc[0]) / pre_10['Close'].iloc[0] * 100
                 
-                # Smart Money Consolidation Condition
+                # Base Smart Money Consolidation Condition
                 if max_order_mult >= 1.8 and -2.0 <= net_price_chg <= 3.0:
-                    range_high = pre_10['High'].max()
                     
-                    for idx_ahead in range(i+1, min(i+8, n_rows - 15)):
-                        if df['Close'].iloc[idx_ahead] > range_high:
-                            entry_price = range_high
-                            stop_loss = entry_price * 0.97
-                            target_price = entry_price * 1.06
-                            
-                            future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
-                            if future_15.empty:
+                    # --- COMBINED MULTI-FILTERS ---
+                    avg_tightness = pre_10['Candle_Range_%'].mean()
+                    spike_days_cnt = ((pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']) >= 1.5).sum()
+                    
+                    green_vol = pre_10[pre_10['Close'] >= pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
+                    red_vol = pre_10[pre_10['Close'] < pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
+                    green_red_ratio = green_vol / red_vol if red_vol > 0 else 1.0
+                    
+                    # Apply Checklist Filters
+                    if avg_tightness <= 4.0 and spike_days_cnt >= 2 and green_red_ratio >= 2.5:
+                        
+                        range_high = pre_10['High'].max()
+                        
+                        # Look ahead for Method 5 Entry (Breakout above range high)
+                        for idx_ahead in range(i+1, min(i+8, n_rows - 15)):
+                            if df['Close'].iloc[idx_ahead] > range_high:
+                                entry_date = df['Date'].iloc[idx_ahead].strftime('%Y-%m-%d')
+                                entry_price = range_high
+                                stop_loss = entry_price * 0.97 # 3% SL
+                                target_price = entry_price * 1.06 # 6% Target
+                                
+                                future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
+                                if future_15.empty:
+                                    break
+                                    
+                                outcome = "EXPIRED"
+                                for _, f_row in future_15.iterrows():
+                                    if f_row['High'] >= target_price:
+                                        outcome = "WIN"
+                                        break
+                                    elif f_row['Low'] <= stop_loss:
+                                        outcome = "LOSS"
+                                        break
+                                
+                                if outcome in ["WIN", "LOSS"]:
+                                    filtered_trades.append({
+                                        "Stock": symbol,
+                                        "Entry_Date": entry_date,
+                                        "Entry_Price": round(entry_price, 2),
+                                        "Outcome": outcome,
+                                        "Tightness_%": round(avg_tightness, 2),
+                                        "Spike_Days": spike_days_cnt,
+                                        "Green_Red_Vol_Ratio": round(green_red_ratio, 2)
+                                    })
                                 break
-                                
-                            outcome = "EXPIRED"
-                            for _, f_row in future_15.iterrows():
-                                if f_row['High'] >= target_price:
-                                    outcome = "WIN"
-                                    break
-                                elif f_row['Low'] <= stop_loss:
-                                    outcome = "LOSS"
-                                    break
-                            
-                            if outcome in ["WIN", "LOSS"]:
-                                # --- EXTRACT PRE-ENTRY CLUES (10 DAYS BEFORE ENTRY) ---
-                                min_vol_ratio = round(pre_10['Volume'].min() / pre_10['Vol_MA20'].mean(), 2)
-                                avg_tightness = round(pre_10['Candle_Range_%'].mean(), 2)
-                                days_above_ema20 = (pre_10['Close'] > pre_10['EMA20']).sum()
-                                spike_days_cnt = ((pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']) >= 1.5).sum()
-                                
-                                # Up day vs Down day vol ratio
-                                green_vol = pre_10[pre_10['Close'] >= pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
-                                red_vol = pre_10[pre_10['Close'] < pre_10['Close'].shift(1).fillna(pre_10['Close'])]['Volume'].sum()
-                                green_red_vol_ratio = round(green_vol / red_vol, 2) if red_vol > 0 else 1.0
-                                
-                                clue_records.append({
-                                    "Stock": symbol,
-                                    "Outcome": outcome,
-                                    "Pre_Vol_Dry_Ratio": min_vol_ratio,         # Lower is better (dry volume)
-                                    "Pre_Candle_Tightness_%": avg_tightness,   # Lower is better (tight consolidation)
-                                    "Days_Above_EMA20": days_above_ema20,      # Higher is better (holding EMA20 support)
-                                    "Order_Spike_Days_Cnt": spike_days_cnt,    # Number of days with order size spike
-                                    "Green_vs_Red_Vol_Ratio": green_red_vol_ratio # Up day volume vs down day volume
-                                })
-                            break
-                    i += 15
-        return clue_records
+                        i += 15
+        return filtered_trades
     except Exception as e:
         return []
 
-all_clues = []
+all_filtered = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Extracting pre-entry clues for {sym}...")
-        res = extract_pre_entry_clues(sym)
+        print(f"[{idx}/{len(STOCKS)}] Running combined filter backtest for {sym}...")
+        res = run_multi_filter_backtest(sym)
         if res:
-            all_clues.extend(res)
+            all_filtered.extend(res)
 
-df_clues = pd.DataFrame(all_clues)
+df_fil = pd.DataFrame(all_filtered)
 
-if not df_clues.empty:
-    win_clues = df_clues[df_clues['Outcome'] == 'WIN']
-    loss_clues = df_clues[df_clues['Outcome'] == 'LOSS']
+if not df_fil.empty:
+    tot = len(df_fil)
+    wins = len(df_fil[df_fil['Outcome'] == 'WIN'])
+    losses = len(df_fil[df_fil['Outcome'] == 'LOSS'])
+    win_rate = round((wins / tot) * 100, 2) if tot > 0 else 0
     
     print("\n" + "="*65)
-    print("   PRE-ENTRY FOOTPRINT CLUES: WINNERS VS LOSERS   ")
+    print("   MULTI-FILTER COMBINATION PERFORMANCE REPORT   ")
     print("="*65)
-    print(f"1. Lowest Vol Dry Ratio      | Winners: {round(win_clues['Pre_Vol_Dry_Ratio'].mean(),2)}x  | Losers: {round(loss_clues['Pre_Vol_Dry_Ratio'].mean(),2)}x")
-    print(f"2. Daily Candle Tightness % | Winners: {round(win_clues['Pre_Candle_Tightness_%'].mean(),2)}%  | Losers: {round(loss_clues['Pre_Candle_Tightness_%'].mean(),2)}%")
-    print(f"3. Days Above 20 EMA (out of 10)| Winners: {round(win_clues['Days_Above_EMA20'].mean(),1)} Days | Losers: {round(loss_clues['Days_Above_EMA20'].mean(),1)} Days")
-    print(f"4. Order Spike Days Count   | Winners: {round(win_clues['Order_Spike_Days_Cnt'].mean(),1)} Days | Losers: {round(loss_clues['Order_Spike_Days_Cnt'].mean(),1)} Days")
-    print(f"5. Green vs Red Vol Ratio   | Winners: {round(win_clues['Green_vs_Red_Vol_Ratio'].mean(),2)}x  | Losers: {round(loss_clues['Green_vs_Red_Vol_Ratio'].mean(),2)}x")
+    print(f"Total Filtered High-Quality Trades    : {tot}")
+    print(f"Target Hit (>= 6% Gain) Wins          : {wins} ({win_rate}%)")
+    print(f"Stop Loss Hit Losses                  : {losses}")
     print("="*65)
 
     try:
-        ws = sh.worksheet("PRE_ENTRY_CLUES_STUDY") if "PRE_ENTRY_CLUES_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("PRE_ENTRY_CLUES_STUDY", 2000, 10)
+        ws = sh.worksheet("MULTI_FILTER_STUDY") if "MULTI_FILTER_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("MULTI_FILTER_STUDY", 2000, 10)
         ws.clear()
         
-        ws.append_row([f"PRE-ENTRY CLUES STUDY (WINNERS VS LOSERS) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Metric", "Winners Avg", "Losers Avg", "Difference / Actionable Clue"])
-        ws.append_row(["Lowest Vol Dry Ratio", round(win_clues['Pre_Vol_Dry_Ratio'].mean(),2), round(loss_clues['Pre_Vol_Dry_Ratio'].mean(),2), "Drier volume before surge"])
-        ws.append_row(["Daily Candle Tightness %", round(win_clues['Pre_Candle_Tightness_%'].mean(),2), round(loss_clues['Pre_Candle_Tightness_%'].mean(),2), "Tighter price range"])
-        ws.append_row(["Days Above 20 EMA", round(win_clues['Days_Above_EMA20'].mean(),1), round(loss_clues['Days_Above_EMA20'].mean(),1), "Price holding above 20 EMA"])
-        ws.append_row(["Order Spike Days Count", round(win_clues['Order_Spike_Days_Cnt'].mean(),1), round(loss_clues['Order_Spike_Days_Cnt'].mean(),1), "Multiple order size spike days"])
-        ws.append_row(["Green vs Red Vol Ratio", round(win_clues['Green_vs_Red_Vol_Ratio'].mean(),2), round(loss_clues['Green_vs_Red_Vol_Ratio'].mean(),2), "Buying volume dominance"])
+        ws.append_row([f"MULTI-FILTER COMBINATION STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Total Trades", "Wins (>=6%)", "Win Rate %", "Losses (SL Hit)"])
+        ws.append_row([tot, wins, f"{win_rate}%", losses])
         ws.append_row([])
         
-        ws.append_row(["Stock", "Outcome", "Pre Vol Dry Ratio", "Pre Candle Tightness %", "Days Above EMA20", "Order Spike Days Cnt", "Green vs Red Vol Ratio"])
-        ws.append_rows(df_clues.values.tolist())
-        print("✅ Pre-entry clues study exported to Google Sheet tab 'PRE_ENTRY_CLUES_STUDY'!")
+        ws.append_row(["Stock", "Entry Date", "Entry Price", "Outcome", "Tightness %", "Spike Days", "Green Red Vol Ratio"])
+        ws.append_rows(df_fil.values.tolist())
+        print("✅ Multi-filter report exported to Google Sheet tab 'MULTI_FILTER_STUDY'!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
-        
+else:
+    print("No trades matched the combined multi-filter checklist.")
+    
