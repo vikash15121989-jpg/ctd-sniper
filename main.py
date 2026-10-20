@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== 10-METHOD ENTRY OPTIMIZATION BACKTESTER ===")
+print("=== METHOD 5 (10D RANGE HIGH BREAKOUT) DEEP DIVE ANALYZER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,7 +19,7 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def run_10_methods_backtest(symbol):
+def analyze_method_5_details(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -53,46 +53,23 @@ def run_10_methods_backtest(symbol):
         df = df.rename(columns=col_map)
         df = df.loc[:, ~df.columns.duplicated()]
         
-        # If Open is missing, estimate with Close
-        if 'Open' not in df.columns:
-            df['Open'] = df['Close'].shift(1).fillna(df['Close'])
-
-        required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Open', 'Date']
+        required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Date']
         if not all(col in df.columns for col in required_cols):
             return []
 
         df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
         df = df.sort_values('Date').reset_index(drop=True)
         
-        for col in ['Volume', 'Trades', 'Close', 'High', 'Low', 'Open']:
+        for col in ['Volume', 'Trades', 'Close', 'High', 'Low']:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
                 
-        df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low', 'Open'])
+        df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
         
-        # Helper function to test a specific entry point and price
-        def evaluate_trade(entry_idx, entry_price):
-            if entry_price <= 0 or entry_idx >= len(df) - 15:
-                return None
-                
-            stop_loss = entry_price * 0.97 # 3% SL
-            target = entry_price * 1.06  # 6% Target
-            
-            future = df.iloc[entry_idx + 1 : entry_idx + 16]
-            if future.empty:
-                return None
-                
-            for _, f_row in future.iterrows():
-                if f_row['High'] >= target:
-                    return "WIN"
-                if f_row['Low'] <= stop_loss:
-                    return "LOSS"
-            return "EXPIRED"
-
-        method_stats = {m: {"Wins": 0, "Losses": 0, "Total": 0} for m in range(1, 11)}
+        m5_records = []
         n_rows = len(df)
         
         for i in range(25, n_rows - 20):
@@ -104,6 +81,8 @@ def run_10_methods_backtest(symbol):
                 
             # Volume Surge Trigger (Min 2.5x of 20MA)
             if vol >= (2.5 * vol_ma):
+                surge_vol_mult = round(vol / vol_ma, 2)
+                
                 # Check preceding 10 days Smart Money Footprint
                 pre_10 = df.iloc[i-10:i]
                 if len(pre_10) < 10:
@@ -112,160 +91,112 @@ def run_10_methods_backtest(symbol):
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 net_price_chg = (pre_10['Close'].iloc[-1] - pre_10['Close'].iloc[0]) / pre_10['Close'].iloc[0] * 100
                 
-                # Smart Money Condition: Order size >= 1.8x & Price flat (-2% to +3%)
+                # Smart Money Condition
                 if max_order_mult >= 1.8 and -2.0 <= net_price_chg <= 3.0:
                     
-                    # --- TEST 10 ENTRY METHODS FOR THIS SURGE ---
-                    
-                    # Method 1: Surge Day Close
-                    res = evaluate_trade(i, df['Close'].iloc[i])
-                    if res: 
-                        method_stats[1]["Total"] += 1
-                        if res == "WIN": method_stats[1]["Wins"] += 1
-                        elif res == "LOSS": method_stats[1]["Losses"] += 1
-
-                    # Method 2: Next Day Open
-                    if i + 1 < n_rows:
-                        res = evaluate_trade(i+1, df['Open'].iloc[i+1])
-                        if res:
-                            method_stats[2]["Total"] += 1
-                            if res == "WIN": method_stats[2]["Wins"] += 1
-                            elif res == "LOSS": method_stats[2]["Losses"] += 1
-
-                    # Method 3: Break of Surge High (Look ahead next 5 days for breakout above surge high)
-                    surge_high = df['High'].iloc[i]
-                    m3_entered = False
-                    for idx_ahead in range(i+1, min(i+6, n_rows)):
-                        if df['High'].iloc[idx_ahead] >= surge_high:
-                            res = evaluate_trade(idx_ahead, surge_high)
-                            if res:
-                                method_stats[3]["Total"] += 1
-                                if res == "WIN": method_stats[3]["Wins"] += 1
-                                elif res == "LOSS": method_stats[3]["Losses"] += 1
-                            m3_entered = True
-                            break
-
-                    # Method 4: Pullback to Surge Low
-                    surge_low = df['Low'].iloc[i]
-                    for idx_ahead in range(i+1, min(i+8, n_rows)):
-                        if df['Low'].iloc[idx_ahead] <= surge_low * 1.01:
-                            res = evaluate_trade(idx_ahead, surge_low)
-                            if res:
-                                method_stats[4]["Total"] += 1
-                                if res == "WIN": method_stats[4]["Wins"] += 1
-                                elif res == "LOSS": method_stats[4]["Losses"] += 1
-                            break
-
-                    # Method 5: 10-Day Consolidation Range High Breakout
+                    # METHOD 5 LOGIC: 10-Day Consolidation High Breakout
                     range_high = pre_10['High'].max()
-                    for idx_ahead in range(i+1, min(i+8, n_rows)):
+                    
+                    # Look ahead for breakout entry
+                    for idx_ahead in range(i+1, min(i+8, n_rows - 15)):
                         if df['Close'].iloc[idx_ahead] > range_high:
-                            res = evaluate_trade(idx_ahead, range_high)
-                            if res:
-                                method_stats[5]["Total"] += 1
-                                if res == "WIN": method_stats[5]["Wins"] += 1
-                                elif res == "LOSS": method_stats[5]["Losses"] += 1
+                            entry_date = df['Date'].iloc[idx_ahead].strftime('%Y-%m-%d')
+                            entry_price = range_high
+                            stop_loss = entry_price * 0.97 # 3% SL
+                            target_price = entry_price * 1.06 # 6% Target
+                            
+                            # Track performance post entry
+                            future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
+                            if future_15.empty:
+                                break
+                                
+                            outcome = "EXPIRED"
+                            days_to_result = 0
+                            max_up_pct = 0.0
+                            
+                            for d_count, (_, f_row) in enumerate(future_15.iterrows(), 1):
+                                f_high = f_row['High']
+                                f_low = f_row['Low']
+                                
+                                up_move = (f_high - entry_price) / entry_price * 100
+                                if up_move > max_up_pct:
+                                    max_up_pct = round(up_move, 2)
+                                    
+                                if f_high >= target_price:
+                                    outcome = "PROFIT (>=6%)"
+                                    days_to_result = d_count
+                                    break
+                                elif f_low <= stop_loss:
+                                    outcome = "LOSS (SL Hit)"
+                                    days_to_result = d_count
+                                    break
+                            
+                            m5_records.append({
+                                "Stock": symbol,
+                                "Entry_Date": entry_date,
+                                "Entry_Price": round(entry_price, 2),
+                                "Surge_Vol_Mult": surge_vol_mult,
+                                "Pre_10D_Order_Mult": round(max_order_mult, 2),
+                                "Outcome": outcome,
+                                "Days_Taken": days_to_result if days_to_result > 0 else "-",
+                                "Max_Gain_%": max_up_pct
+                            })
                             break
-
-                    # Method 6: VWAP/Mean Reversion entry (Using Typical Price as proxy)
-                    typical_price = (df['High'].iloc[i] + df['Low'].iloc[i] + df['Close'].iloc[i]) / 3
-                    res = evaluate_trade(i, typical_price)
-                    if res:
-                        method_stats[6]["Total"] += 1
-                        if res == "WIN": method_stats[6]["Wins"] += 1
-                        elif res == "LOSS": method_stats[6]["Losses"] += 1
-
-                    # Method 7: Pivot Point Resistance Breakout (PP = (H+L+C)/3, R1 = 2*PP - L)
-                    pp = (df['High'].iloc[i] + df['Low'].iloc[i] + df['Close'].iloc[i]) / 3
-                    r1 = (2 * pp) - df['Low'].iloc[i]
-                    for idx_ahead in range(i+1, min(i+6, n_rows)):
-                        if df['Close'].iloc[idx_ahead] >= r1:
-                            res = evaluate_trade(idx_ahead, r1)
-                            if res:
-                                method_stats[7]["Total"] += 1
-                                if res == "WIN": method_stats[7]["Wins"] += 1
-                                elif res == "LOSS": method_stats[7]["Losses"] += 1
-                            break
-
-                    # Method 8: 3rd Day After Surge
-                    if i + 3 < n_rows:
-                        res = evaluate_trade(i+3, df['Close'].iloc[i+3])
-                        if res:
-                            method_stats[8]["Total"] += 1
-                            if res == "WIN": method_stats[8]["Wins"] += 1
-                            elif res == "LOSS": method_stats[8]["Losses"] += 1
-
-                    # Method 9: Moving Average confirmation (Close > 5 EMA)
-                    ema5 = df['Close'].ewm(span=5).mean()
-                    if i < len(ema5) and df['Close'].iloc[i] > ema5.iloc[i]:
-                        res = evaluate_trade(i, df['Close'].iloc[i])
-                        if res:
-                            method_stats[9]["Total"] += 1
-                            if res == "WIN": method_stats[9]["Wins"] += 1
-                            elif res == "LOSS": method_stats[9]["Losses"] += 1
-
-                    # Method 10: Pre-Surge Last Day Close (Right before volume spike)
-                    res = evaluate_trade(i-1, df['Close'].iloc[i-1])
-                    if res:
-                        method_stats[10]["Total"] += 1
-                        if res == "WIN": method_stats[10]["Wins"] += 1
-                        elif res == "LOSS": method_stats[10]["Losses"] += 1
-                        
-                    i += 15 # jump ahead
-        return method_stats
+                    i += 15
+        return m5_records
     except Exception as e:
-        return {}
+        return []
 
-aggregate_stats = {m: {"Wins": 0, "Losses": 0, "Total": 0} for m in range(1, 11)}
-
+all_m5 = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Optimizing entry methods for {sym}...")
-        res = run_10_methods_backtest(sym)
+        print(f"[{idx}/{len(STOCKS)}] Analyzing Method 5 trades for {sym}...")
+        res = analyze_method_5_details(sym)
         if res:
-            for m in res:
-                aggregate_stats[m]["Wins"] += res[m]["Wins"]
-                aggregate_stats[m]["Losses"] += res[m]["Losses"]
-                aggregate_stats[m]["Total"] += res[m]["Total"]
+            all_m5.extend(res)
 
-summary_rows = []
-print("\n" + "="*65)
-print("   10-METHOD ENTRY STRATEGY OPTIMIZATION REPORT   ")
-print("="*65)
+df_m5 = pd.DataFrame(all_m5)
 
-method_names = {
-    1: "Method 1: Surge Day Close Entry",
-    2: "Method 2: Next Day Open Entry",
-    3: "Method 3: Break of Surge High Entry",
-    4: "Method 4: Pullback to Surge Low Entry",
-    5: "Method 5: 10D Range High Breakout",
-    6: "Method 6: Typical Price / VWAP Proxy",
-    7: "Method 7: Pivot Point R1 Breakout",
-    8: "Method 8: 3rd Day After Surge Entry",
-    9: "Method 9: 5 EMA Trend Confirmation",
-    10: "Method 10: Pre-Surge Last Day Entry"
-}
-
-for m in range(1, 11):
-    tot = aggregate_stats[m]["Total"]
-    wins = aggregate_stats[m]["Wins"]
-    losses = aggregate_stats[m]["Losses"]
-    win_rate = round((wins / tot) * 100, 2) if tot > 0 else 0
+if not df_m5.empty:
+    total_trades = len(df_m5)
+    profits = df_m5[df_m5['Outcome'] == 'PROFIT (>=6%)']
+    losses = df_m5[df_m5['Outcome'] == 'LOSS (SL Hit)']
     
-    print(f"{method_names[m]:<38} | Trades: {tot:<5} | Wins: {wins:<5} | Win Rate: {win_rate}%")
-    summary_rows.append([method_names[m], tot, wins, losses, f"{win_rate}%"])
-
-print("="*65)
-
-# Export to Google Sheet
-try:
-    ws = sh.worksheet("ENTRY_OPTIMIZATION_STUDY") if "ENTRY_OPTIMIZATION_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("ENTRY_OPTIMIZATION_STUDY", 2000, 10)
-    ws.clear()
+    win_cnt = len(profits)
+    loss_cnt = len(losses)
+    win_pct = round((win_cnt / total_trades) * 100, 2)
     
-    ws.append_row([f"10-METHOD ENTRY STRATEGY OPTIMIZATION STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-    ws.append_row(["Entry Method Name", "Total Trades", "Wins (>=6%)", "Losses (SL Hit)", "Win Rate %"])
-    ws.append_rows(summary_rows)
-    print("✅ Optimization study exported to Google Sheet tab 'ENTRY_OPTIMIZATION_STUDY'!")
-except Exception as e:
-    print(f"Failed to export to Google Sheet: {e}")
-                            
+    avg_win_days = round(pd.to_numeric(profits['Days_Taken'], errors='coerce').mean(), 1)
+    avg_max_gain = round(profits['Max_Gain_%'].mean(), 2)
+    avg_surge_vol_win = round(profits['Surge_Vol_Mult'].mean(), 2)
+    avg_surge_vol_loss = round(losses['Surge_Vol_Mult'].mean(), 2)
+    
+    print("\n" + "="*65)
+    print("   METHOD 5 (10D RANGE HIGH BREAKOUT) DEEP ANALYSIS REPORT   ")
+    print("="*65)
+    print(f"Total Method 5 Trades                  : {total_trades}")
+    print(f"Profit Trades (Target >= 6% Hit)       : {win_cnt} ({win_pct}%)")
+    print(f"Loss Trades (Stop Loss Hit)            : {loss_cnt}")
+    print(f"Average Days to Hit 6% Profit          : {avg_win_days} Days")
+    print(f"Average Max Gain in Winning Trades     : +{avg_max_gain}%")
+    print(f"Average Surge Vol Multiple in WIN Trades: {avg_surge_vol_win}x")
+    print(f"Average Surge Vol Multiple in LOSS Trades: {avg_surge_vol_loss}x")
+    print("="*65)
+
+    try:
+        ws = sh.worksheet("METHOD_5_DEEP_DIVE") if "METHOD_5_DEEP_DIVE" in [x.title for x in sh.worksheets()] else sh.add_worksheet("METHOD_5_DEEP_DIVE", 2000, 10)
+        ws.clear()
+        
+        ws.append_row([f"METHOD 5 DEEP ANALYSIS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Total Trades", "Profits (>=6%)", "Win Rate %", "Losses (SL Hit)", "Avg Days to Profit", "Avg Max Gain %", "Avg Vol Mult (Win)", "Avg Vol Mult (Loss)"])
+        ws.append_row([total_trades, win_cnt, f"{win_pct}%", loss_cnt, avg_win_days, f"{avg_max_gain}%", f"{avg_surge_vol_win}x", f"{avg_surge_vol_loss}x"])
+        ws.append_row([])
+        
+        ws.append_row(["Stock", "Entry Date", "Entry Price", "Surge Vol Mult", "Pre 10D Order Mult", "Outcome", "Days Taken", "Max Gain %"])
+        ws.append_rows(df_m5.values.tolist())
+        print("✅ Deep analysis exported to Google Sheet tab 'METHOD_5_DEEP_DIVE'!")
+    except Exception as e:
+        print(f"Failed to export to Google Sheet: {e}")
+else:
+    print("No Method 5 trades found.")
+    
