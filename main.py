@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== SURGE OUTCOME BACKTESTER (BREAKOUT VS BREAKDOWN) ===")
+print("=== SURGE CAUSE & CATEGORIZATION ANALYZER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,7 +19,7 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def analyze_surge_outcome(symbol):
+def categorize_surge_causes(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -66,25 +66,22 @@ def analyze_surge_outcome(symbol):
         df['Avg_Order_Size'] = df['Volume'] / df['Trades']
         df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        df['Prev_Close'] = df['Close'].shift(1)
-        df['Daily_Return'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close'] * 100
         
-        outcomes = []
+        categorized = []
         n_rows = len(df)
         
-        for i in range(25, n_rows - 15):
+        for i in range(25, n_rows - 10):
             vol = df['Volume'].iloc[i]
             vol_ma = df['Vol_MA20'].iloc[i]
             
             if pd.isna(vol_ma) or vol_ma == 0:
                 continue
                 
-            # Volume Surge Trigger (Min 2.5x of 20MA)
+            # Every Volume Surge Trigger (>= 2.5x of 20MA)
             if vol >= (2.5 * vol_ma):
                 surge_date = df['Date'].iloc[i].strftime('%Y-%m-%d')
                 surge_price = df['Close'].iloc[i]
                 
-                # Check preceding 10 days condition (Smart money footprint check)
                 pre_10 = df.iloc[i-10:i]
                 if len(pre_10) < 10:
                     continue
@@ -92,72 +89,70 @@ def analyze_surge_outcome(symbol):
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 net_price_chg = (pre_10['Close'].iloc[-1] - pre_10['Close'].iloc[0]) / pre_10['Close'].iloc[0] * 100
                 
-                # Filter: If pre-surge had order size spike >= 1.8x and net price was relatively flat (-2% to +3%)
+                # --- CATEGORIZATION LOGIC ---
                 if max_order_mult >= 1.8 and -2.0 <= net_price_chg <= 3.0:
-                    
-                    # Track post-surge performance for next 10 days
-                    post_10 = df.iloc[i+1:i+11]
-                    if post_10.empty:
-                        continue
-                        
-                    max_high = post_10['High'].max()
-                    min_low = post_10['Low'].min()
-                    
-                    up_pct = round((max_high - surge_price) / surge_price * 100, 2)
-                    down_pct = round((min_low - surge_price) / surge_price * 100, 2)
-                    
-                    if up_pct >= 6.0 and abs(down_pct) < 3.0:
-                        result = "Strong Breakout (UP)"
-                    elif down_pct <= -3.0 and up_pct < 5.0:
-                        result = "Breakdown (DOWN)"
-                    else:
-                        result = "Sideways / Mixed"
-                        
-                    outcomes.append({
-                        "Stock": symbol,
-                        "Surge_Date": surge_date,
-                        "Surge_Price": round(surge_price, 2),
-                        "Pre_Surge_Max_Order_Mult": round(max_order_mult, 2),
-                        "Pre_10D_Net_Chg_%": round(net_price_chg, 2),
-                        "Post_Surge_Max_Up_%": up_pct,
-                        "Post_Surge_Max_Down_%": down_pct,
-                        "Outcome_Result": result
-                    })
-                    
-                    i += 10 # skip to next window
-        return outcomes
+                    category = "1. Smart Money Accumulation (Quiet Size Spike)"
+                elif net_price_chg > 5.0:
+                    category = "2. Existing Momentum / Trend Move"
+                else:
+                    category = "3. Random / News / High Volatility Event"
+                
+                categorized.append({
+                    "Stock": symbol,
+                    "Surge_Date": surge_date,
+                    "Surge_Price": round(surge_price, 2),
+                    "Pre_10D_Max_Order_Mult": round(max_order_mult, 2),
+                    "Pre_10D_Net_Chg_%": round(net_price_chg, 2),
+                    "Category": category
+                })
+                i += 5
+        return categorized
     except Exception as e:
         return []
 
-all_outcomes = []
+all_categorized = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Analyzing surge outcomes for {sym}...")
-        res = analyze_surge_outcome(sym)
+        print(f"[{idx}/{len(STOCKS)}] Categorizing surge triggers for {sym}...")
+        res = categorize_surge_causes(sym)
         if res:
-            all_outcomes.extend(res)
+            all_categorized.extend(res)
 
-df_out = pd.DataFrame(all_outcomes)
+df_cat = pd.DataFrame(all_categorized)
 
-if not df_out.empty:
-    print("\n" + "="*60)
-    print("   SURGE OUTCOME PERFORMANCE REPORT   ")
-    print("="*60)
-    print(f"Total Filtered Surges Analyzed        : {len(df_out)}")
-    print(f"Strong Breakouts (UP)                 : {len(df_out[df_out['Outcome_Result'] == 'Strong Breakout (UP)'])}")
-    print(f"Breakdowns (DOWN)                     : {len(df_out[df_out['Outcome_Result'] == 'Breakdown (DOWN)'])}")
-    print("="*60)
+if not df_cat.empty:
+    total_surges = len(df_cat)
+    cat1_count = len(df_cat[df_cat['Category'].str.startswith('1.')])
+    cat2_count = len(df_cat[df_cat['Category'].str.startswith('2.')])
+    cat3_count = len(df_cat[df_cat['Category'].str.startswith('3.')])
+    
+    cat1_pct = round((cat1_count / total_surges) * 100, 2)
+    cat2_pct = round((cat2_count / total_surges) * 100, 2)
+    cat3_pct = round((cat3_count / total_surges) * 100, 2)
+    
+    print("\n" + "="*65)
+    print("   VOLUME SURGE CAUSE & DISTRIBUTION REPORT   ")
+    print("="*65)
+    print(f"Total Volume Surges Analyzed            : {total_surges}")
+    print(f"1. Smart Money Footprint (Accumulation) : {cat1_count} ({cat1_pct}%)")
+    print(f"2. Existing Momentum Run                : {cat2_count} ({cat2_pct}%)")
+    print(f"3. Random / News / Volatile Event       : {cat3_count} ({cat3_pct}%)")
+    print("="*65)
 
     try:
-        ws = sh.worksheet("SURGE_OUTCOME_STUDY") if "SURGE_OUTCOME_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SURGE_OUTCOME_STUDY", 2000, 10)
+        ws = sh.worksheet("SURGE_CATEGORIZATION") if "SURGE_CATEGORIZATION" in [x.title for x in sh.worksheets()] else sh.add_worksheet("SURGE_CATEGORIZATION", 2000, 10)
         ws.clear()
         
-        ws.append_row([f"SURGE OUTCOME STUDY (BREAKOUT VS BREAKDOWN) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["Stock", "Surge Date", "Surge Price", "Pre Surge Max Order Mult", "Pre 10D Net Chg %", "Post Surge Max Up %", "Post Surge Max Down %", "Outcome Result"])
-        ws.append_rows(df_out.values.tolist())
-        print("✅ Surge outcome study exported to Google Sheet tab 'SURGE_OUTCOME_STUDY'!")
+        ws.append_row([f"SURGE BREAKDOWN DISTRIBUTION | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row(["Total Surges", "Smart Money Accumulation Count", "Smart Money %", "Momentum Run Count", "Momentum %", "Random/News Count", "Random %"])
+        ws.append_row([total_surges, cat1_count, f"{cat1_pct}%", cat2_count, f"{cat2_pct}%", cat3_count, f"{cat3_pct}%"])
+        ws.append_row([])
+        
+        ws.append_row(["Stock", "Surge Date", "Surge Price", "Pre 10D Max Order Mult", "Pre 10D Net Chg %", "Category"])
+        ws.append_rows(df_cat.values.tolist())
+        print("✅ Categorized distribution exported to Google Sheet tab 'SURGE_CATEGORIZATION'!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
 else:
-    print("No matching surge outcomes found.")
+    print("No surge data categorized.")
     
