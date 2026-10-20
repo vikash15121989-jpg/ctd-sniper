@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== PRE-SURGE MAX VOLUME WITHOUT BREAKOUT BACKTESTER ===")
+print("=== FILTERED DELAYED BREAKOUT BACKTESTER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,7 +19,7 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def run_delayed_breakout_backtest(symbol):
+def run_filtered_delayed_backtest(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')
@@ -64,12 +64,21 @@ def run_delayed_breakout_backtest(symbol):
         df = df.dropna(subset=['Volume', 'Trades', 'Close', 'High', 'Low'])
         
         df['Turnover'] = df['Volume'] * df['Close']
+        df['Avg_Order_Size'] = df['Volume'] / df['Trades']
+        df['Avg_Size_MA20'] = df['Avg_Order_Size'].rolling(20).mean()
+        df['Candle_Range_%'] = (df['High'] - df['Low']) / df['Low'] * 100
+        
         trade_rows = []
         n_rows = len(df)
         
         for i in range(15, n_rows - 20):
             pre_10 = df.iloc[i-10:i]
             if len(pre_10) < 10:
+                continue
+                
+            # Liquidity Filter Check (Min 2 Crore Turnover)
+            avg_turnover = pre_10['Turnover'].mean()
+            if avg_turnover < 20000000:
                 continue
                 
             max_10d_vol = pre_10['Volume'].max()
@@ -79,94 +88,96 @@ def run_delayed_breakout_backtest(symbol):
             current_high = df['High'].iloc[i]
             current_close = df['Close'].iloc[i]
             
-            # Condition: Volume is greater than last 10 days max volume, BUT Close did NOT break the 10-day high on this exact day
+            # Volume surge greater than last 10 days max volume, but close did NOT break the 10-day high
             if current_vol > max_10d_vol and current_close < max_10d_high:
-                # Liquidity check
-                avg_turnover = pre_10['Turnover'].mean()
-                if avg_turnover < 20000000:
-                    continue
                 
-                # Now check if it breaks the 10-day high within the next 10 days
-                subsequent_10 = df.iloc[i+1 : i+11]
-                if subsequent_10.empty:
-                    continue
+                # Smart Money Footprint Check on pre-10 days accumulation
+                max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
+                avg_tightness = pre_10['Candle_Range_%'].mean()
                 
-                for idx_ahead, f_row in subsequent_10.iterrows():
-                    if f_row['Close'] > max_10d_high:
-                        # Breakout happened within 10 days! Let's test the trade outcome
-                        entry_date = f_row['Date'].strftime('%Y-%m-%d')
-                        entry_p = max_10d_high
-                        
-                        future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
-                        if future_15.empty:
-                            break
+                if max_order_mult >= 1.8 and avg_tightness <= 4.0:
+                    
+                    # Check if it breaks the 10-day high within the next 10 days
+                    subsequent_10 = df.iloc[i+1 : i+11]
+                    if subsequent_10.empty:
+                        continue
+                    
+                    for idx_ahead, f_row in subsequent_10.iterrows():
+                        if f_row['Close'] > max_10d_high:
+                            entry_date = f_row['Date'].strftime('%Y-%m-%d')
+                            entry_p = max_10d_high
                             
-                        sl = entry_p * 0.97
-                        tgt = entry_p * 1.06
-                        outcome = "EXPIRED"
-                        
-                        for _, fut in future_15.iterrows():
-                            if fut['High'] >= tgt:
-                                outcome = "WIN"
+                            future_15 = df.iloc[idx_ahead+1 : idx_ahead+16]
+                            if future_15.empty:
                                 break
-                            elif fut['Low'] <= sl:
-                                outcome = "LOSS"
-                                break
-                        
-                        if outcome in ["WIN", "LOSS"]:
-                            trade_rows.append({
-                                "Stock": symbol,
-                                "Surge_Date": df['Date'].iloc[i].strftime('%Y-%m-%d'),
-                                "Breakout_Date": entry_date,
-                                "Entry_Price": round(entry_p, 2),
-                                "Outcome": outcome
-                            })
-                        break
+                                
+                            sl = entry_p * 0.97
+                            tgt = entry_p * 1.06
+                            outcome = "EXPIRED"
+                            
+                            for _, fut in future_15.iterrows():
+                                if fut['High'] >= tgt:
+                                    outcome = "WIN"
+                                    break
+                                elif fut['Low'] <= sl:
+                                    outcome = "LOSS"
+                                    break
+                            
+                            if outcome in ["WIN", "LOSS"]:
+                                trade_rows.append({
+                                    "Stock": symbol,
+                                    "Surge_Date": df['Date'].iloc[i].strftime('%Y-%m-%d'),
+                                    "Breakout_Date": entry_date,
+                                    "Entry_Price": round(entry_p, 2),
+                                    "Outcome": outcome,
+                                    "Turnover_Cr": round(avg_turnover / 10000000, 2)
+                                })
+                            break
             i += 1
         return trade_rows
     except Exception as e:
         return []
 
-all_delayed_trades = []
+all_filtered_delayed = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Running delayed breakout backtest for {sym}...")
-        res = run_delayed_breakout_backtest(sym)
+        print(f"[{idx}/{len(STOCKS)}] Running filtered delayed breakout backtest for {sym}...")
+        res = run_filtered_delayed_backtest(sym)
         if res:
-            all_delayed_trades.extend(res)
+            all_filtered_delayed.extend(res)
 
-df_del = pd.DataFrame(all_delayed_trades)
+df_fdel = pd.DataFrame(all_filtered_delayed)
 
-if not df_del.empty:
-    tot = len(df_del)
-    wins = len(df_del[df_del['Outcome'] == 'WIN'])
-    losses = len(df_del[df_del['Outcome'] == 'LOSS'])
+if not df_fdel.empty:
+    tot = len(df_fdel)
+    wins = len(df_fdel[df_fdel['Outcome'] == 'WIN'])
+    losses = len(df_fdel[df_fdel['Outcome'] == 'LOSS'])
     win_rate = round((wins / tot) * 100, 2) if tot > 0 else 0
     total_pnl = round((wins * 6.0) - (losses * 3.0), 2)
     
     print("\n" + "="*65)
-    print("   DELAYED BREAKOUT (VOLUME SURGE WITHOUT IMMEDIATE HIGH BREAK) REPORT   ")
+    print("   FILTERED DELAYED BREAKOUT PERFORMANCE REPORT   ")
     print("="*65)
-    print(f"Total Qualified Trades         : {tot}")
-    print(f"Wins (Target >= 6% Hit)        : {wins} ({win_rate}%)")
-    print(f"Losses (Stop Loss Hit)         : {losses}")
-    print(f"Cumulative Fixed P&L           : +{total_pnl}% (Avg: +{round(total_pnl/tot,2)}% per trade)")
+    print(f"Total Qualified Filtered Trades : {tot}")
+    print(f"Wins (Target >= 6% Hit)         : {wins} ({win_rate}%)")
+    print(f"Losses (Stop Loss Hit)          : {losses}")
+    print(f"Cumulative Fixed P&L            : +{total_pnl}% (Avg: +{round(total_pnl/tot,2)}% per trade)")
     print("="*65)
 
     try:
-        ws = sh.worksheet("DELAYED_BREAKOUT_STUDY") if "DELAYED_BREAKOUT_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("DELAYED_BREAKOUT_STUDY", 2000, 10)
+        ws = sh.worksheet("FILTERED_DELAYED_STUDY") if "FILTERED_DELAYED_STUDY" in [x.title for x in sh.worksheets()] else sh.add_worksheet("FILTERED_DELAYED_STUDY", 2000, 10)
         ws.clear()
         
-        ws.append_row([f"DELAYED BREAKOUT STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws.append_row([f"FILTERED DELAYED BREAKOUT STUDY | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
         ws.append_row(["Total Trades", "Wins", "Win Rate %", "Losses", "Total P&L %"])
         ws.append_row([tot, wins, f"{win_rate}%", losses, f"+{total_pnl}%"])
         ws.append_row([])
         
-        ws.append_row(["Stock", "Surge Date", "Breakout Date", "Entry Price", "Outcome"])
-        ws.append_rows(df_del.values.tolist())
-        print("✅ Delayed breakout study exported to Google Sheet tab 'DELAYED_BREAKOUT_STUDY'!")
+        ws.append_row(["Stock", "Surge Date", "Breakout Date", "Entry Price", "Outcome", "Turnover (Cr)"])
+        ws.append_rows(df_fdel.values.tolist())
+        print("✅ Filtered delayed breakout study exported to Google Sheet tab 'FILTERED_DELAYED_STUDY'!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
 else:
-    print("No trades matched the delayed breakout criteria.")
+    print("No trades matched the filtered delayed breakout criteria.")
     
