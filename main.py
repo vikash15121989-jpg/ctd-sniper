@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== LIVE DELAYED BREAKOUT SETUP SCANNER ===")
+print("=== DUAL-PIPELINE DELAYED BREAKOUT SCANNER ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -19,14 +19,17 @@ except Exception as e:
     print(f"Google Sheet Connection Error: {e}")
     STOCKS = []
 
-def scan_live_delayed_setups(symbol):
+pre_surge_radar = []
+active_delayed_setups = []
+
+def process_stock_pipelines(symbol):
     try:
         to_date = datetime.now().strftime('%d-%m-%Y')
         from_date = (datetime.now() - timedelta(days=60)).strftime('%d-%m-%Y')
         
         df = capital_market.price_volume_data(symbol=symbol, from_date=from_date, to_date=to_date)
         if df is None or df.empty or len(df) < 25:
-            return None
+            return
             
         df.columns = [str(c).strip().title() for c in df.columns]
         df = df.loc[:, ~df.columns.duplicated()]
@@ -52,7 +55,7 @@ def scan_live_delayed_setups(symbol):
         
         required_cols = ['Volume', 'Trades', 'Close', 'High', 'Low', 'Date']
         if not all(col in df.columns for col in required_cols):
-            return None
+            return
 
         df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
         df = df.sort_values('Date').reset_index(drop=True)
@@ -68,16 +71,57 @@ def scan_live_delayed_setups(symbol):
         df['Candle_Range_%'] = (df['High'] - df['Low']) / df['Low'] * 100
         
         n_rows = len(df)
-        if n_rows < 15:
-            return None
+        if n_rows < 20:
+            return
+
+        # -------------------------------------------------------------
+        # PIPELINE 1: PRE-SURGE RADAR (Pattern ready, but Volume Surge pending)
+        # -------------------------------------------------------------
+        last_10 = df.iloc[-10:]
+        avg_turnover_p1 = last_10['Turnover'].mean()
+        
+        if avg_turnover_p1 >= 20000000: # Turnover >= 2 Cr
+            max_order_mult_p1 = (last_10['Avg_Order_Size'] / last_10['Avg_Size_MA20']).max()
+            avg_tightness_p1 = last_10['Candle_Range_%'].mean()
             
-        # Check in the last 10 trading sessions for the volume surge setup
-        for i in range(n_rows - 10, n_rows - 1):
+            green_vol_p1 = last_10[last_10['Close'] >= last_10['Close'].shift(1).fillna(last_10['Close'])]['Volume'].sum()
+            red_vol_p1 = last_10[last_10['Close'] < last_10['Close'].shift(1).fillna(last_10['Close'])]['Volume'].sum()
+            gr_ratio_p1 = green_vol_p1 / red_vol_p1 if red_vol_p1 > 0 else 10.0
+            pre_net_chg_p1 = (last_10['Close'].iloc[-1] - last_10['Close'].iloc[0]) / last_10['Close'].iloc[0] * 100
+            
+            latest_vol = df['Volume'].iloc[-1]
+            max_10d_vol_p1 = df['Volume'].iloc[-11:-1].max()
+            
+            if (max_order_mult_p1 >= 1.8 and 
+                avg_tightness_p1 <= 4.0 and 
+                gr_ratio_p1 >= 2.5 and 
+                pre_net_chg_p1 > 0 and 
+                latest_vol <= max_10d_vol_p1):
+                
+                curr_price = round(df['Close'].iloc[-1], 2)
+                d10_high = round(last_10['High'].max(), 2)
+                
+                # Updated Hyperlink Text: Only "View Chart"
+                chart_url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+                chart_hyperlink = f'=HYPERLINK("{chart_url}", "View Chart")'
+                
+                pre_surge_radar.append({
+                    "Date": df['Date'].iloc[-1].strftime('%Y-%m-%d'),
+                    "Symbol": symbol,
+                    "Current_Price": curr_price,
+                    "Watch_Trigger_High": d10_high,
+                    "GR_Ratio": round(gr_ratio_p1, 2),
+                    "Chart": chart_hyperlink
+                })
+
+        # -------------------------------------------------------------
+        # PIPELINE 2: ACTIVE DELAYED SETUPS (Volume surge came, NO breakout yet)
+        # -------------------------------------------------------------
+        for i in range(n_rows - 10, n_rows):
             pre_10 = df.iloc[i-10:i]
             if len(pre_10) < 10:
                 continue
                 
-            # Filter 1: Min Turnover >= 2 Cr
             avg_turnover = pre_10['Turnover'].mean()
             if avg_turnover < 20000000:
                 continue
@@ -85,11 +129,20 @@ def scan_live_delayed_setups(symbol):
             max_10d_vol = pre_10['Volume'].max()
             max_10d_high = pre_10['High'].max()
             
-            current_vol = df['Volume'].iloc[i]
-            current_close = df['Close'].iloc[i]
+            curr_vol = df['Volume'].iloc[i]
+            curr_close = df['Close'].iloc[i]
+            curr_high = df['High'].iloc[i]
             
-            # Condition: Volume > 10D Max Volume, but Close < 10D High
-            if current_vol > max_10d_vol and current_close < max_10d_high:
+            if curr_vol > max_10d_vol and curr_close < max_10d_high and curr_high < max_10d_high:
+                
+                after_surge = df.iloc[i+1:]
+                already_triggered = False
+                if not after_surge.empty:
+                    if (after_surge['High'] >= max_10d_high).any():
+                        already_triggered = True
+                
+                if already_triggered:
+                    continue
                 
                 max_order_mult = (pre_10['Avg_Order_Size'] / pre_10['Avg_Size_MA20']).max()
                 avg_tightness = pre_10['Candle_Range_%'].mean()
@@ -110,51 +163,62 @@ def scan_live_delayed_setups(symbol):
                     sl_p = round(entry_p * 0.97, 2)
                     tgt_p = round(entry_p * 1.06, 2)
                     
-                    # Hyperlink Formula for Google Sheet
+                    # Updated Hyperlink Text: Only "View Chart"
                     chart_url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
-                    chart_hyperlink = f'=HYPERLINK("{chart_url}", "Open {symbol} Chart")'
+                    chart_hyperlink = f'=HYPERLINK("{chart_url}", "View Chart")'
                     
-                    return {
+                    active_delayed_setups.append({
                         "Surge_Date": surge_date,
                         "Symbol": symbol,
                         "Entry_P": entry_p,
                         "SL_P": sl_p,
                         "Tgt_P": tgt_p,
                         "Chart": chart_hyperlink
-                    }
-        return None
+                    })
+                    break
     except Exception as e:
-        return None
+        return
 
-scanned_setups = []
 if len(STOCKS) > 0:
     for idx, sym in enumerate(STOCKS, 1):
-        print(f"[{idx}/{len(STOCKS)}] Scanning live delayed setup for {sym}...")
-        res = scan_live_delayed_setups(sym)
-        if res:
-            scanned_setups.append(res)
+        print(f"[{idx}/{len(STOCKS)}] Processing Dual Pipeline for {sym}...")
+        process_stock_pipelines(sym)
 
-if len(scanned_setups) > 0:
-    df_setups = pd.DataFrame(scanned_setups)
-    
-    # Sort by Recent Date First (Descending)
-    df_setups['Surge_Date_dt'] = pd.to_datetime(df_setups['Surge_Date'])
-    df_setups = df_setups.sort_values(by='Surge_Date_dt', ascending=False).drop(columns=['Surge_Date_dt'])
-    
-    formatted_rows = df_setups.values.tolist()
+# -------------------------------------------------------------
+# EXPORT TO GOOGLE SHEET TABS
+# -------------------------------------------------------------
 
+# Tab 1: PRE_SURGE_RADAR
+if len(pre_surge_radar) > 0:
+    df_p1 = pd.DataFrame(pre_surge_radar)
+    df_p1['Date_dt'] = pd.to_datetime(df_p1['Date'])
+    df_p1 = df_p1.sort_values(by='Date_dt', ascending=False).drop(columns=['Date_dt'])
+    rows_p1 = df_p1.values.tolist()
+    
     try:
-        ws = sh.worksheet("READY_FOR_TOMORROW") if "READY_FOR_TOMORROW" in [x.title for x in sh.worksheets()] else sh.add_worksheet("READY_FOR_TOMORROW", 2000, 10)
-        ws.clear()
-        
-        ws.append_row([f"LIVE DELAYED BREAKOUT SETUPS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["A: Surge Date", "B: Share Name", "C: Entry Price", "D: SL Price", "E: Target Price", "F: Chart Link"])
-        
-        # Insert rows using USER_ENTERED option to parse formulas correctly
-        ws.append_rows(formatted_rows, value_input_option='USER_ENTERED')
-        print("✅ Sorted Live Setups with TradingView Hyperlinks exported to Google Sheet!")
+        ws1 = sh.worksheet("PRE_SURGE_RADAR") if "PRE_SURGE_RADAR" in [x.title for x in sh.worksheets()] else sh.add_worksheet("PRE_SURGE_RADAR", 2000, 10)
+        ws1.clear()
+        ws1.append_row([f"PRE-SURGE RADAR (Volume Pending) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws1.append_row(["Date", "Stock Name", "Current Price", "10D High Price", "Green/Red Vol Ratio", "Chart Link"])
+        ws1.append_rows(rows_p1, value_input_option='USER_ENTERED')
+        print("✅ Sheet 1 'PRE_SURGE_RADAR' updated successfully!")
     except Exception as e:
-        print(f"Failed to export to Google Sheet: {e}")
-else:
-    print("No live delayed setups found matching criteria today.")
+        print(f"Error updating PRE_SURGE_RADAR: {e}")
+
+# Tab 2: ACTIVE_DELAYED_SETUPS
+if len(active_delayed_setups) > 0:
+    df_p2 = pd.DataFrame(active_delayed_setups)
+    df_p2['Surge_Date_dt'] = pd.to_datetime(df_p2['Surge_Date'])
+    df_p2 = df_p2.sort_values(by='Surge_Date_dt', ascending=False).drop(columns=['Surge_Date_dt'])
+    rows_p2 = df_p2.values.tolist()
     
+    try:
+        ws2 = sh.worksheet("ACTIVE_DELAYED_SETUPS") if "ACTIVE_DELAYED_SETUPS" in [x.title for x in sh.worksheets()] else sh.add_worksheet("ACTIVE_DELAYED_SETUPS", 2000, 10)
+        ws2.clear()
+        ws2.append_row([f"ACTIVE DELAYED SETUPS (Volume Came, No Breakout) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
+        ws2.append_row(["Surge Date", "Stock Name", "Entry Price (10D High)", "SL Price (-3%)", "Target Price (+6%)", "Chart Link"])
+        ws2.append_rows(rows_p2, value_input_option='USER_ENTERED')
+        print("✅ Sheet 2 'ACTIVE_DELAYED_SETUPS' updated successfully!")
+    except Exception as e:
+        print(f"Error updating ACTIVE_DELAYED_SETUPS: {e}")
+        
