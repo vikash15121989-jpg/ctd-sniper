@@ -109,7 +109,10 @@ def scan_live_delayed_setups(symbol):
                     entry_p = round(max_10d_high, 2)
                     sl_p = round(entry_p * 0.97, 2)
                     tgt_p = round(entry_p * 1.06, 2)
-                    chart_link = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+                    
+                    # Hyperlink Formula for Google Sheet
+                    chart_url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+                    chart_hyperlink = f'=HYPERLINK("{chart_url}", "Open {symbol} Chart")'
                     
                     return {
                         "Surge_Date": surge_date,
@@ -117,7 +120,7 @@ def scan_live_delayed_setups(symbol):
                         "Entry_P": entry_p,
                         "SL_P": sl_p,
                         "Tgt_P": tgt_p,
-                        "Chart": chart_link
+                        "Chart": chart_hyperlink
                     }
         return None
     except Exception as e:
@@ -132,10 +135,9 @@ if len(STOCKS) > 0:
             scanned_setups.append(res)
 
 if len(scanned_setups) > 0:
-    # Convert to DataFrame for sorting by Recent Date
     df_setups = pd.DataFrame(scanned_setups)
     
-    # Sort by Surge_Date DESCENDING (Latest date on top)
+    # Sort by Recent Date First (Descending)
     df_setups['Surge_Date_dt'] = pd.to_datetime(df_setups['Surge_Date'])
     df_setups = df_setups.sort_values(by='Surge_Date_dt', ascending=False).drop(columns=['Surge_Date_dt'])
     
@@ -146,9 +148,11 @@ if len(scanned_setups) > 0:
         ws.clear()
         
         ws.append_row([f"LIVE DELAYED BREAKOUT SETUPS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
-        ws.append_row(["A: Surge Date", "B: Share Name", "C: Entry Price", "D: SL Price", "E: Target Price", "F: Chart"])
-        ws.append_rows(formatted_rows)
-        print("✅ Sorted Live Delayed Setups (Newest Date on Top) successfully exported to Google Sheet tab 'READY_FOR_TOMORROW'!")
+        ws.append_row(["A: Surge Date", "B: Share Name", "C: Entry Price", "D: SL Price", "E: Target Price", "F: Chart Link"])
+        
+        # Insert rows using USER_ENTERED option to parse formulas correctly
+        ws.append_rows(formatted_rows, value_input_option='USER_ENTERED')
+        print("✅ Sorted Live Setups with TradingView Hyperlinks exported to Google Sheet!")
     except Exception as e:
         print(f"Failed to export to Google Sheet: {e}")
 else:
