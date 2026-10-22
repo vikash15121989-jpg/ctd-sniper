@@ -7,7 +7,7 @@ import os
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== DUAL-PIPELINE DELAYED BREAKOUT SCANNER ===")
+print("=== DUAL-PIPELINE DELAYED BREAKOUT SCANNER (DATE FIXED) ===")
 
 try:
     gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
@@ -57,8 +57,9 @@ def process_stock_pipelines(symbol):
         if not all(col in df.columns for col in required_cols):
             return
 
-        df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
-        df = df.sort_values('Date').reset_index(drop=True)
+        # STRICT DATE CONVERSION (Normalized to midnight to avoid time shift errors)
+        df['Date_Parsed'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
+        df = df.dropna(subset=['Date_Parsed']).sort_values('Date_Parsed').reset_index(drop=True)
         
         for col in ['Volume', 'Trades', 'Close', 'High', 'Low']:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
@@ -75,12 +76,12 @@ def process_stock_pipelines(symbol):
             return
 
         # -------------------------------------------------------------
-        # PIPELINE 1: PRE-SURGE RADAR (Pattern ready, but Volume Surge pending)
+        # PIPELINE 1: PRE-SURGE RADAR
         # -------------------------------------------------------------
         last_10 = df.iloc[-10:]
         avg_turnover_p1 = last_10['Turnover'].mean()
         
-        if avg_turnover_p1 >= 20000000: # Turnover >= 2 Cr
+        if avg_turnover_p1 >= 20000000:
             max_order_mult_p1 = (last_10['Avg_Order_Size'] / last_10['Avg_Size_MA20']).max()
             avg_tightness_p1 = last_10['Candle_Range_%'].mean()
             
@@ -100,13 +101,11 @@ def process_stock_pipelines(symbol):
                 
                 curr_price = round(df['Close'].iloc[-1], 2)
                 d10_high = round(last_10['High'].max(), 2)
-                
-                # Updated Hyperlink Text: Only "View Chart"
                 chart_url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
                 chart_hyperlink = f'=HYPERLINK("{chart_url}", "View Chart")'
                 
                 pre_surge_radar.append({
-                    "Date": df['Date'].iloc[-1].strftime('%Y-%m-%d'),
+                    "Date": df['Date_Parsed'].iloc[-1].strftime('%Y-%m-%d'),
                     "Symbol": symbol,
                     "Current_Price": curr_price,
                     "Watch_Trigger_High": d10_high,
@@ -115,7 +114,7 @@ def process_stock_pipelines(symbol):
                 })
 
         # -------------------------------------------------------------
-        # PIPELINE 2: ACTIVE DELAYED SETUPS (Volume surge came, NO breakout yet)
+        # PIPELINE 2: ACTIVE DELAYED SETUPS
         # -------------------------------------------------------------
         for i in range(n_rows - 10, n_rows):
             pre_10 = df.iloc[i-10:i]
@@ -158,12 +157,12 @@ def process_stock_pipelines(symbol):
                     gr_ratio >= 2.5 and 
                     pre_net_chg > 0):
                     
-                    surge_date = df['Date'].iloc[i].strftime('%Y-%m-%d')
+                    # Exact matched candle date
+                    surge_date = df['Date_Parsed'].iloc[i].strftime('%Y-%m-%d')
                     entry_p = round(max_10d_high, 2)
                     sl_p = round(entry_p * 0.97, 2)
                     tgt_p = round(entry_p * 1.06, 2)
                     
-                    # Updated Hyperlink Text: Only "View Chart"
                     chart_url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
                     chart_hyperlink = f'=HYPERLINK("{chart_url}", "View Chart")'
                     
@@ -188,7 +187,6 @@ if len(STOCKS) > 0:
 # EXPORT TO GOOGLE SHEET TABS
 # -------------------------------------------------------------
 
-# Tab 1: PRE_SURGE_RADAR
 if len(pre_surge_radar) > 0:
     df_p1 = pd.DataFrame(pre_surge_radar)
     df_p1['Date_dt'] = pd.to_datetime(df_p1['Date'])
@@ -201,11 +199,10 @@ if len(pre_surge_radar) > 0:
         ws1.append_row([f"PRE-SURGE RADAR (Volume Pending) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
         ws1.append_row(["Date", "Stock Name", "Current Price", "10D High Price", "Green/Red Vol Ratio", "Chart Link"])
         ws1.append_rows(rows_p1, value_input_option='USER_ENTERED')
-        print("✅ Sheet 1 'PRE_SURGE_RADAR' updated successfully!")
+        print("✅ Sheet 1 'PRE_SURGE_RADAR' updated with exact dates!")
     except Exception as e:
         print(f"Error updating PRE_SURGE_RADAR: {e}")
 
-# Tab 2: ACTIVE_DELAYED_SETUPS
 if len(active_delayed_setups) > 0:
     df_p2 = pd.DataFrame(active_delayed_setups)
     df_p2['Surge_Date_dt'] = pd.to_datetime(df_p2['Surge_Date'])
@@ -218,7 +215,6 @@ if len(active_delayed_setups) > 0:
         ws2.append_row([f"ACTIVE DELAYED SETUPS (Volume Came, No Breakout) | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"])
         ws2.append_row(["Surge Date", "Stock Name", "Entry Price (10D High)", "SL Price (-3%)", "Target Price (+6%)", "Chart Link"])
         ws2.append_rows(rows_p2, value_input_option='USER_ENTERED')
-        print("✅ Sheet 2 'ACTIVE_DELAYED_SETUPS' updated successfully!")
+        print("✅ Sheet 2 'ACTIVE_DELAYED_SETUPS' updated with exact dates!")
     except Exception as e:
         print(f"Error updating ACTIVE_DELAYED_SETUPS: {e}")
-        
