@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MAX PROFIT & FAKEOUT BACKTESTER ===")
+print("=== CTD_SNIPER RANGE-FILTERED SWING BREAKOUT BACKTESTER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,12 +29,11 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. TRADE LOGS WITH MAX PROFIT & FAKEOUT TRACKING
+# 2. BACKTEST ENGINE WITH RANGE CONDITION
 # -------------------------------------------------------------
-def backtest_max_profit_and_fakeout(
+def backtest_range_filtered_swing(
     symbol,
     min_consolidation_months=3,
-    atr_period=14,
     stop_loss_pct=0.07,
     rr_target=3.0,
 ):
@@ -52,21 +51,16 @@ def backtest_max_profit_and_fakeout(
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     highs = df["High"].values
-    closes = df["Close"].values
     lows = df["Low"].values
+    closes = df["Close"].values
     n = len(df)
 
-    if n < (min_consolidation_months * 2 + atr_period):
+    if n < (min_consolidation_months * 2 + 5):
       return []
 
-    # ATR Calculation
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(window=atr_period).mean()
-    df["ATR_Pct"] = (df["ATR"] / df["Close"]) * 100
-    median_atr_pct = df["ATR_Pct"].median()
+    # Range percentage calculation for every month: (High - Low) / Close * 100
+    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Pct"].values
 
     trades = []
     in_trade = False
@@ -78,20 +72,18 @@ def backtest_max_profit_and_fakeout(
     resistance_level = 0
     max_price_reached = 0
 
-    for i in range(min_consolidation_months + atr_period, n):
+    for i in range(min_consolidation_months + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
       curr_open = df["Open"].iloc[i]
-      atr_p = df["ATR_Pct"].iloc[i]
+      curr_range = ranges[i]
 
       if in_trade:
-        # Track maximum price reached during the trade
         if curr_high > max_price_reached:
           max_price_reached = curr_high
 
-        # Check exit conditions
         if curr_low <= stop_loss:
           max_profit_pct = (
               (max_price_reached - entry_price) / entry_price
@@ -103,9 +95,7 @@ def backtest_max_profit_and_fakeout(
               "Breakout_Month": entry_date.strftime("%b %Y"),
               "Entry_Price": round(entry_price, 2),
               "Max_Profit_%": round(max_profit_pct, 2),
-              "Result": (
-                  "FAKEOUT / LOSS" if max_profit_pct < 5 else "PARTIAL / LOSS"
-              ),
+              "Result": "FAKEOUT / LOSS",
               "Final_PnL_%": round(pnl_pct, 2),
           })
           in_trade = False
@@ -137,8 +127,10 @@ def backtest_max_profit_and_fakeout(
         pending_entry = False
         continue
 
-      # Find Unbroken Swing High
+      # Find Unbroken Swing High (Max High Month)
       active_resistance = None
+      resistance_index = -1
+
       for j in range(
           i - min_consolidation_months, min_consolidation_months, -1
       ):
@@ -156,17 +148,20 @@ def backtest_max_profit_and_fakeout(
               break
           if not ever_broken:
             active_resistance = highs[j]
+            resistance_index = j
             break
 
-      # Breakout & Strict ATR Filter
-      if (
-          active_resistance is not None
-          and curr_close > active_resistance
-          and pd.notna(atr_p)
-          and atr_p <= median_atr_pct
-      ):
-        resistance_level = active_resistance
-        pending_entry = True
+      # Breakout Condition + Range Filter Logic:
+      # 1. Close > Resistance
+      # 2. Breakout candle range <= Max range of all months after the swing high up to current month
+      if active_resistance is not None and curr_close > active_resistance:
+        post_swing_ranges = ranges[resistance_index + 1 : i]
+        if len(post_swing_ranges) > 0:
+          max_subsequent_range = post_swing_ranges.max()
+          # Breakout month range should not be greater than the maximum range of post-swing months
+          if curr_range <= max_subsequent_range:
+            resistance_level = active_resistance
+            pending_entry = True
 
     return trades
 
@@ -181,8 +176,8 @@ all_trade_logs = []
 
 if len(STOCKS) > 0:
   for idx, sym in enumerate(STOCKS, 1):
-    print(f"[{idx}/{len(STOCKS)}] Analyzing max profit & fakeouts for {sym}...")
-    t_logs = backtest_max_profit_and_fakeout(sym)
+    print(f"[{idx}/{len(STOCKS)}] Running range-filtered backtest for {sym}...")
+    t_logs = backtest_range_filtered_swing(sym)
     if t_logs:
       all_trade_logs.extend(t_logs)
 
@@ -192,13 +187,13 @@ if len(all_trade_logs) > 0:
 
   try:
     ws_log = (
-        sh.worksheet("TRADE_FAKEOUT_LOGS")
-        if "TRADE_FAKEOUT_LOGS" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("TRADE_FAKEOUT_LOGS", 2000, 10)
+        sh.worksheet("RANGE_FILTER_LOGS")
+        if "RANGE_FILTER_LOGS" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("RANGE_FILTER_LOGS", 2000, 10)
     )
     ws_log.clear()
     ws_log.append_row([
-        "BREAKOUT MAX PROFIT & FAKEOUT ANALYSIS |"
+        "RANGE FILTERED BREAKOUT LOGS |"
         f" {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"
     ])
     ws_log.append_row([
@@ -212,10 +207,11 @@ if len(all_trade_logs) > 0:
     ])
     ws_log.append_rows(rows_logs, value_input_option="USER_ENTERED")
     print(
-        "✅ Sheet 'TRADE_FAKEOUT_LOGS' updated successfully with max profit and"
-        " fakeout metrics!"
+        "✅ Sheet 'RANGE_FILTER_LOGS' updated successfully with range-filtered"
+        " trades!"
     )
   except Exception as e:
     print(f"Error updating Google Sheet: {e}")
 else:
-  print("⚠️ No trade logs found.")
+  print("⚠️ No trade logs found matching the range condition.")
+  
