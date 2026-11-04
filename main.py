@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER HISTORICAL SWING BREAKOUT BACKTESTER ===")
+print("=== CTD_SNIPER DETAILED SWING BREAKOUT BACKTESTER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE FOR A SINGLE STOCK
+# 2. BACKTEST ENGINE WITH DETAILED METRICS
 # -------------------------------------------------------------
-def backtest_historical_swing_breakout(
+def backtest_detailed_swing(
     symbol,
     min_consolidation_months=3,
     atr_period=14,
@@ -42,10 +42,10 @@ def backtest_historical_swing_breakout(
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     # 10+ Years Monthly Data download
     df = yf.download(
-        ticker_symbol, start="2010-01-01", interval="1mo", auto_adjust=False
+        ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False
     )
 
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < 30:
       return None
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -78,7 +78,7 @@ def backtest_historical_swing_breakout(
 
     # Main Simulation Loop
     for i in range(min_consolidation_months + atr_period, n):
-      current_date = df.index[i].strftime("%Y-%m-%d")
+      current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = df["Low"].iloc[i]
@@ -90,6 +90,8 @@ def backtest_historical_swing_breakout(
           pnl_pct = (stop_loss - entry_price) / entry_price * 100
           trades.append({
               "Symbol": symbol,
+              "Entry_Date": entry_date,
+              "Exit_Date": current_date,
               "Result": "LOSS",
               "PnL_%": round(pnl_pct, 2),
           })
@@ -98,6 +100,8 @@ def backtest_historical_swing_breakout(
           pnl_pct = (take_profit - entry_price) / entry_price * 100
           trades.append({
               "Symbol": symbol,
+              "Entry_Date": entry_date,
+              "Exit_Date": current_date,
               "Result": "WIN",
               "PnL_%": round(pnl_pct, 2),
           })
@@ -114,18 +118,20 @@ def backtest_historical_swing_breakout(
         pending_entry = False
         continue
 
-      # Find Historical Unbroken Swing High (Min 3 months left/right valid, max any duration)
+      # Find Historical Unbroken Swing High (Min 3 months left/right valid, unbroken until now)
       active_resistance = None
       for j in range(
           i - min_consolidation_months, min_consolidation_months, -1
       ):
         is_valid_swing = True
+        # Check preceding 3 months
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
             is_valid_swing = False
             break
 
         if is_valid_swing:
+          # Check if ever broken between j and current i
           ever_broken = False
           for k in range(j + 1, i):
             if highs[k] > highs[j]:
@@ -153,9 +159,16 @@ def backtest_historical_swing_breakout(
     win_rate = round((wins / total) * 100, 2)
     total_pnl = round(t_df["PnL_%"].sum(), 2)
 
+    # Calculate average trades per year
+    start_year = df.index[0].year
+    end_year = df.index[-1].year
+    total_years = max(1, (end_year - start_year + 1))
+    trades_per_year = round(total / total_years, 2)
+
     return {
         "Symbol": symbol,
         "Total_Trades": total,
+        "Trades_Per_Year": trades_per_year,
         "Wins": wins,
         "Losses": total - wins,
         "Win_Rate_%": win_rate,
@@ -173,13 +186,13 @@ summary_results = []
 
 if len(STOCKS) > 0:
   for idx, sym in enumerate(STOCKS, 1):
-    print(f"[{idx}/{len(STOCKS)}] Backtesting {sym}...")
-    res = backtest_historical_swing_breakout(sym)
+    print(f"[{idx}/{len(STOCKS)}] Backtesting detailed swing for {sym}...")
+    res = backtest_detailed_swing(sym)
     if res:
       summary_results.append(res)
 
 # -------------------------------------------------------------
-# 4. EXPORT TO GOOGLE SHEETS (`BACKTEST_RESULTS` TAB)
+# 4. EXPORT RESULTS TO GOOGLE SHEETS (`BACKTEST_RESULTS`)
 # -------------------------------------------------------------
 if len(summary_results) > 0:
   df_sum = pd.DataFrame(summary_results).sort_values(
@@ -195,16 +208,24 @@ if len(summary_results) > 0:
     )
     ws_bt.clear()
     ws_bt.append_row([
-        "HISTORICAL SWING BREAKOUT BACKTEST SUMMARY |"
+        "DETAILED SWING BREAKOUT BACKTEST SUMMARY |"
         f" {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"
     ])
-    ws_bt.append_row(
-        ["Stock Symbol", "Total Trades", "Wins", "Losses", "Win Rate %", "Total PnL %"]
-    )
+    ws_bt.append_row([
+        "Stock Symbol",
+        "Total Trades",
+        "Trades / Year",
+        "Wins",
+        "Losses",
+        "Win Rate %",
+        "Total PnL %",
+    ])
     ws_bt.append_rows(rows_backtest, value_input_option="USER_ENTERED")
-    print("✅ Sheet 'BACKTEST_RESULTS' updated successfully with backtest data!")
+    print(
+        "✅ Sheet 'BACKTEST_RESULTS' updated successfully with detailed metrics!"
+    )
   except Exception as e:
     print(f"Error updating Google Sheet: {e}")
 else:
   print("⚠️ No trades found across watchlist stocks to export.")
-    
+  
