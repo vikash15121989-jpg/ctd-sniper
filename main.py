@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER CHART INSPECTION EXPORTER (2025-2026) ===")
+print("=== CTD_SNIPER TRADINGVIEW CHART LINKS EXPORTER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE TO LOG BREAKOUT MONTHS FOR INSPECTION
+# 2. BACKTEST ENGINE WITH TRADINGVIEW LINK GENERATOR
 # -------------------------------------------------------------
-def get_chart_inspection_data(
+def get_trades_with_charts(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -95,6 +95,10 @@ def get_chart_inspection_data(
               2025,
               2026,
           ]:
+            # Generate TradingView Clickable Link Formula for Google Sheets
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+
             trades.append({
                 "Symbol": symbol,
                 "Breakout_Month": entry_date.strftime("%b %Y"),
@@ -102,6 +106,7 @@ def get_chart_inspection_data(
                 "Entry_Price": round(entry_price, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN (14% TARGET)" if is_win else "LOSS (7% SL)",
+                "TradingView_Chart": sheet_link_formula,
             })
           in_trade = False
         continue
@@ -170,7 +175,7 @@ def get_chart_inspection_data(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = get_chart_inspection_data(sym)
+    t = get_trades_with_charts(sym)
     if t:
       all_trades.extend(t)
 
@@ -181,7 +186,7 @@ if len(all_trades) > 0:
   win_rate = round((wins / total) * 100, 2)
 
   print(f"\n========================================")
-  print(f" CHART INSPECTION EXPORT READY")
+  print(f" CHART LINKS EXPORT READY")
   print(f"========================================")
   print(f" Total Trades Logged : {total}")
   print(f" Winning %           : {win_rate}%")
@@ -189,13 +194,13 @@ if len(all_trades) > 0:
 
   try:
     ws = (
-        sh.worksheet("CHART_INSPECTION")
-        if "CHART_INSPECTION" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("CHART_INSPECTION", 2000, 10)
+        sh.worksheet("CHART_LINKS")
+        if "CHART_LINKS" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("CHART_LINKS", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "CHART INSPECTION LOG (2025-2026) |"
+        "CHART INSPECTION WITH TRADINGVIEW LINKS (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -205,13 +210,14 @@ if len(all_trades) > 0:
         "Entry Price",
         "Max Profit %",
         "Result",
+        "TradingView Link",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
     print(
-        "✅ Data successfully saved to 'CHART_INSPECTION' tab in Google Sheet!"
+        "✅ Data with clickable TradingView chart links saved to 'CHART_LINKS'"
+        " tab!"
     )
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-  
