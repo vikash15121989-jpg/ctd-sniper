@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER DEEP WIN VS LOSS PATTERN DISCOVERY ===")
+print("=== CTD_SNIPER MULTI-LOGIC EDGE DISCOVERY (2025-2026) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. PATTERN DISCOVERY ENGINE (FINDING THE EXACT DIFFERENCE)
+# 2. EDGE DISCOVERY ENGINE
 # -------------------------------------------------------------
-def discover_winning_logic(
+def discover_edge(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -53,6 +53,7 @@ def discover_winning_logic(
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
+    opens = df["Open"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -67,16 +68,22 @@ def discover_winning_logic(
     entry_date = None
     resistance_level = 0
     max_price_reached = 0
-    base_duration = 0
-    breakout_range = 0
-    base_avg_range = 0
+
+    # Metrics to capture for Edge analysis
+    close_location_pct = (
+        0  # Where did breakout close relative to its high-low range (0 to 1)
+    )
+    base_drawdown_pct = 0  # Max drop inside the base
+    distance_from_52w_high = (
+        0  # How close was resistance to 52-week high at breakout
+    )
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
-      curr_open = df["Open"].iloc[i]
+      curr_open = opens[i]
       curr_range = ranges[i]
 
       if in_trade:
@@ -90,9 +97,6 @@ def discover_winning_logic(
               if is_win
               else (stop_loss - entry_price) / entry_price * 100
           )
-          max_profit_pct = (
-              (max_price_reached - entry_price) / entry_price
-          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
@@ -100,12 +104,9 @@ def discover_winning_logic(
           ]:
             trades.append({
                 "Symbol": symbol,
-                "Base_Months": base_duration,
-                "Breakout_Range_%": round(breakout_range, 2),
-                "Base_Avg_Range_%": round(base_avg_range, 2),
-                "Range_Ratio": round(
-                    breakout_range / (base_avg_range + 0.001), 2
-                ),
+                "Close_Location": round(close_location_pct, 2),
+                "Base_Drawdown_%": round(base_drawdown_pct, 2),
+                "Dist_52W_High_%": round(distance_from_52w_high, 2),
                 "Result": "WIN" if is_win else "LOSS",
             })
           in_trade = False
@@ -161,9 +162,30 @@ def discover_winning_logic(
           max_subsequent_range = post_swing_ranges.max()
           if curr_range <= max_subsequent_range:
             resistance_level = active_resistance
-            base_duration = i - resistance_index
-            base_avg_range = post_swing_ranges.mean()
-            breakout_range = curr_range
+
+            # Calculate Edge Metrics
+            # 1. Close Location in Breakout Candle (0 = Low, 1 = High)
+            candle_span = curr_high - curr_low
+            close_location_pct = (
+                (curr_close - curr_low) / candle_span if candle_span > 0 else 0
+            )
+
+            # 2. Base Drawdown (Max drop from resistance to lowest low inside base)
+            base_lows = lows[resistance_index + 1 : i]
+            base_drawdown_pct = (
+                ((active_resistance - base_lows.min()) / active_resistance)
+                * 100
+                if len(base_lows) > 0
+                else 0
+            )
+
+            # 3. Distance from 52W High at breakout time
+            rolling_52w_high = highs[max(0, i - 12) : i].max()
+            distance_from_52w_high = (
+                ((rolling_52w_high - active_resistance) / rolling_52w_high)
+                * 100
+            )
+
             pending_entry = True
 
     return trades
@@ -173,12 +195,12 @@ def discover_winning_logic(
 
 
 # -------------------------------------------------------------
-# 3. RUN & PRINT COMPARATIVE METRICS
+# 3. RUN & COMPARE EDGES
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = discover_winning_logic(sym)
+    t = discover_edge(sym)
     if t:
       all_trades.extend(t)
 
@@ -186,7 +208,7 @@ if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
 
   print("\n==================================================")
-  print(" DEEP PATTERN COMPARISON: WINS VS LOSSES")
+  print(" MULTI-LOGIC EDGE DISCOVERY REPORT")
   print("==================================================")
   wins_df = df_res[df_res["Result"] == "WIN"]
   loss_df = df_res[df_res["Result"] == "LOSS"]
@@ -195,48 +217,42 @@ if len(all_trades) > 0:
   print(f"Total Losses Analysed: {len(loss_df)}")
   print("--------------------------------------------------")
   print(
-      "📊 Average Base Duration -> Wins:"
-      f" {wins_df['Base_Months'].mean():.2f}m | Losses:"
-      f" {loss_df['Base_Months'].mean():.2f}m"
+      "🎯 Close Location (High ke paas close): Wins:"
+      f" {wins_df['Close_Location'].mean():.2f} | Losses:"
+      f" {loss_df['Close_Location'].mean():.2f}"
   )
   print(
-      "📊 Average Breakout Range -> Wins:"
-      f" {wins_df['Breakout_Range_%'].mean():.2f}% | Losses:"
-      f" {loss_df['Breakout_Range_%'].mean():.2f}%"
+      "🎯 Base Drawdown % (Kitna gira base me): Wins:"
+      f" {wins_df['Base_Drawdown_%'].mean():.2f}% | Losses:"
+      f" {loss_df['Base_Drawdown_%'].mean():.2f}%"
   )
   print(
-      "📊 Average Base Range ----> Wins:"
-      f" {wins_df['Base_Avg_Range_%'].mean():.2f}% | Losses:"
-      f" {loss_df['Base_Avg_Range_%'].mean():.2f}%"
-  )
-  print(
-      "📊 Range Ratio (Breakout/Base) -> Wins:"
-      f" {wins_df['Range_Ratio'].mean():.2f} | Losses:"
-      f" {loss_df['Range_Ratio'].mean():.2f}"
+      "🎯 Distance from 52W High %: Wins:"
+      f" {wins_df['Dist_52W_High_%'].mean():.2f}% | Losses:"
+      f" {loss_df['Dist_52W_High_%'].mean():.2f}%"
   )
   print("==================================================")
 
   try:
     ws = (
-        sh.worksheet("LOGIC_DISCOVERY")
-        if "LOGIC_DISCOVERY" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("LOGIC_DISCOVERY", 2000, 10)
+        sh.worksheet("EDGE_DISCOVERY")
+        if "EDGE_DISCOVERY" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("EDGE_DISCOVERY", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "WIN VS LOSS LOGIC DISCOVERY REPORT |"
+        "MULTI-LOGIC EDGE REPORT |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Stock Symbol",
-        "Base Months",
-        "Breakout Range %",
-        "Base Avg Range %",
-        "Range Ratio",
+        "Close Location",
+        "Base Drawdown %",
+        "Dist 52W High %",
         "Result",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Detailed logic report saved to 'LOGIC_DISCOVERY' tab in sheet!")
+    print("✅ Edge discovery report saved to 'EDGE_DISCOVERY' tab in sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
