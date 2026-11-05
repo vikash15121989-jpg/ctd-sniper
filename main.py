@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MULTI-LOGIC EDGE DISCOVERY (2025-2026) ===")
+print("=== CTD_SNIPER CHART INSPECTION EXPORTER (2025-2026) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. EDGE DISCOVERY ENGINE
+# 2. BACKTEST ENGINE TO LOG BREAKOUT MONTHS FOR INSPECTION
 # -------------------------------------------------------------
-def discover_edge(
+def get_chart_inspection_data(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -53,7 +53,6 @@ def discover_edge(
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
-    opens = df["Open"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -69,21 +68,12 @@ def discover_edge(
     resistance_level = 0
     max_price_reached = 0
 
-    # Metrics to capture for Edge analysis
-    close_location_pct = (
-        0  # Where did breakout close relative to its high-low range (0 to 1)
-    )
-    base_drawdown_pct = 0  # Max drop inside the base
-    distance_from_52w_high = (
-        0  # How close was resistance to 52-week high at breakout
-    )
-
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
-      curr_open = opens[i]
+      curr_open = df["Open"].iloc[i]
       curr_range = ranges[i]
 
       if in_trade:
@@ -97,6 +87,9 @@ def discover_edge(
               if is_win
               else (stop_loss - entry_price) / entry_price * 100
           )
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
@@ -104,10 +97,11 @@ def discover_edge(
           ]:
             trades.append({
                 "Symbol": symbol,
-                "Close_Location": round(close_location_pct, 2),
-                "Base_Drawdown_%": round(base_drawdown_pct, 2),
-                "Dist_52W_High_%": round(distance_from_52w_high, 2),
-                "Result": "WIN" if is_win else "LOSS",
+                "Breakout_Month": entry_date.strftime("%b %Y"),
+                "Resistance": round(resistance_level, 2),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Result": "WIN (14% TARGET)" if is_win else "LOSS (7% SL)",
             })
           in_trade = False
         continue
@@ -162,30 +156,6 @@ def discover_edge(
           max_subsequent_range = post_swing_ranges.max()
           if curr_range <= max_subsequent_range:
             resistance_level = active_resistance
-
-            # Calculate Edge Metrics
-            # 1. Close Location in Breakout Candle (0 = Low, 1 = High)
-            candle_span = curr_high - curr_low
-            close_location_pct = (
-                (curr_close - curr_low) / candle_span if candle_span > 0 else 0
-            )
-
-            # 2. Base Drawdown (Max drop from resistance to lowest low inside base)
-            base_lows = lows[resistance_index + 1 : i]
-            base_drawdown_pct = (
-                ((active_resistance - base_lows.min()) / active_resistance)
-                * 100
-                if len(base_lows) > 0
-                else 0
-            )
-
-            # 3. Distance from 52W High at breakout time
-            rolling_52w_high = highs[max(0, i - 12) : i].max()
-            distance_from_52w_high = (
-                ((rolling_52w_high - active_resistance) / rolling_52w_high)
-                * 100
-            )
-
             pending_entry = True
 
     return trades
@@ -195,64 +165,51 @@ def discover_edge(
 
 
 # -------------------------------------------------------------
-# 3. RUN & COMPARE EDGES
+# 3. RUN & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = discover_edge(sym)
+    t = get_chart_inspection_data(sym)
     if t:
       all_trades.extend(t)
 
 if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
+  wins = len(df_res[df_res["Result"].str.contains("WIN")])
+  total = len(df_res)
+  win_rate = round((wins / total) * 100, 2)
 
-  print("\n==================================================")
-  print(" MULTI-LOGIC EDGE DISCOVERY REPORT")
-  print("==================================================")
-  wins_df = df_res[df_res["Result"] == "WIN"]
-  loss_df = df_res[df_res["Result"] == "LOSS"]
-
-  print(f"Total Wins Analysed  : {len(wins_df)}")
-  print(f"Total Losses Analysed: {len(loss_df)}")
-  print("--------------------------------------------------")
-  print(
-      "🎯 Close Location (High ke paas close): Wins:"
-      f" {wins_df['Close_Location'].mean():.2f} | Losses:"
-      f" {loss_df['Close_Location'].mean():.2f}"
-  )
-  print(
-      "🎯 Base Drawdown % (Kitna gira base me): Wins:"
-      f" {wins_df['Base_Drawdown_%'].mean():.2f}% | Losses:"
-      f" {loss_df['Base_Drawdown_%'].mean():.2f}%"
-  )
-  print(
-      "🎯 Distance from 52W High %: Wins:"
-      f" {wins_df['Dist_52W_High_%'].mean():.2f}% | Losses:"
-      f" {loss_df['Dist_52W_High_%'].mean():.2f}%"
-  )
-  print("==================================================")
+  print(f"\n========================================")
+  print(f" CHART INSPECTION EXPORT READY")
+  print(f"========================================")
+  print(f" Total Trades Logged : {total}")
+  print(f" Winning %           : {win_rate}%")
+  print(f"========================================")
 
   try:
     ws = (
-        sh.worksheet("EDGE_DISCOVERY")
-        if "EDGE_DISCOVERY" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("EDGE_DISCOVERY", 2000, 10)
+        sh.worksheet("CHART_INSPECTION")
+        if "CHART_INSPECTION" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("CHART_INSPECTION", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "MULTI-LOGIC EDGE REPORT |"
+        "CHART INSPECTION LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
-        "Stock Symbol",
-        "Close Location",
-        "Base Drawdown %",
-        "Dist 52W High %",
+        "Symbol",
+        "Breakout Month",
+        "Resistance",
+        "Entry Price",
+        "Max Profit %",
         "Result",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Edge discovery report saved to 'EDGE_DISCOVERY' tab in sheet!")
+    print(
+        "✅ Data successfully saved to 'CHART_INSPECTION' tab in Google Sheet!"
+    )
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
