@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER BALANCED VOLUME BACKTEST (2025-2026) ===")
+print("=== CTD_SNIPER DEEP WIN VS LOSS PATTERN DISCOVERY ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH BALANCED VOLUME FILTER
+# 2. PATTERN DISCOVERY ENGINE (FINDING THE EXACT DIFFERENCE)
 # -------------------------------------------------------------
-def backtest_balanced_volume(
+def discover_winning_logic(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -49,14 +49,10 @@ def backtest_balanced_volume(
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
-    df.dropna(
-        subset=["Open", "High", "Low", "Close", "Volume"], inplace=True
-    )
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
-    opens = df["Open"].values
-    volumes = df["Volume"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -71,15 +67,17 @@ def backtest_balanced_volume(
     entry_date = None
     resistance_level = 0
     max_price_reached = 0
+    base_duration = 0
+    breakout_range = 0
+    base_avg_range = 0
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
-      curr_open = opens[i]
+      curr_open = df["Open"].iloc[i]
       curr_range = ranges[i]
-      curr_vol = volumes[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -102,12 +100,13 @@ def backtest_balanced_volume(
           ]:
             trades.append({
                 "Symbol": symbol,
-                "Resistance": round(resistance_level, 2),
-                "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
-                "Result": "WIN (14% TARGET)" if is_win else "LOSS (7% SL)",
-                "Final_PnL_%": round(pnl_pct, 2),
+                "Base_Months": base_duration,
+                "Breakout_Range_%": round(breakout_range, 2),
+                "Base_Avg_Range_%": round(base_avg_range, 2),
+                "Range_Ratio": round(
+                    breakout_range / (base_avg_range + 0.001), 2
+                ),
+                "Result": "WIN" if is_win else "LOSS",
             })
           in_trade = False
         continue
@@ -122,7 +121,7 @@ def backtest_balanced_volume(
         pending_entry = False
         continue
 
-      # Find Swing High with Strict Validation
+      # Find True Swing High
       active_resistance = None
       resistance_index = -1
 
@@ -130,8 +129,6 @@ def backtest_balanced_volume(
           i - min_consolidation_months, min_consolidation_months - 1, -1
       ):
         is_valid_swing = True
-
-        # Left & Right 3 months check
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
             is_valid_swing = False
@@ -158,29 +155,16 @@ def backtest_balanced_volume(
         resistance_index = j
         break
 
-      # Breakout Condition + Range Filter + Balanced Volume Rules
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0:
           max_subsequent_range = post_swing_ranges.max()
-
           if curr_range <= max_subsequent_range:
-            # MODERATE VOLUME CHECK:
-            # 1. Base me volume uncontrolled high na ho (historical average se 1.5x se kam ya barabar)
-            # 2. Breakout candle ka volume pichle average volume se zyada ho (Volume Surge)
-            base_volumes = volumes[resistance_index + 1 : i]
-            hist_avg_vol = volumes[
-                max(0, resistance_index - 20) : resistance_index
-            ].mean()
-
-            if len(base_volumes) > 0:
-              avg_base_vol = base_volumes.mean()
-              # Base volume should not be explosively high (avoid heavy distribution)
-              if avg_base_vol <= hist_avg_vol * 1.5:
-                # Breakout volume surge confirmation
-                if curr_vol >= hist_avg_vol:
-                  resistance_level = active_resistance
-                  pending_entry = True
+            resistance_level = active_resistance
+            base_duration = i - resistance_index
+            base_avg_range = post_swing_ranges.mean()
+            breakout_range = curr_range
+            pending_entry = True
 
     return trades
 
@@ -189,53 +173,72 @@ def backtest_balanced_volume(
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT SUMMARY TO GOOGLE SHEETS
+# 3. RUN & PRINT COMPARATIVE METRICS
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_balanced_volume(sym)
+    t = discover_winning_logic(sym)
     if t:
       all_trades.extend(t)
 
 if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
-  wins = len(df_res[df_res["Result"].str.contains("WIN")])
-  total = len(df_res)
-  win_rate = round((wins / total) * 100, 2)
-  total_pnl = round(df_res["Final_PnL_%"].sum(), 2)
 
-  print(f"\n========================================")
-  print(f" BALANCED VOLUME SUMMARY (2025-2026)")
-  print(f"========================================")
-  print(f" Total Trades : {total}")
-  print(f" Winning %    : {win_rate}% ({wins} Wins / {total - wins} Losses)")
-  print(f" Total PnL %  : {total_pnl}%")
-  print(f"========================================")
+  print("\n==================================================")
+  print(" DEEP PATTERN COMPARISON: WINS VS LOSSES")
+  print("==================================================")
+  wins_df = df_res[df_res["Result"] == "WIN"]
+  loss_df = df_res[df_res["Result"] == "LOSS"]
+
+  print(f"Total Wins Analysed  : {len(wins_df)}")
+  print(f"Total Losses Analysed: {len(loss_df)}")
+  print("--------------------------------------------------")
+  print(
+      "📊 Average Base Duration -> Wins:"
+      f" {wins_df['Base_Months'].mean():.2f}m | Losses:"
+      f" {loss_df['Base_Months'].mean():.2f}m"
+  )
+  print(
+      "📊 Average Breakout Range -> Wins:"
+      f" {wins_df['Breakout_Range_%'].mean():.2f}% | Losses:"
+      f" {loss_df['Breakout_Range_%'].mean():.2f}%"
+  )
+  print(
+      "📊 Average Base Range ----> Wins:"
+      f" {wins_df['Base_Avg_Range_%'].mean():.2f}% | Losses:"
+      f" {loss_df['Base_Avg_Range_%'].mean():.2f}%"
+  )
+  print(
+      "📊 Range Ratio (Breakout/Base) -> Wins:"
+      f" {wins_df['Range_Ratio'].mean():.2f} | Losses:"
+      f" {loss_df['Range_Ratio'].mean():.2f}"
+  )
+  print("==================================================")
 
   try:
     ws = (
-        sh.worksheet("SUMMARY_BALANCED_VOL")
-        if "SUMMARY_BALANCED_VOL" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("SUMMARY_BALANCED_VOL", 2000, 10)
+        sh.worksheet("LOGIC_DISCOVERY")
+        if "LOGIC_DISCOVERY" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("LOGIC_DISCOVERY", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "BALANCED VOLUME BACKTEST REPORT |"
+        "WIN VS LOSS LOGIC DISCOVERY REPORT |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Stock Symbol",
-        "Resistance",
-        "Breakout Month",
-        "Entry Price",
-        "Max Profit %",
+        "Base Months",
+        "Breakout Range %",
+        "Base Avg Range %",
+        "Range Ratio",
         "Result",
-        "Final PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Results saved to 'SUMMARY_BALANCED_VOL' tab in Google Sheet!")
+    print("✅ Detailed logic report saved to 'LOGIC_DISCOVERY' tab in sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Is balanced volume filter ke mutabiq koi trade nahi mili.")
+  print("⚠️ Koi trade nahi mili.")
+  
