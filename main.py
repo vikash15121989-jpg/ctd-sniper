@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER STRICT SWING & RANGE-FILTERED BACKTEST (2025-2026) ===")
+print("=== CTD_SNIPER BASE VOLUME DRYNESS FILTERED BACKTEST (2025-2026) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. STRICT BACKTEST ENGINE (TRUE SWING HIGH + RANGE FILTER)
+# 2. BACKTEST ENGINE WITH BASE VOLUME DRYNESS FILTER
 # -------------------------------------------------------------
-def backtest_strict_swing_2025_2026(
+def backtest_with_base_volume_dryness(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -49,10 +49,14 @@ def backtest_strict_swing_2025_2026(
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
-    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    df.dropna(
+        subset=["Open", "High", "Low", "Close", "Volume"], inplace=True
+    )
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
+    opens = df["Open"].values
+    volumes = df["Volume"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -68,13 +72,12 @@ def backtest_strict_swing_2025_2026(
     resistance_level = 0
     max_price_reached = 0
 
-    # Loop must allow 3 months before and 3 months after validation
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
-      curr_open = df["Open"].iloc[i]
+      curr_open = opens[i]
       curr_range = ranges[i]
 
       if in_trade:
@@ -118,7 +121,7 @@ def backtest_strict_swing_2025_2026(
         pending_entry = False
         continue
 
-      # Find STRICT Unbroken Swing High (Checking Left 3 AND Right 3 Months)
+      # Find Swing High with Strict Validation
       active_resistance = None
       resistance_index = -1
 
@@ -135,7 +138,7 @@ def backtest_strict_swing_2025_2026(
         if not is_valid_swing:
           continue
 
-        # 2. Right 3 months check (Crucial fix to avoid false swings like ABINFRA)
+        # 2. Right 3 months check
         for k in range(j + 1, j + min_consolidation_months + 1):
           if highs[j] <= highs[k]:
             is_valid_swing = False
@@ -149,20 +152,34 @@ def backtest_strict_swing_2025_2026(
           if highs[k] > highs[j]:
             ever_broken = True
             break
+        if ever_broken:
+          continue
 
-        if not ever_broken:
-          active_resistance = highs[j]
-          resistance_index = j
-          break  # Most recent valid true swing high mil gaya
+        active_resistance = highs[j]
+        resistance_index = j
+        break
 
-      # Breakout Condition + Range Filter
+      # Breakout Condition + Range Filter + Base Volume Dryness Filter
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0:
           max_subsequent_range = post_swing_ranges.max()
+
+          # Range condition check
           if curr_range <= max_subsequent_range:
-            resistance_level = active_resistance
-            pending_entry = True
+            # BASE VOLUME DRYNESS CHECK:
+            # Base (j+1 to i-1) ka average volume, historical average volume se kam hona chahiye
+            base_volumes = volumes[resistance_index + 1 : i]
+            historical_avg_volume = volumes[
+                max(0, resistance_index - 20) : resistance_index
+            ].mean()
+
+            if (
+                len(base_volumes) > 0
+                and base_volumes.mean() < historical_avg_volume
+            ):
+              resistance_level = active_resistance
+              pending_entry = True
 
     return trades
 
@@ -176,7 +193,7 @@ def backtest_strict_swing_2025_2026(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_strict_swing_2025_2026(sym)
+    t = backtest_with_base_volume_dryness(sym)
     if t:
       all_trades.extend(t)
 
@@ -188,7 +205,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["Final_PnL_%"].sum(), 2)
 
   print(f"\n========================================")
-  print(f" STRICT PERFORMANCE SUMMARY (2025-2026)")
+  print(f" DRY VOLUME BASE SUMMARY (2025-2026)")
   print(f"========================================")
   print(f" Total Trades : {total}")
   print(f" Winning %    : {win_rate}% ({wins} Wins / {total - wins} Losses)")
@@ -197,13 +214,13 @@ if len(all_trades) > 0:
 
   try:
     ws = (
-        sh.worksheet("SUMMARY_STRICT_7_14")
-        if "SUMMARY_STRICT_7_14" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("SUMMARY_STRICT_7_14", 2000, 10)
+        sh.worksheet("SUMMARY_DRY_VOL")
+        if "SUMMARY_DRY_VOL" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("SUMMARY_DRY_VOL", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "STRICT 2025-2026 BACKTEST (TRUE SWINGS) |"
+        "DRY VOLUME BASE BACKTEST REPORT |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -216,11 +233,9 @@ if len(all_trades) > 0:
         "Final PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print(
-        "✅ Results saved to 'SUMMARY_STRICT_7_14' tab in Google Sheet!"
-    )
+    print("✅ Results saved to 'SUMMARY_DRY_VOL' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Strict true swing rules ke mutabiq koi trade nahi mili.")
+  print("⚠️ Is dry volume filter ke mutabiq koi trade nahi mili.")
   
