@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER PRE-BREAKOUT PATTERN ANALYZER (2025-2026) ===")
+print("=== CTD_SNIPER STRICT SWING & RANGE-FILTERED BACKTEST (2025-2026) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST & PATTERN EXTRACTION ENGINE
+# 2. STRICT BACKTEST ENGINE (TRUE SWING HIGH + RANGE FILTER)
 # -------------------------------------------------------------
-def analyze_trade_patterns(
+def backtest_strict_swing_2025_2026(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -66,11 +66,10 @@ def analyze_trade_patterns(
     take_profit = 0
     entry_date = None
     resistance_level = 0
-    base_duration = 0
-    pre_breakout_avg_range = 0
-    breakout_range = 0
+    max_price_reached = 0
 
-    for i in range(min_consolidation_months + 3, n):
+    # Loop must allow 3 months before and 3 months after validation
+    for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
@@ -79,6 +78,9 @@ def analyze_trade_patterns(
       curr_range = ranges[i]
 
       if in_trade:
+        if curr_high > max_price_reached:
+          max_price_reached = curr_high
+
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
           pnl_pct = (
@@ -86,6 +88,9 @@ def analyze_trade_patterns(
               if is_win
               else (stop_loss - entry_price) / entry_price * 100
           )
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
@@ -93,11 +98,11 @@ def analyze_trade_patterns(
           ]:
             trades.append({
                 "Symbol": symbol,
+                "Resistance": round(resistance_level, 2),
                 "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Base_Months": base_duration,
-                "Pre_Breakout_Avg_Range_%": round(pre_breakout_avg_range, 2),
-                "Breakout_Range_%": round(breakout_range, 2),
-                "Result": "WIN" if is_win else "LOSS",
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Result": "WIN (14% TARGET)" if is_win else "LOSS (7% SL)",
                 "Final_PnL_%": round(pnl_pct, 2),
             })
           in_trade = False
@@ -108,46 +113,55 @@ def analyze_trade_patterns(
         stop_loss = entry_price * (1 - stop_loss_pct)
         take_profit = entry_price * (1 + take_profit_pct)
         entry_date = current_date
+        max_price_reached = curr_high
         in_trade = True
         pending_entry = False
         continue
 
-      # Find Unbroken Swing High
+      # Find STRICT Unbroken Swing High (Checking Left 3 AND Right 3 Months)
       active_resistance = None
       resistance_index = -1
 
       for j in range(
-          i - min_consolidation_months, min_consolidation_months, -1
+          i - min_consolidation_months, min_consolidation_months - 1, -1
       ):
         is_valid_swing = True
+
+        # 1. Left 3 months check
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
             is_valid_swing = False
             break
+        if not is_valid_swing:
+          continue
 
-        if is_valid_swing:
-          ever_broken = False
-          for k in range(j + 1, i):
-            if highs[k] > highs[j]:
-              ever_broken = True
-              break
-          if not ever_broken:
-            active_resistance = highs[j]
-            resistance_index = j
+        # 2. Right 3 months check (Crucial fix to avoid false swings like ABINFRA)
+        for k in range(j + 1, j + min_consolidation_months + 1):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        # 3. Check if ever broken between j+1 and i-1
+        ever_broken = False
+        for k in range(j + 1, i):
+          if highs[k] > highs[j]:
+            ever_broken = True
             break
 
-      # Breakout Condition + Range Filter & Pattern Metrics Capture
+        if not ever_broken:
+          active_resistance = highs[j]
+          resistance_index = j
+          break  # Most recent valid true swing high mil gaya
+
+      # Breakout Condition + Range Filter
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0:
           max_subsequent_range = post_swing_ranges.max()
           if curr_range <= max_subsequent_range:
             resistance_level = active_resistance
-            base_duration = (
-                i - resistance_index
-            )  # Base kitne mahine chala
-            pre_breakout_avg_range = post_swing_ranges.mean()  # Base ka average range
-            breakout_range = curr_range  # Breakout candle ka range
             pending_entry = True
 
     return trades
@@ -157,92 +171,56 @@ def analyze_trade_patterns(
 
 
 # -------------------------------------------------------------
-# 3. RUN & COMPARE PATTERNS (WINS VS LOSSES)
+# 3. RUN & EXPORT SUMMARY TO GOOGLE SHEETS
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = analyze_trade_patterns(sym)
+    t = backtest_strict_swing_2025_2026(sym)
     if t:
       all_trades.extend(t)
 
 if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
+  wins = len(df_res[df_res["Result"].str.contains("WIN")])
+  total = len(df_res)
+  win_rate = round((wins / total) * 100, 2)
+  total_pnl = round(df_res["Final_PnL_%"].sum(), 2)
 
-  print("\n==================================================")
-  print(" PATTERN COMPARISON: WINS VS LOSSES (2025-2026)")
-  print("==================================================")
+  print(f"\n========================================")
+  print(f" STRICT PERFORMANCE SUMMARY (2025-2026)")
+  print(f"========================================")
+  print(f" Total Trades : {total}")
+  print(f" Winning %    : {win_rate}% ({wins} Wins / {total - wins} Losses)")
+  print(f" Total PnL %  : {total_pnl}%")
+  print(f"========================================")
 
-  wins_df = df_res[df_res["Result"] == "WIN"]
-  loss_df = df_res[df_res["Result"] == "LOSS"]
-
-  print(f"Total Winning Trades : {len(wins_df)}")
-  print(f"Total Losing Trades  : {len(loss_df)}")
-  print("--------------------------------------------------")
-  print("AVERAGE PATTERN METRICS:")
-  print(
-      " - Avg Base Duration (Wins)  :"
-      f" {wins_df['Base_Months'].mean():.2f} months"
-      if len(wins_df) > 0
-      else "N/A"
-  )
-  print(
-      " - Avg Base Duration (Losses) :"
-      f" {loss_df['Base_Months'].mean():.2f} months"
-      if len(loss_df) > 0
-      else "N/A"
-  )
-  print(
-      " - Avg Pre-Breakout Range (Wins)  :"
-      f" {wins_df['Pre_Breakout_Avg_Range_%'].mean():.2f}%"
-      if len(wins_df) > 0
-      else "N/A"
-  )
-  print(
-      " - Avg Pre-Breakout Range (Losses) :"
-      f" {loss_df['Pre_Breakout_Avg_Range_%'].mean():.2f}%"
-      if len(loss_df) > 0
-      else "N/A"
-  )
-  print(
-      " - Avg Breakout Candle Range (Wins)  :"
-      f" {wins_df['Breakout_Range_%'].mean():.2f}%"
-      if len(wins_df) > 0
-      else "N/A"
-  )
-  print(
-      " - Avg Breakout Candle Range (Losses) :"
-      f" {loss_df['Breakout_Range_%'].mean():.2f}%"
-      if len(loss_df) > 0
-      else "N/A"
-  )
-  print("==================================================")
-
-  # Save to Google Sheet for deep inspection
   try:
     ws = (
-        sh.worksheet("PATTERN_ANALYSIS")
-        if "PATTERN_ANALYSIS" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("PATTERN_ANALYSIS", 2000, 10)
+        sh.worksheet("SUMMARY_STRICT_7_14")
+        if "SUMMARY_STRICT_7_14" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("SUMMARY_STRICT_7_14", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "PRE-BREAKOUT PATTERN ANALYSIS (WINS VS LOSSES) |"
+        "STRICT 2025-2026 BACKTEST (TRUE SWINGS) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Stock Symbol",
+        "Resistance",
         "Breakout Month",
-        "Base Months",
-        "Pre-Breakout Avg Range %",
-        "Breakout Range %",
+        "Entry Price",
+        "Max Profit %",
         "Result",
         "Final PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Pattern analysis data saved to 'PATTERN_ANALYSIS' tab in sheet!")
+    print(
+        "✅ Results saved to 'SUMMARY_STRICT_7_14' tab in Google Sheet!"
+    )
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Koi trade nahi mili analysis ke liye.")
+  print("⚠️ Strict true swing rules ke mutabiq koi trade nahi mili.")
   
