@@ -157,11 +157,8 @@ def backtest_final_optimized(
           # -------------------------------------------------
           # FINAL COMBINED EDGE FILTERS
           # -------------------------------------------------
-          # 1. Close Location: Must close in upper half (>= 0.5)
           candle_span = curr_high - curr_low
           close_loc = (curr_close - curr_low) / (candle_span + 0.0001)
-          
-          # 2. Macro Trend Distance: Price must be at least 15% above 10M SMA
           sma_dist = ((curr_close - curr_sma10) / curr_sma10) * 100 if not np.isnan(curr_sma10) else 0
 
           if close_loc >= 0.5 and sma_dist >= 15.0:
@@ -184,3 +181,43 @@ if len(STOCKS) > 0:
       all_trades.extend(t)
 
 if len(all_trades) > 0:
+  df_res = pd.DataFrame(all_trades)
+  total = len(df_res)
+  wins = len(df_res[df_res["Result"] == "WIN"])
+  win_rate = round((wins / total) * 100, 2)
+  total_pnl = round(df_res["PnL_%"].sum(), 2)
+
+  print(f"\n========================================")
+  print(f" FINAL OPTIMIZED STRATEGY RESULTS (2025-2026)")
+  print(f"========================================")
+  print(f" Total Trades : {total}")
+  print(f" Wins         : {wins} | Losses: {total - wins}")
+  print(f" Win Rate     : {win_rate}%")
+  print(f" Total PnL    : {total_pnl}%")
+  print(f"========================================")
+
+  try:
+    ws = (
+        sh.worksheet("FINAL_OPTIMIZED_LOG")
+        if "FINAL_OPTIMIZED_LOG" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("FINAL_OPTIMIZED_LOG", 2000, 10)
+    )
+    ws.clear()
+    ws.append_row([
+        f"FINAL OPTIMIZED LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+    ])
+    ws.append_row([
+        "Symbol",
+        "Entry Date",
+        "Entry Price",
+        "Max Profit %",
+        "Result",
+        "PnL %",
+    ])
+    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+    print("✅ Data successfully saved to 'FINAL_OPTIMIZED_LOG' tab in Google Sheet!")
+  except Exception as e:
+    print(f"Sheet update error: {e}")
+else:
+  print("⚠️ Koi trade nahi mili.")
+  
