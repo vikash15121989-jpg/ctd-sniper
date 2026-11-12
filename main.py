@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER ORIGINAL MONTHLY OPEN STRATEGY BACKTEST ===")
+print("=== CTD_SNIPER FILTERED STRATEGY OPTIMIZER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. ORIGINAL MONTHLY BACKTEST ENGINE
+# 2. BACKTEST ENGINE WITH SMART FILTERS
 # -------------------------------------------------------------
-def backtest_monthly_direct(
+def backtest_filtered_strategy(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -50,10 +50,12 @@ def backtest_monthly_direct(
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
-    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
+    opens = df["Open"].values
+    volumes = df["Volume"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -72,8 +74,9 @@ def backtest_monthly_direct(
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
-      curr_open = df["Open"].iloc[i]
+      curr_open = opens[i]
       curr_range = ranges[i]
+      curr_vol = volumes[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -88,7 +91,6 @@ def backtest_monthly_direct(
           )
           max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
 
-          # Filter strictly for 2025-2026 execution
           if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
             trades.append({
                 "Symbol": symbol,
@@ -148,7 +150,24 @@ def backtest_monthly_direct(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          pending_entry = True
+          
+          # -------------------------------------------------
+          # SMART FILTERS TEST
+          # -------------------------------------------------
+          # 1. Close Location Filter: Close should be in upper half of the candle range
+          candle_range = curr_high - curr_low
+          if candle_range > 0:
+            close_loc = (curr_close - curr_low) / candle_range
+          else:
+            close_loc = 0.5
+
+          # 2. Volume Filter: Breakout volume should be greater than 3-month average volume
+          avg_vol_3m = np.mean(volumes[i-3:i]) if i >= 3 else curr_vol
+          is_volume_good = curr_vol >= avg_vol_3m
+
+          # Let's apply filter condition: Close in upper 40% AND Volume supported
+          if close_loc >= 0.6 and is_volume_good:
+            pending_entry = True
 
     return trades
 
@@ -162,7 +181,7 @@ def backtest_monthly_direct(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_monthly_direct(sym)
+    t = backtest_filtered_strategy(sym)
     if t:
       all_trades.extend(t)
 
@@ -174,7 +193,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n========================================")
-  print(f" ORIGINAL MONTHLY STRATEGY RESULTS (2025-2026)")
+  print(f" FILTERED STRATEGY RESULTS (2025-2026)")
   print(f"========================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -184,13 +203,13 @@ if len(all_trades) > 0:
 
   try:
     ws = (
-        sh.worksheet("MONTHLY_DIRECT_LOG")
-        if "MONTHLY_DIRECT_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("MONTHLY_DIRECT_LOG", 2000, 10)
+        sh.worksheet("FILTERED_STRATEGY_LOG")
+        if "FILTERED_STRATEGY_LOG" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("FILTERED_STRATEGY_LOG", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "ORIGINAL MONTHLY DIRECT LOG (2025-2026) |"
+        "FILTERED STRATEGY LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -202,7 +221,7 @@ if len(all_trades) > 0:
         "PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Data successfully saved to 'MONTHLY_DIRECT_LOG' tab in Google Sheet!")
+    print("✅ Data successfully saved to 'FILTERED_STRATEGY_LOG' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
