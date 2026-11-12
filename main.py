@@ -72,8 +72,6 @@ def analyze_winner_loser_traits(
     take_profit = 0
     entry_date = None
     max_price_reached = 0
-    breakout_vol = 0
-    breakout_close_loc = 0
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
@@ -92,11 +90,9 @@ def analyze_winner_loser_traits(
           is_win = curr_high >= take_profit
           
           if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
-            # Calculate weekly characteristics right after breakout
             w_after = df_w[df_w.index >= entry_date]
             avg_weekly_vol_surge = 0
             if len(w_after) >= 2:
-              # Check volume behavior in first 2 weeks after entry
               w_vols = w_after["Volume"].values[:2]
               avg_weekly_vol_surge = np.mean(w_vols) / (np.mean(volumes[max(0, i-3):i]) + 1)
 
@@ -178,7 +174,6 @@ if len(STOCKS) > 0:
 if len(all_diagnostics) > 0:
   df_diag = pd.DataFrame(all_diagnostics)
   
-  # Group by WIN vs LOSS to find structural differences
   summary_stats = df_diag.groupby("Result")[["Breakout_Volume_Ratio", "Candle_Close_Location", "Early_Weekly_Vol_Ratio"]].mean().reset_index()
 
   print(f"\n========================================")
@@ -195,15 +190,20 @@ if len(all_diagnostics) > 0:
     )
     ws.clear()
     ws.append_row([
-        "WINNER VS LOSER DIAGNOSTIC ANALYSIS (2025-2026) |"
-        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"WINNER VS LOSER DIAGNOSTIC ANALYSIS (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
-    ws.append_row(["Result Group", "Avg Breakout Volume Ratio", "Avg Candle Close Location (0 to 1)", "Early Weekly Volume Ratio"])
+    ws.append_row(["Result Group", "Avg Breakout Volume Ratio", "Avg Candle Close Location", "Early Weekly Volume Ratio"])
     for _, row in summary_stats.iterrows():
-      ws.append_row([row["Result"], row["Breakout_Volume_Ratio"], row["Candle_Close_Location"], row["Early_Weekly_Vol_Ratio"]])
+      ws.append_row([str(row["Result"]), float(row["Breakout_Volume_Ratio"]), float(row["Candle_Close_Location"]), float(row["Early_Weekly_Vol_Ratio"])])
       
-    # Also push raw items for complete transparency
     ws.append_row([])
     ws.append_row(["--- RAW TRADE TRAITS ---"])
-    ws.append_row(["Symbol", "Result", "Breakout Volume Ratio", "Candle Close
+    ws.append_row(["Symbol", "Result", "Breakout Volume Ratio", "Candle Close Location", "Early Weekly Vol Ratio"])
+    ws.append_rows(df_diag.values.tolist(), value_input_option="USER_ENTERED")
     
+    print("✅ Diagnostic metrics successfully saved to 'WINNER_VS_LOSER_DIAGNOSTIC' tab in Google Sheet!")
+  except Exception as e:
+    print(f"Sheet update error: {e}")
+else:
+  print("⚠️ Koi data nahi mila analysis ke liye.")
+  
