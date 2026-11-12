@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER STRICT VOLUME FILTER BACKTEST ===")
+print("=== CTD_SNIPER COMPREHENSIVE DIAGNOSTIC SCANNER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,33 +29,38 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH STRICT VOLUME FILTER
+# 2. MULTI-CRITERIA DIAGNOSTIC ENGINE
 # -------------------------------------------------------------
-def backtest_volume_filtered(
+def analyze_all_traits(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
 ):
-  trades = []
+  trade_features = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
+    df_w = yf.download(
+        ticker_symbol, start="2023-01-01", interval="1wk", auto_adjust=False, progress=False
+    )
 
     if df is None or df.empty or len(df) < 30:
-      return trades
+      return trade_features
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
-
     df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
+
+    df["SMA_10"] = df["Close"].rolling(window=10).mean()
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
     opens = df["Open"].values
     volumes = df["Volume"].values
+    sma10 = df["SMA_10"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -69,7 +74,7 @@ def backtest_volume_filtered(
     entry_date = None
     max_price_reached = 0
 
-    for i in range(min_consolidation_months * 2 + 3, n):
+    for i in range(max(min_consolidation_months * 2 + 3, 10), n):
       current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
@@ -77,6 +82,7 @@ def backtest_volume_filtered(
       curr_open = opens[i]
       curr_range = ranges[i]
       curr_vol = volumes[i]
+      curr_sma10 = sma10[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -84,21 +90,31 @@ def backtest_volume_filtered(
 
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
-          pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
-              if is_win
-              else (stop_loss - entry_price) / entry_price * 100
-          )
-          max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
-
+          
           if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
-            trades.append({
+            # 1. Breakout Volume Ratio
+            avg_vol_3m = np.mean(volumes[max(0, i-3):i]) if i >= 3 else curr_vol
+            vol_ratio = curr_vol / (avg_vol_3m + 1)
+
+            # 2. Candle Close Location (0 to 1)
+            candle_span = curr_high - curr_low
+            close_loc = (curr_close - curr_low) / (candle_span + 0.0001)
+
+            # 3. Distance from 10M SMA (%)
+            sma_dist = ((curr_close - curr_sma10) / curr_sma10) * 100 if not np.isnan(curr_sma10) else 0
+
+            # 4. Pre-Breakout Consolidation Range Compression (Avg range of last 3 months vs prior 3 months)
+            recent_ranges = np.mean(ranges[i-3:i])
+            prior_ranges = np.mean(ranges[i-6:i-3]) if i >= 6 else recent_ranges
+            range_compression = recent_ranges / (prior_ranges + 0.0001)
+
+            trade_features.append({
                 "Symbol": symbol,
-                "Entry_Date": entry_date.strftime("%b %Y"),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "PnL_%": round(pnl_pct, 2),
+                "Volume_Ratio": round(float(vol_ratio), 2),
+                "Close_Location": round(float(close_loc), 2),
+                "Distance_Above_SMA10_%": round(float(sma_dist), 2),
+                "Range_Compression_Ratio": round(float(range_compression), 2)
             })
           in_trade = False
         continue
@@ -150,68 +166,57 @@ def backtest_volume_filtered(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # -------------------------------------------------
-          # STRICT VOLUME SURGE FILTER (1.5x of 3-month average)
-          # -------------------------------------------------
-          avg_vol_3m = np.mean(volumes[i-3:i]) if i >= 3 else curr_vol
-          if curr_vol >= (avg_vol_3m * 1.5):
-            pending_entry = True
+          pending_entry = True
 
-    return trades
+    return trade_features
 
   except Exception as e:
     return []
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEET
+# 3. RUN & EXPORT COMPREHENSIVE REPORT TO SHEET
 # -------------------------------------------------------------
-all_trades = []
+all_diagnostics = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_volume_filtered(sym)
-    if t:
-      all_trades.extend(t)
+    res = analyze_all_traits(sym)
+    if res:
+      all_diagnostics.extend(res)
 
-if len(all_trades) > 0:
-  df_res = pd.DataFrame(all_trades)
-  total = len(df_res)
-  wins = len(df_res[df_res["Result"] == "WIN"])
-  win_rate = round((wins / total) * 100, 2)
-  total_pnl = round(df_res["PnL_%"].sum(), 2)
+if len(all_diagnostics) > 0:
+  df_diag = pd.DataFrame(all_diagnostics)
+  
+  summary_stats = df_diag.groupby("Result")[["Volume_Ratio", "Close_Location", "Distance_Above_SMA10_%", "Range_Compression_Ratio"]].mean().reset_index()
 
   print(f"\n========================================")
-  print(f" VOLUME FILTERED STRATEGY RESULTS (2025-2026)")
+  print(f" COMPREHENSIVE WINNER VS LOSER TRAITS")
   print(f"========================================")
-  print(f" Total Trades : {total}")
-  print(f" Wins         : {wins} | Losses: {total - wins}")
-  print(f" Win Rate     : {win_rate}%")
-  print(f" Total PnL    : {total_pnl}%")
+  print(summary_stats.to_string(index=False))
   print(f"========================================")
 
   try:
     ws = (
-        sh.worksheet("VOLUME_FILTERED_LOG")
-        if "VOLUME_FILTERED_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("VOLUME_FILTERED_LOG", 2000, 10)
+        sh.worksheet("COMPREHENSIVE_DIAGNOSTIC")
+        if "COMPREHENSIVE_DIAGNOSTIC" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("COMPREHENSIVE_DIAGNOSTIC", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"VOLUME FILTERED STRATEGY LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"COMPREHENSIVE DIAGNOSTIC ANALYSIS (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
-    ws.append_row([
-        "Symbol",
-        "Entry Date",
-        "Entry Price",
-        "Max Profit %",
-        "Result",
-        "PnL %",
-    ])
-    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Data successfully saved to 'VOLUME_FILTERED_LOG' tab in Google Sheet!")
+    ws.append_row(["Result Group", "Avg Volume Ratio", "Avg Close Location", "Avg Distance Above SMA10 (%)", "Avg Range Compression Ratio"])
+    for _, row in summary_stats.iterrows():
+      ws.append_row([str(row["Result"]), float(row["Volume_Ratio"]), float(row["Close_Location"]), float(row["Distance_Above_SMA10_%"]), float(row["Range_Compression_Ratio"])])
+      
+    ws.append_row([])
+    ws.append_row(["--- RAW TRADES DATA ---"])
+    ws.append_row(["Symbol", "Result", "Volume Ratio", "Close Location", "Distance Above SMA10 %", "Range Compression Ratio"])
+    ws.append_rows(df_diag.values.tolist(), value_input_option="USER_ENTERED")
+    
+    print("✅ Comprehensive diagnostics successfully saved to 'COMPREHENSIVE_DIAGNOSTIC' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-    print("⚠️ Koi trade nahi mili.")
+  print("⚠️ Koi data nahi mila analysis ke liye.")
   
