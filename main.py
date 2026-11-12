@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER FILTERED STRATEGY OPTIMIZER ===")
+print("=== CTD_SNIPER WINNER VS LOSER DIAGNOSTIC SCANNER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,28 +29,32 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH SMART FILTERS
+# 2. DIAGNOSTIC COMPARISON ENGINE
 # -------------------------------------------------------------
-def backtest_filtered_strategy(
+def analyze_winner_loser_traits(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
 ):
-  trades = []
+  trade_features = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
+    df_w = yf.download(
+        ticker_symbol, start="2023-01-01", interval="1wk", auto_adjust=False, progress=False
+    )
 
-    if df is None or df.empty or len(df) < 30:
-      return trades
+    if df is None or df.empty or len(df) < 30 or df_w is None or df_w.empty:
+      return trade_features
 
-    if isinstance(df.columns, pd.MultiIndex):
-      df.columns = df.columns.get_level_values(0)
+    for d in [df, df_w]:
+      if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+      d.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
 
-    df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
@@ -68,6 +72,8 @@ def backtest_filtered_strategy(
     take_profit = 0
     entry_date = None
     max_price_reached = 0
+    breakout_vol = 0
+    breakout_close_loc = 0
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
@@ -84,21 +90,22 @@ def backtest_filtered_strategy(
 
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
-          pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
-              if is_win
-              else (stop_loss - entry_price) / entry_price * 100
-          )
-          max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
-
+          
           if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
-            trades.append({
+            # Calculate weekly characteristics right after breakout
+            w_after = df_w[df_w.index >= entry_date]
+            avg_weekly_vol_surge = 0
+            if len(w_after) >= 2:
+              # Check volume behavior in first 2 weeks after entry
+              w_vols = w_after["Volume"].values[:2]
+              avg_weekly_vol_surge = np.mean(w_vols) / (np.mean(volumes[max(0, i-3):i]) + 1)
+
+            trade_features.append({
                 "Symbol": symbol,
-                "Entry_Date": entry_date.strftime("%b %Y"),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "PnL_%": round(pnl_pct, 2),
+                "Breakout_Volume_Ratio": round(curr_vol / (np.mean(volumes[i-3:i]) + 1), 2),
+                "Candle_Close_Location": round((curr_close - curr_low) / (curr_high - curr_low + 0.0001), 2),
+                "Early_Weekly_Vol_Ratio": round(float(avg_weekly_vol_surge), 2)
             })
           in_trade = False
         continue
@@ -150,80 +157,53 @@ def backtest_filtered_strategy(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # -------------------------------------------------
-          # SMART FILTERS TEST
-          # -------------------------------------------------
-          # 1. Close Location Filter: Close should be in upper half of the candle range
-          candle_range = curr_high - curr_low
-          if candle_range > 0:
-            close_loc = (curr_close - curr_low) / candle_range
-          else:
-            close_loc = 0.5
+          pending_entry = True
 
-          # 2. Volume Filter: Breakout volume should be greater than 3-month average volume
-          avg_vol_3m = np.mean(volumes[i-3:i]) if i >= 3 else curr_vol
-          is_volume_good = curr_vol >= avg_vol_3m
-
-          # Let's apply filter condition: Close in upper 40% AND Volume supported
-          if close_loc >= 0.6 and is_volume_good:
-            pending_entry = True
-
-    return trades
+    return trade_features
 
   except Exception as e:
     return []
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEET
+# 3. RUN & EXPORT COMPARISON METRICS TO SHEET
 # -------------------------------------------------------------
-all_trades = []
+all_diagnostics = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_filtered_strategy(sym)
-    if t:
-      all_trades.extend(t)
+    res = analyze_winner_loser_traits(sym)
+    if res:
+      all_diagnostics.extend(res)
 
-if len(all_trades) > 0:
-  df_res = pd.DataFrame(all_trades)
-  total = len(df_res)
-  wins = len(df_res[df_res["Result"] == "WIN"])
-  win_rate = round((wins / total) * 100, 2)
-  total_pnl = round(df_res["PnL_%"].sum(), 2)
+if len(all_diagnostics) > 0:
+  df_diag = pd.DataFrame(all_diagnostics)
+  
+  # Group by WIN vs LOSS to find structural differences
+  summary_stats = df_diag.groupby("Result")[["Breakout_Volume_Ratio", "Candle_Close_Location", "Early_Weekly_Vol_Ratio"]].mean().reset_index()
 
   print(f"\n========================================")
-  print(f" FILTERED STRATEGY RESULTS (2025-2026)")
+  print(f" WINNER VS LOSER BEHAVIORAL COMPARISON")
   print(f"========================================")
-  print(f" Total Trades : {total}")
-  print(f" Wins         : {wins} | Losses: {total - wins}")
-  print(f" Win Rate     : {win_rate}%")
-  print(f" Total PnL    : {total_pnl}%")
+  print(summary_stats.to_string(index=False))
   print(f"========================================")
 
   try:
     ws = (
-        sh.worksheet("FILTERED_STRATEGY_LOG")
-        if "FILTERED_STRATEGY_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("FILTERED_STRATEGY_LOG", 2000, 10)
+        sh.worksheet("WINNER_VS_LOSER_DIAGNOSTIC")
+        if "WINNER_VS_LOSER_DIAGNOSTIC" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("WINNER_VS_LOSER_DIAGNOSTIC", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "FILTERED STRATEGY LOG (2025-2026) |"
+        "WINNER VS LOSER DIAGNOSTIC ANALYSIS (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
-    ws.append_row([
-        "Symbol",
-        "Entry Date",
-        "Entry Price",
-        "Max Profit %",
-        "Result",
-        "PnL %",
-    ])
-    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Data successfully saved to 'FILTERED_STRATEGY_LOG' tab in Google Sheet!")
-  except Exception as e:
-    print(f"Sheet update error: {e}")
-else:
-  print("⚠️ Koi trade nahi mili.")
-  
+    ws.append_row(["Result Group", "Avg Breakout Volume Ratio", "Avg Candle Close Location (0 to 1)", "Early Weekly Volume Ratio"])
+    for _, row in summary_stats.iterrows():
+      ws.append_row([row["Result"], row["Breakout_Volume_Ratio"], row["Candle_Close_Location"], row["Early_Weekly_Vol_Ratio"]])
+      
+    # Also push raw items for complete transparency
+    ws.append_row([])
+    ws.append_row(["--- RAW TRADE TRAITS ---"])
+    ws.append_row(["Symbol", "Result", "Breakout Volume Ratio", "Candle Close
+    
