@@ -8,9 +8,11 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER ORIGINAL 413 TRADES BACKTEST ===")
+print("=== CTD_SNIPER DUAL BACKTEST ENGINE (RECENT VS MAJOR) ===")
 
-# 1. LOAD WATCHLIST
+# -------------------------------------------------------------
+# 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
+# -------------------------------------------------------------
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
@@ -23,20 +25,24 @@ try:
   print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
-  STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]
+  STOCKS = []
 
 
-# 2. ORIGINAL BACKTEST FUNCTION
-def run_original_backtest(symbol, min_consolidation_months=3):
+# -------------------------------------------------------------
+# 2. CORE BACKTEST FUNCTION (SUPPORTS SWING TYPE)
+# -------------------------------------------------------------
+def run_backtest_engine(
+    symbol,
+    swing_type="RECENT",
+    min_consolidation_months=3,
+    stop_loss_pct=0.07,
+    take_profit_pct=0.14,
+):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
-        ticker_symbol,
-        start="2018-01-01",
-        interval="1mo",
-        auto_adjust=False,
-        progress=False,
+        ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
 
     if df is None or df.empty or len(df) < 30:
@@ -45,29 +51,92 @@ def run_original_backtest(symbol, min_consolidation_months=3):
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
-    df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
-    dates = df.index
+    opens = df["Open"].values
     n = len(df)
 
-    start_idx = min_consolidation_months * 2 + 2
-    end_idx = n - 1
+    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Pct"].values
 
-    for i in range(start_idx, end_idx):
-      signal_date = dates[i]
+    in_trade = False
+    pending_entry = False
+    entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    entry_date = None
+    resistance_level = 0
+    max_price_reached = 0
 
-      # Strictly check 2025 and 2026 signals
-      if signal_date.year not in [2025, 2026]:
+    start_idx = max(min_consolidation_months * 2 + 3, 10)
+
+    for i in range(start_idx, n):
+      current_date = df.index[i]
+      curr_close = closes[i]
+      curr_high = highs[i]
+      curr_low = lows[i]
+      curr_open = opens[i]
+      curr_range = ranges[i]
+
+      if in_trade:
+        if curr_high > max_price_reached:
+          max_price_reached = curr_high
+
+        if curr_low <= stop_loss or curr_high >= take_profit:
+          is_win = curr_high >= take_profit
+          pnl_pct = (
+              (take_profit - entry_price) / entry_price * 100
+              if is_win
+              else (stop_loss - entry_price) / entry_price * 100
+          )
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100
+
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+
+            trades.append({
+                "Symbol": symbol,
+                "Breakout_Month": entry_date.strftime("%b %Y"),
+                "Resistance": round(resistance_level, 2),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Result": "WIN" if is_win else "LOSS",
+                "PnL_%": round(pnl_pct, 2),
+                "TradingView_Chart": sheet_link_formula,
+            })
+          in_trade = False
         continue
 
-      curr_close = closes[i]
-      prev_close = closes[i - 1]
+      if pending_entry:
+        entry_price = curr_open
+        stop_loss = entry_price * (1 - stop_loss_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        pending_entry = False
+        continue
 
+      # Swing Detection Logic based on Type
       active_resistance = None
-      for j in range(i - 1, min_consolidation_months - 1, -1):
+      resistance_index = -1
+
+      if swing_type == "RECENT":
+        search_range = range(i - 1, min_consolidation_months - 1, -1)
+      else:  # MAJOR
+        search_range = range(
+            i - min_consolidation_months, min_consolidation_months - 1, -1
+        )
+
+      for j in search_range:
         is_valid_swing = True
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
@@ -92,118 +161,75 @@ def run_original_backtest(symbol, min_consolidation_months=3):
           continue
 
         active_resistance = highs[j]
+        resistance_index = j
         break
 
-      if (
-          active_resistance is not None
-          and curr_close > active_resistance
-          and prev_close <= active_resistance
-      ):
-        entry_price = curr_close
-        stop_loss = entry_price * 0.93  # -7%
-        take_profit = entry_price * 1.14  # +14%
-        entry_month_date = dates[i + 1]
+      if active_resistance is not None and curr_close > active_resistance:
+        post_swing_ranges = ranges[resistance_index + 1 : i]
+        if len(post_swing_ranges) > 0:
+          if curr_range <= post_swing_ranges.max():
+            resistance_level = active_resistance
+            pending_entry = True
 
-        trade_result = "OPEN"
-        exit_date = None
-        pnl_percent = 0.0
+    return trades
 
-        for m in range(i + 1, n):
-          m_high = highs[m]
-          m_low = lows[m]
-
-          hit_tp = m_high >= take_profit
-          hit_sl = m_low <= stop_loss
-
-          if hit_tp and hit_sl:
-            trade_result = "LOSS"
-            pnl_percent = -7.0
-            exit_date = dates[m]
-            break
-          elif hit_sl:
-            trade_result = "LOSS"
-            pnl_percent = -7.0
-            exit_date = dates[m]
-            break
-          elif hit_tp:
-            trade_result = "WIN"
-            pnl_percent = 14.0
-            exit_date = dates[m]
-            break
-
-        if trade_result != "OPEN":
-          trades.append({
-              "Symbol": symbol,
-              "Signal_Month": signal_date.strftime("%b %Y"),
-              "Entry_Month": entry_month_date.strftime("%b %Y"),
-              "Trigger_Price": round(entry_price, 2),
-              "Resistance": round(active_resistance, 2),
-              "Result": trade_result,
-              "Return_%": pnl_percent,
-              "Exit_Month": (
-                  exit_date.strftime("%b %Y") if exit_date else "Ongoing"
-              ),
-          })
-  except Exception:
-    pass
-  return trades
-
-
-# 3. RUN & EXPORT
-all_backtest_results = []
-print("🚀 Running Original 413-Trades Backtest...")
-
-for sym in STOCKS:
-  stock_trades = run_original_backtest(sym)
-  if stock_trades:
-    all_backtest_results.extend(stock_trades)
-
-if len(all_backtest_results) > 0:
-  df_bt = pd.DataFrame(all_backtest_results)
-  total_trades = len(df_bt)
-  wins = len(df_bt[df_bt["Result"] == "WIN"])
-  losses = len(df_bt[df_bt["Result"] == "LOSS"])
-  win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-  total_return = df_bt["Return_%"].sum()
-
-  print("\n========================================")
-  print("📊 ORIGINAL BACKTEST SUMMARY")
-  print("========================================")
-  print(f"Total Trades Simulated : {total_trades}")
-  print(f"Winning Trades (+14%)  : {wins}")
-  print(f"Losing Trades (-7%)    : {losses}")
-  print(f"Strategy Win Rate      : {win_rate:.2f}%")
-  print(f"Cumulative Return      : {total_return:.2f}%")
-  print("========================================\n")
-
-  try:
-    bt_tab_name = "MONTHLY_DIRECT_LOG"
-    ws_bt = (
-        sh.worksheet(bt_tab_name)
-        if bt_tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(bt_tab_name, 2000, 10)
-    )
-    ws_bt.clear()
-    ws_bt.append_row([
-        "ORIGINAL MONTHLY STRATEGY RESULTS (2025-2026) | Generated on"
-        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
-    ])
-    ws_bt.append_row([
-        f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win"
-        f" Rate: {win_rate:.2f}% | Total Return: {total_return:.2f}%"
-    ])
-    ws_bt.append_row([])
-    ws_bt.append_row([
-        "Symbol",
-        "Signal Month",
-        "Entry Month",
-        "Trigger Price",
-        "Resistance",
-        "Result",
-        "Return %",
-        "Exit Month",
-    ])
-    ws_bt.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
-    print(f"✅ Saved to '{bt_tab_name}' tab in Google Sheet!")
   except Exception as e:
-    print(f"Sheet update error: {e}")
+    return []
+
+
+# -------------------------------------------------------------
+# 3. RUN BOTH ENGINES & EXPORT TO GOOGLE SHEETS
+# -------------------------------------------------------------
+if len(STOCKS) > 0:
+  for s_type in ["RECENT", "MAJOR"]:
+    print(f"\n🚀 Running {s_type} Swing Backtest...")
+    all_trades = []
+
+    for sym in STOCKS:
+      t = run_backtest_engine(sym, swing_type=s_type)
+      if t:
+        all_trades.extend(t)
+
+    if len(all_trades) > 0:
+      df_res = pd.DataFrame(all_trades)
+      wins = len(df_res[df_res["Result"] == "WIN"])
+      total = len(df_res)
+      win_rate = round((wins / total) * 100, 2)
+      total_pnl = round(df_res["PnL_%"].sum(), 2)
+
+      print(f"📊 {s_type} Results -> Trades: {total} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%")
+
+      tab_name = f"BT_{s_type}_LOG"
+      try:
+        ws = (
+            sh.worksheet(tab_name)
+            if tab_name in [x.title for x in sh.worksheets()]
+            else sh.add_worksheet(tab_name, 2000, 10)
+        )
+        ws.clear()
+        ws.append_row([
+            f"{s_type} SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        ])
+        ws.append_row([
+            f"Total Trades: {total} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
+        ])
+        ws.append_row([])
+        ws.append_row([
+            "Symbol",
+            "Breakout Month",
+            "Resistance",
+            "Entry Price",
+            "Max Profit %",
+            "Result",
+            "PnL %",
+            "TradingView Link",
+        ])
+        ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+        print(f"✅ Saved to '{tab_name}' tab successfully!")
+      except Exception as e:
+        print(f"Sheet update error for {s_type}: {e}")
+    else:
+      print(f"⚠️ No trades found for {s_type} swing.")
+else:
+  print("⚠️ Watchlist is empty.")
+  
