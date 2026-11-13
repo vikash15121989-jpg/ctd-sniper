@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER HISTORICAL BACKTESTING ENGINE ===")
+print("=== CTD_SNIPER 2025-2026 BACKTESTING ENGINE ===")
 
 # -------------------------------------------------------------
 # 1. LOAD WATCHLIST FROM GOOGLE SHEETS
@@ -29,21 +29,21 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST FUNCTION FOR A SINGLE STOCK
+# 2. BACKTEST FUNCTION FOR 2025-2026
 # -------------------------------------------------------------
-def backtest_stock(symbol, min_consolidation_months=3):
+def backtest_stock_recent(symbol, min_consolidation_months=3):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol,
-        start="2018-01-01",
+        start="2025-01-01",  # Strictly restricted from 2025 onwards
         interval="1mo",
         auto_adjust=False,
         progress=False,
     )
 
-    if df is None or df.empty or len(df) < 40:
+    if df is None or df.empty or len(df) < 15:
       return trades
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -60,10 +60,11 @@ def backtest_stock(symbol, min_consolidation_months=3):
     df["Range_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
     ranges = df["Range_Ratio"].values
 
-    # Loop through historical monthly candles to find signals
-    # Start after enough history for consolidation and swing check
-    start_idx = min_consolidation_months * 2 + 5
-    end_idx = n - 2  # Leave room for trade outcome evaluation
+    start_idx = min_consolidation_months + 2
+    end_idx = n - 1
+
+    if start_idx >= end_idx:
+      return trades
 
     for i in range(start_idx, end_idx):
       curr_close = closes[i]
@@ -77,7 +78,6 @@ def backtest_stock(symbol, min_consolidation_months=3):
       for j in range(i - 1, min_consolidation_months - 1, -1):
         is_valid_swing = True
 
-        # Check left consolidation
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
             is_valid_swing = False
@@ -85,7 +85,6 @@ def backtest_stock(symbol, min_consolidation_months=3):
         if not is_valid_swing:
           continue
 
-        # Check right consolidation
         for k in range(j + 1, j + min_consolidation_months + 1):
           if highs[j] <= highs[k]:
             is_valid_swing = False
@@ -93,7 +92,6 @@ def backtest_stock(symbol, min_consolidation_months=3):
         if not is_valid_swing:
           continue
 
-        # Check if ever broken before `i`
         ever_broken = False
         for k in range(j + 1, i):
           if highs[k] > highs[j]:
@@ -114,15 +112,12 @@ def backtest_stock(symbol, min_consolidation_months=3):
       ):
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # Setup trade parameters
           entry_price = curr_close
           stop_loss = entry_price * 0.93  # -7%
           take_profit = entry_price * 1.14  # +14%
           signal_date = dates[i]
           entry_month_date = dates[i + 1]
 
-          # Simulate Trade Outcome in subsequent months (from i+1 onwards)
           trade_result = "OPEN"
           exit_date = None
           pnl_percent = 0.0
@@ -131,12 +126,10 @@ def backtest_stock(symbol, min_consolidation_months=3):
             m_high = highs[m]
             m_low = lows[m]
 
-            # Check if Take Profit (+14%) or Stop Loss (-7%) hit first in this candle
             hit_tp = m_high >= take_profit
             hit_sl = m_low <= stop_loss
 
             if hit_tp and hit_sl:
-              # If both hit in the same month, assume conservative SL hit first
               trade_result = "LOSS"
               pnl_percent = -7.0
               exit_date = dates[m]
@@ -173,13 +166,13 @@ def backtest_stock(symbol, min_consolidation_months=3):
 
 
 # -------------------------------------------------------------
-# 3. RUN BACKTEST ACROSS ALL WATCHLIST STOCKS
+# 3. RUN BACKTEST FOR 2025-2026 ACROSS WATCHLIST
 # -------------------------------------------------------------
 all_backtest_results = []
-print("🚀 Running historical backtest across watchlist...")
+print("🚀 Running 2025-2026 historical backtest across watchlist...")
 
 for sym in STOCKS:
-  stock_trades = backtest_stock(sym)
+  stock_trades = backtest_stock_recent(sym)
   if stock_trades:
     all_backtest_results.extend(stock_trades)
 
@@ -188,7 +181,7 @@ for sym in STOCKS:
 # -------------------------------------------------------------
 if len(all_backtest_results) > 0:
   df_bt = pd.DataFrame(all_backtest_results)
-  
+
   total_trades = len(df_bt)
   wins = len(df_bt[df_bt["Result"] == "WIN"])
   losses = len(df_bt[df_bt["Result"] == "LOSS"])
@@ -196,7 +189,7 @@ if len(all_backtest_results) > 0:
   total_return = df_bt["Return_%"].sum()
 
   print("\n========================================")
-  print("📊 BACKTEST SUMMARY REPORT")
+  print("📊 2025-2026 BACKTEST SUMMARY REPORT")
   print("========================================")
   print(f"Total Trades Simulated : {total_trades}")
   print(f"Winning Trades (+14%)  : {wins}")
@@ -205,9 +198,8 @@ if len(all_backtest_results) > 0:
   print(f"Cumulative Return      : {total_return:.2f}%")
   print("========================================\n")
 
-  # Save backtest results and summary to Google Sheets
   try:
-    bt_tab_name = "BACKTEST_REPORT"
+    bt_tab_name = "BACKTEST_2025_2026"
     ws_bt = (
         sh.worksheet(bt_tab_name)
         if bt_tab_name in [x.title for x in sh.worksheets()]
@@ -215,12 +207,12 @@ if len(all_backtest_results) > 0:
     )
     ws_bt.clear()
     ws_bt.append_row([
-        f"CTD SNIPER BACKTEST REPORT | Generated on {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"CTD SNIPER 2025-2026 BACKTEST REPORT | Generated on {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws_bt.append_row([
         f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}% | Total Return: {total_return:.2f}%"
     ])
-    ws_bt.append_row([])  # Empty row
+    ws_bt.append_row([])
     ws_bt.append_row([
         "Symbol",
         "Signal Month",
@@ -232,9 +224,12 @@ if len(all_backtest_results) > 0:
         "Exit Month",
     ])
     ws_bt.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
-    print(f"✅ Detailed backtest log successfully saved to '{bt_tab_name}' tab in Google Sheet!")
+    print(
+        f"✅ 2025-2026 backtest log successfully saved to '{bt_tab_name}' tab in"
+        " Google Sheet!"
+    )
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Backtest ke liye koi trades nahi mile.")
+  print("⚠️ 2025-2026 ke period mein koi trades nahi mile.")
   
