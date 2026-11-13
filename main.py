@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER DUAL BACKTESTING ENGINE (2025-2026) ===")
+print("=== CTD_SNIPER FIXED DUAL BACKTESTING ENGINE (2025-2026) ===")
 
 # 1. LOAD WATCHLIST
 try:
@@ -26,7 +26,7 @@ except Exception as e:
   STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]
 
 
-def run_backtest_for_logic(logic_type="RECENT"):
+def run_backtest_strict(logic_type="RECENT"):
   all_trades = []
   min_consolidation_months = 3
 
@@ -65,7 +65,7 @@ def run_backtest_for_logic(logic_type="RECENT"):
         active_resistance = None
 
         if logic_type == "RECENT":
-          # IMMEDIATE / RECENT SWING HIGH (Scans backwards from i-1)
+          # 1. IMMEDIATE / RECENT SWING HIGH (Scans backwards from i-1)
           for j in range(i - 1, min_consolidation_months - 1, -1):
             is_valid = True
             for k in range(j - min_consolidation_months, j):
@@ -91,7 +91,7 @@ def run_backtest_for_logic(logic_type="RECENT"):
             break
 
         else:
-          # MAJOR SWING HIGH (Scans within window)
+          # 2. MAJOR SWING HIGH (Scans within window i - min_consolidation)
           for j in range(
               i - min_consolidation_months, min_consolidation_months - 1, -1
           ):
@@ -124,8 +124,8 @@ def run_backtest_for_logic(logic_type="RECENT"):
             and prev_close <= active_resistance
         ):
           entry_price = curr_close
-          stop_loss = entry_price * 0.93
-          take_profit = entry_price * 1.14
+          stop_loss = entry_price * 0.93  # -7%
+          take_profit = entry_price * 1.14  # +14%
           entry_month_date = dates[i + 1]
 
           trade_result = "OPEN"
@@ -138,7 +138,7 @@ def run_backtest_for_logic(logic_type="RECENT"):
             hit_tp = m_high >= take_profit
             hit_sl = m_low <= stop_loss
 
-            if hit_tp and hit_sl or hit_sl:
+            if hit_sl:
               trade_result = "LOSS"
               pnl_percent = -7.0
               exit_date = dates[m]
@@ -168,10 +168,10 @@ def run_backtest_for_logic(logic_type="RECENT"):
   return all_trades
 
 
-# Run both logics and export separately
+# Run both distinct logics
 for logic in ["RECENT", "MAJOR"]:
-  print(f"\n🚀 Running {logic} Swing Backtest...")
-  trades = run_backtest_for_logic(logic)
+  print(f"\n🚀 Running Strict {logic} Swing Backtest...")
+  trades = run_backtest_strict(logic)
 
   if len(trades) > 0:
     df_bt = pd.DataFrame(trades)
@@ -181,9 +181,12 @@ for logic in ["RECENT", "MAJOR"]:
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     total_return = df_bt["Return_%"].sum()
 
-    print(f"📊 {logic} RESULTS -> Trades: {total_trades} | Win Rate: {win_rate:.2f}% | Return: {total_return:.2f}%")
+    print(
+        f"📊 {logic} RESULTS -> Trades: {total_trades} | Win Rate:"
+        f" {win_rate:.2f}% | Return: {total_return:.2f}%"
+    )
 
-    tab_name = f"BT_{logic}_2025_2026"
+    tab_name = f"BT_STRICT_{logic}_2025"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -191,12 +194,27 @@ for logic in ["RECENT", "MAJOR"]:
           else sh.add_worksheet(tab_name, 2000, 10)
       )
       ws.clear()
-      ws.append_row([f"{logic} SWING BACKTEST REPORT (2025-2026) | Generated: {datetime.now(IST).strftime('%d-%b-%Y')}"])
-      ws.append_row([f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}% | Return: {total_return:.2f}%"])
+      ws.append_row([
+          f"STRICT {logic} SWING BACKTEST (2025-2026) | Generated:"
+          f" {datetime.now(IST).strftime('%d-%b-%Y')}"
+      ])
+      ws.append_row([
+          f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win"
+          f" Rate: {win_rate:.2f}% | Return: {total_return:.2f}%"
+      ])
       ws.append_row([])
-      ws.append_row(["Symbol", "Signal Month", "Entry Month", "Trigger Price", "Resistance", "Result", "Return %", "Exit Month"])
+      ws.append_row([
+          "Symbol",
+          "Signal Month",
+          "Entry Month",
+          "Trigger Price",
+          "Resistance",
+          "Result",
+          "Return %",
+          "Exit Month",
+      ])
       ws.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
-      print(f"✅ Saved to tab '{tab_name}'")
+      print(f"✅ Saved correctly to tab '{tab_name}'")
     except Exception as e:
       print(f"Sheet error: {e}")
-      
+                  
