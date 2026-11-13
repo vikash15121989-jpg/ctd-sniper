@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER 2025-2026 BACKTESTING ENGINE ===")
+print("=== CTD_SNIPER MAJOR SWING 2025-2026 BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. LOAD WATCHLIST FROM GOOGLE SHEETS
@@ -25,19 +25,19 @@ try:
   print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist for Backtesting.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
-  STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]  # Fallback list
+  STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST FUNCTION FOR 2025-2026
+# 2. BACKTEST FUNCTION WITH MAJOR SWING HIGH LOGIC (2025-2026)
 # -------------------------------------------------------------
-def backtest_stock_recent(symbol, min_consolidation_months=3):
+def backtest_major_swing(symbol, min_consolidation_months=3):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol,
-        start="2025-01-01",  # Strictly restricted from 2025 onwards
+        start="2025-01-01",
         interval="1mo",
         auto_adjust=False,
         progress=False,
@@ -71,13 +71,14 @@ def backtest_stock_recent(symbol, min_consolidation_months=3):
       prev_close = closes[i - 1]
       curr_range = ranges[i]
 
-      # FIND IMMEDIATE (CLOSEST) TRUE SWING HIGH BY SCANNING BACKWARDS FROM `i-1`
+      # MAJOR SWING HIGH LOGIC
       active_resistance = None
       resistance_index = -1
 
-      for j in range(i - 1, min_consolidation_months - 1, -1):
+      for j in range(
+          i - min_consolidation_months, min_consolidation_months - 1, -1
+      ):
         is_valid_swing = True
-
         for k in range(j - min_consolidation_months, j):
           if highs[j] <= highs[k]:
             is_valid_swing = False
@@ -166,18 +167,18 @@ def backtest_stock_recent(symbol, min_consolidation_months=3):
 
 
 # -------------------------------------------------------------
-# 3. RUN BACKTEST FOR 2025-2026 ACROSS WATCHLIST
+# 3. RUN BACKTEST ACROSS WATCHLIST
 # -------------------------------------------------------------
 all_backtest_results = []
-print("🚀 Running 2025-2026 historical backtest across watchlist...")
+print("🚀 Running 2025-2026 backtest with Major Swing logic...")
 
 for sym in STOCKS:
-  stock_trades = backtest_stock_recent(sym)
+  stock_trades = backtest_major_swing(sym)
   if stock_trades:
     all_backtest_results.extend(stock_trades)
 
 # -------------------------------------------------------------
-# 4. AGGREGATE PERFORMANCE METRICS & EXPORT TO GOOGLE SHEETS
+# 4. AGGREGATE METRICS & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
 if len(all_backtest_results) > 0:
   df_bt = pd.DataFrame(all_backtest_results)
@@ -189,7 +190,7 @@ if len(all_backtest_results) > 0:
   total_return = df_bt["Return_%"].sum()
 
   print("\n========================================")
-  print("📊 2025-2026 BACKTEST SUMMARY REPORT")
+  print("📊 MAJOR SWING 2025-2026 BACKTEST SUMMARY")
   print("========================================")
   print(f"Total Trades Simulated : {total_trades}")
   print(f"Winning Trades (+14%)  : {wins}")
@@ -199,7 +200,7 @@ if len(all_backtest_results) > 0:
   print("========================================\n")
 
   try:
-    bt_tab_name = "BACKTEST_2025_2026"
+    bt_tab_name = "BACKTEST_MAJOR_2025_2026"
     ws_bt = (
         sh.worksheet(bt_tab_name)
         if bt_tab_name in [x.title for x in sh.worksheets()]
@@ -207,7 +208,7 @@ if len(all_backtest_results) > 0:
     )
     ws_bt.clear()
     ws_bt.append_row([
-        f"CTD SNIPER 2025-2026 BACKTEST REPORT | Generated on {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"MAJOR SWING 2025-2026 BACKTEST REPORT | Generated on {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws_bt.append_row([
         f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}% | Total Return: {total_return:.2f}%"
@@ -225,11 +226,11 @@ if len(all_backtest_results) > 0:
     ])
     ws_bt.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
     print(
-        f"✅ 2025-2026 backtest log successfully saved to '{bt_tab_name}' tab in"
-        " Google Sheet!"
+        f"✅ Major swing backtest log saved to '{bt_tab_name}' tab in Google"
+        " Sheet!"
     )
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ 2025-2026 ke period mein koi trades nahi mile.")
+  print("⚠️ 2025-2026 ke period mein major swing logic par koi trades nahi mile.")
   
