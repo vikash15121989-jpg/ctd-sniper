@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER FULLY DYNAMIC MONTH-MAPPING SCANNER ===")
+print("=== CTD_SNIPER STRICT NEXT-MONTH ENTRY SCANNER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. DYNAMIC SCANNER (AUTOMATICALLY TARGETS PREVIOUS CLOSED MONTH)
+# 2. SCANNER WITH STRICT NEXT-MONTH MAPPING
 # -------------------------------------------------------------
-def scan_dynamic_breakout(symbol, min_consolidation_months=3):
+def scan_next_month_entry(symbol, min_consolidation_months=3):
   signal_data = None
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -55,17 +55,17 @@ def scan_dynamic_breakout(symbol, min_consolidation_months=3):
     df["Range_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
     ranges = df["Range_Ratio"].values
 
-    # FULLY DYNAMIC INDEX MAPPING:
-    # n-1 is current running month, n-2 is the last completed closed month.
-    # We evaluate n-2 close for trading in n-1 (current month).
+    # STRICT MAPPING:
+    # n-2 index is the last fully completed closed month (e.g., October close)
+    # n-1 index is the immediate next month where trade/entry is taken (e.g., November entry)
     i = n - 2  
-    closed_month_date = df.index[i]       # Automatically picks the closed month (e.g., October)
-    trading_month_date = df.index[i + 1]  # Automatically picks the active trading month (e.g., November)
+    breakout_month_date = df.index[i]     # Mahina jisme candle close hui (e.g. Oct 2026)
+    entry_month_date = df.index[i + 1]    # Agla mahina jisme entry leni hai (e.g. Nov 2026)
     
     curr_close = closes[i]
     curr_range = ranges[i]
 
-    # Find True Swing High prior to the closed month
+    # Find True Swing High prior to the breakout month
     active_resistance = None
     resistance_index = -1
 
@@ -97,25 +97,25 @@ def scan_dynamic_breakout(symbol, min_consolidation_months=3):
       resistance_index = j
       break
 
-    # Check if closed month broke the active resistance
+    # Check if breakout month closed above active resistance
     if active_resistance is not None and curr_close > active_resistance:
       post_swing_ranges = ranges[resistance_index + 1 : i]
-      if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
+      if len(post_sighting := post_swing_ranges) > 0 and curr_range <= post_sighting.max():
         
         tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol}", "{symbol} Chart")'
         
         signal_data = {
             "Symbol": symbol,
             "Scan_Date": datetime.now(IST).strftime("%d-%b-%Y"),
-            "Breakout_Close_Month": closed_month_date.strftime("%b %Y"),
-            "Trading_Month": trading_month_date.strftime("%b %Y"),
+            "Breakout_Close_Month": breakout_month_date.strftime("%b %Y"),
+            "Entry_Trading_Month": entry_month_date.strftime("%b %Y"),
             "Trigger_Price": round(curr_close, 2),
             "Resistance_Broken": round(active_resistance, 2),
             "Stop_Loss (7%)": round(curr_close * 0.93, 2),
             "Take_Profit (14%)": round(curr_close * 1.14, 2),
             "TradingView": tv_link
         }
-        print(f"🎯 [MATCH] {symbol}: Closed in {closed_month_date.strftime('%b %Y')} -> Valid for {trading_month_date.strftime('%b %Y')}")
+        print(f"🎯 [MATCH] {symbol} | Close: {breakout_month_date.strftime('%b %Y')} ➡️ Entry Valid For: {entry_month_date.strftime('%b %Y')}")
 
     return signal_data
 
@@ -124,48 +124,48 @@ def scan_dynamic_breakout(symbol, min_consolidation_months=3):
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEET (DYNAMIC SHEET TAB)
+# 3. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
-dynamic_signals = []
+all_signals = []
 if len(STOCKS) > 0:
-  print(f"🔍 Scanning {len(STOCKS)} stocks dynamically...")
+  print(f"🔍 Scanning {len(STOCKS)} stocks with strict next-month entry rule...")
   for sym in STOCKS:
-    res = scan_dynamic_breakout(sym)
+    res = scan_next_month_entry(sym)
     if res:
-      dynamic_signals.append(res)
+      all_signals.append(res)
 
-print(f"\nTotal signals found: {len(dynamic_signals)}")
+print(f"\nTotal valid signals found: {len(all_signals)}")
 
-if len(dynamic_signals) > 0:
-  df_dyn = pd.DataFrame(dynamic_signals)
-  # Dynamic tab name based on current running trading month
-  current_trading_label = df_dyn['Trading_Month'].iloc[0].replace(" ", "_").upper() + "_SIGNALS"
+if len(all_signals) > 0:
+  df_res = pd.DataFrame(all_signals)
+  # Target tab name based strictly on the Entry Trading Month
+  target_tab = df_res['Entry_Trading_Month'].iloc[0].replace(" ", "_").upper() + "_SIGNALS"
   
   try:
     ws = (
-        sh.worksheet(current_trading_label)
-        if current_trading_label in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(current_trading_label, 2000, 10)
+        sh.worksheet(target_tab)
+        if target_tab in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet(target_tab, 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"DYNAMIC BREAKOUT SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"STRICT NEXT-MONTH ENTRY SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
         "Scan Date",
         "Breakout Close Month",
-        "Trading Month",
+        "Entry Trading Month",
         "Trigger Price",
         "Resistance Broken",
         "Stop Loss (7%)",
         "Take Profit (14%)",
         "TradingView Link"
     ])
-    ws.append_rows(df_dyn.values.tolist(), value_input_option="USER_ENTERED")
-    print(f"✅ Data successfully saved to '{current_trading_label}' tab in Google Sheet!")
+    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+    print(f"✅ Data successfully saved to '{target_tab}' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Pichle closed mahine me koi matching breakout nahi mila.")
+  print("⚠️ Koi matching setup nahi mila.")
   
