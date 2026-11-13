@@ -8,11 +8,9 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER RECENT SWING BACKTEST (2025-2026) ===")
+print("=== CTD_SNIPER ORIGINAL 413 TRADES BACKTEST ===")
 
-# -------------------------------------------------------------
-# 1. LOAD WATCHLIST FROM GOOGLE SHEETS
-# -------------------------------------------------------------
+# 1. LOAD WATCHLIST
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
@@ -22,22 +20,20 @@ try:
       for s in raw
       if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
   ]
-  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist for Backtesting.")
+  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]
 
 
-# -------------------------------------------------------------
-# 2. BACKTEST FUNCTION (RECENT SWING HIGH LOGIC, 2018 START)
-# -------------------------------------------------------------
-def backtest_recent_swing(symbol, min_consolidation_months=3):
+# 2. ORIGINAL BACKTEST FUNCTION
+def run_original_backtest(symbol, min_consolidation_months=3):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol,
-        start="2018-01-01",  # 2018 se data download taaki saare valid swing highs milein
+        start="2018-01-01",
         interval="1mo",
         auto_adjust=False,
         progress=False,
@@ -63,14 +59,13 @@ def backtest_recent_swing(symbol, min_consolidation_months=3):
     for i in range(start_idx, end_idx):
       signal_date = dates[i]
 
-      # Strictly filter signal period for 2025-2026
+      # Strictly check 2025 and 2026 signals
       if signal_date.year not in [2025, 2026]:
         continue
 
       curr_close = closes[i]
       prev_close = closes[i - 1]
 
-      # IMMEDIATE / RECENT SWING HIGH LOGIC (Scans backwards from i-1)
       active_resistance = None
       for j in range(i - 1, min_consolidation_months - 1, -1):
         is_valid_swing = True
@@ -99,7 +94,6 @@ def backtest_recent_swing(symbol, min_consolidation_months=3):
         active_resistance = highs[j]
         break
 
-      # FRESH BREAKOUT CHECK
       if (
           active_resistance is not None
           and curr_close > active_resistance
@@ -121,7 +115,12 @@ def backtest_recent_swing(symbol, min_consolidation_months=3):
           hit_tp = m_high >= take_profit
           hit_sl = m_low <= stop_loss
 
-          if hit_sl:
+          if hit_tp and hit_sl:
+            trade_result = "LOSS"
+            pnl_percent = -7.0
+            exit_date = dates[m]
+            break
+          elif hit_sl:
             trade_result = "LOSS"
             pnl_percent = -7.0
             exit_date = dates[m]
@@ -145,27 +144,22 @@ def backtest_recent_swing(symbol, min_consolidation_months=3):
                   exit_date.strftime("%b %Y") if exit_date else "Ongoing"
               ),
           })
-
   except Exception:
     pass
-
   return trades
 
 
-# -------------------------------------------------------------
-# 3. RUN BACKTEST & EXPORT TO GOOGLE SHEETS
-# -------------------------------------------------------------
+# 3. RUN & EXPORT
 all_backtest_results = []
-print("🚀 Running Recent Swing High Backtest (2025-2026)...")
+print("🚀 Running Original 413-Trades Backtest...")
 
 for sym in STOCKS:
-  stock_trades = backtest_recent_swing(sym)
+  stock_trades = run_original_backtest(sym)
   if stock_trades:
     all_backtest_results.extend(stock_trades)
 
 if len(all_backtest_results) > 0:
   df_bt = pd.DataFrame(all_backtest_results)
-
   total_trades = len(df_bt)
   wins = len(df_bt[df_bt["Result"] == "WIN"])
   losses = len(df_bt[df_bt["Result"] == "LOSS"])
@@ -173,7 +167,7 @@ if len(all_backtest_results) > 0:
   total_return = df_bt["Return_%"].sum()
 
   print("\n========================================")
-  print("📊 RECENT SWING 2025-2026 BACKTEST SUMMARY")
+  print("📊 ORIGINAL BACKTEST SUMMARY")
   print("========================================")
   print(f"Total Trades Simulated : {total_trades}")
   print(f"Winning Trades (+14%)  : {wins}")
@@ -191,7 +185,7 @@ if len(all_backtest_results) > 0:
     )
     ws_bt.clear()
     ws_bt.append_row([
-        "RECENT SWING BACKTEST REPORT (2025-2026) | Generated on"
+        "ORIGINAL MONTHLY STRATEGY RESULTS (2025-2026) | Generated on"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws_bt.append_row([
@@ -213,6 +207,4 @@ if len(all_backtest_results) > 0:
     print(f"✅ Saved to '{bt_tab_name}' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
-else:
-  print("⚠️ No trades found.")
-  
+    
