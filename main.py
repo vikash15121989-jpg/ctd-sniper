@@ -157,7 +157,7 @@ if len(latest_signals) > 0:
     ])
     ws.append_rows(df_lat.values.tolist(), value_input_option="USER_ENTERED")
     print("✅ Data successfully saved to 'LATEST_BREAKOUT_SIGNALS' tab in Google Sheet!")
-  exceptException as e:
+  except Exception as e:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Pichle closed mahine me koi breakout match nahi mila.")
