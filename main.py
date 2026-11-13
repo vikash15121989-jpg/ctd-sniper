@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER LIVE BREAKOUT SCANNER ===")
+print("=== CTD_SNIPER FULLY AUTOMATED DYNAMIC BREAKOUT SCANNER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -22,16 +22,16 @@ try:
       for s in raw
       if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
   ]
-  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist for Live Scanning.")
+  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
 
 
 # -------------------------------------------------------------
-# 2. LIVE SCANNER ENGINE (CURRENT MONTH BREAKOUT DETECTION)
+# 2. DYNAMIC SCANNER FOR THE LAST COMPLETED MONTH'S BREAKOUT
 # -------------------------------------------------------------
-def scan_live_breakouts(symbol, min_consolidation_months=3):
+def scan_latest_completed_month_breakout(symbol, min_consolidation_months=3):
   signal_data = None
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -50,22 +50,18 @@ def scan_live_breakouts(symbol, min_consolidation_months=3):
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
-    opens = df["Open"].values
     n = len(df)
 
-    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
-    ranges = df["Range_Pct"].values
+    df["Range_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Ratio"].values
 
-    # Check the very last candle (Current Active/Latest Month)
-    i = n - 1
+    # Target the LAST COMPLETED monthly candle (n-2 index, because n-1 is the current running month)
+    i = n - 2
     current_date = df.index[i]
     curr_close = closes[i]
-    curr_high = highs[i]
-    curr_low = lows[i]
-    curr_open = opens[i]
     curr_range = ranges[i]
 
-    # Find True Swing High in history prior to current month
+    # Find True Swing High prior to this completed month
     active_resistance = None
     resistance_index = -1
 
@@ -97,12 +93,11 @@ def scan_live_breakouts(symbol, min_consolidation_months=3):
       resistance_index = j
       break
 
-    # Check if current month breaks the active resistance (Pure Breakout)
+    # Check if that completed month closed above the active resistance
     if active_resistance is not None and curr_close > active_resistance:
       post_swing_ranges = ranges[resistance_index + 1 : i]
       if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
         
-        # Generate TradingView Clickable Chart Hyperlink
         tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol}", "{symbol} Chart")'
         
         signal_data = {
@@ -123,32 +118,32 @@ def scan_live_breakouts(symbol, min_consolidation_months=3):
 
 
 # -------------------------------------------------------------
-# 3. RUN SCANNER & EXPORT SIGNALS TO GOOGLE SHEET
+# 3. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
-live_signals = []
+latest_signals = []
 if len(STOCKS) > 0:
-  print("🔍 Scanning watchlist for active breakouts...")
+  print(f"🔍 Scanning watchlist for last closed month breakouts...")
   for sym in STOCKS:
-    res = scan_live_breakouts(sym)
+    res = scan_latest_completed_month_breakout(sym)
     if res:
-      live_signals.append(res)
+      latest_signals.append(res)
 
-if len(live_signals) > 0:
-  df_live = pd.DataFrame(live_signals)
+if len(latest_signals) > 0:
+  df_lat = pd.DataFrame(latest_signals)
   print(f"\n========================================")
-  print(f" LIVE SCANNER FOUND {len(df_live)} BREAKOUT SIGNALS")
+  print(f" LATEST CLOSED MONTH BREAKOUTS FOUND: {len(df_lat)}")
   print(f"========================================")
-  print(df_live[["Symbol", "Trigger_Price", "Stop_Loss (7%)", "Take_Profit (14%)"]])
+  print(df_lat[["Symbol", "Breakout_Month", "Trigger_Price", "Stop_Loss (7%)", "Take_Profit (14%)"]])
 
   try:
     ws = (
-        sh.worksheet("LIVE_SCANNER_SIGNALS")
-        if "LIVE_SCANNER_SIGNALS" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("LIVE_SCANNER_SIGNALS", 2000, 10)
+        sh.worksheet("LATEST_BREAKOUT_SIGNALS")
+        if "LATEST_BREAKOUT_SIGNALS" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("LATEST_BREAKOUT_SIGNALS", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"LIVE BREAKOUT SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"
+        f"LATEST CLOSED MONTH BREAKOUT SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
@@ -160,9 +155,10 @@ if len(live_signals) > 0:
         "Take Profit (14%)",
         "TradingView Link"
     ])
-    ws.append_rows(df_live.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Live signals successfully saved to 'LIVE_SCANNER_SIGNALS' tab in Google Sheet!")
-  except Exception as e:
+    ws.append_rows(df_lat.values.tolist(), value_input_option="USER_ENTERED")
+    print("✅ Data successfully saved to 'LATEST_BREAKOUT_SIGNALS' tab in Google Sheet!")
+  exceptException as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Current active candle par koi naya breakout match nahi mila.")
+  print("⚠️ Pichle closed mahine me koi breakout match nahi mila.")
+  
