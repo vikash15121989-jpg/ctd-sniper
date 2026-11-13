@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER EXACT TRADE-BY-TRADE TIMEFRAME SCANNER ===")
+print("=== CTD_SNIPER FINAL OPTIMIZED STRATEGY BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,43 +29,40 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. EXACT TIMEFRAME DIAGNOSTIC ENGINE (NO AVERAGES)
+# 2. BACKTEST ENGINE WITH COMBINED EDGE FILTERS
 # -------------------------------------------------------------
-def analyze_exact_trades(
+def backtest_final_optimized(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
 ):
-  detailed_trades = []
+  trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
-    
-    # Download Monthly, Weekly, and Daily Data
-    df_m = yf.download(ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False)
-    df_w = yf.download(ticker_symbol, start="2012-01-01", interval="1wk", auto_adjust=False, progress=False)
-    df_d = yf.download(ticker_symbol, start="2012-01-01", interval="1d", auto_adjust=False, progress=False)
+    df = yf.download(
+        ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
+    )
 
-    if df_m is None or df_m.empty or len(df_m) < 30 or df_w is None or df_d is None:
-      return detailed_trades
+    if df is None or df.empty or len(df) < 30:
+      return trades
 
-    for df_frame in [df_m, df_w, df_d]:
-      if isinstance(df_frame.columns, pd.MultiIndex):
-        df_frame.columns = df_frame.columns.get_level_values(0)
-      df_frame.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
+    if isinstance(df.columns, pd.MultiIndex):
+      df.columns = df.columns.get_level_values(0)
 
-    df_m["SMA_10"] = df_m["Close"].rolling(window=10).mean()
+    df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
+    df["SMA_10"] = df["Close"].rolling(window=10).mean()
 
-    highs = df_m["High"].values
-    lows = df_m["Low"].values
-    closes = df_m["Close"].values
-    opens = df_m["Open"].values
-    volumes = df_m["Volume"].values
-    sma10 = df_m["SMA_10"].values
-    n = len(df_m)
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    opens = df["Open"].values
+    volumes = df["Volume"].values
+    sma10 = df["SMA_10"].values
+    n = len(df)
 
-    df_m["Range_Pct"] = ((df_m["High"] - df_m["Low"]) / df_m["Close"]) * 100
-    ranges = df_m["Range_Pct"].values
+    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Pct"].values
 
     in_trade = False
     pending_entry = False
@@ -76,7 +73,7 @@ def analyze_exact_trades(
     max_price_reached = 0
 
     for i in range(max(min_consolidation_months * 2 + 3, 10), n):
-      current_date = df_m.index[i]
+      current_date = df.index[i]
       curr_close = closes[i]
       curr_high = highs[i]
       curr_low = lows[i]
@@ -95,37 +92,16 @@ def analyze_exact_trades(
               if is_win
               else (stop_loss - entry_price) / entry_price * 100
           )
+          max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
-            month_start = pd.Timestamp(entry_date).replace(day=1)
-            next_month = month_start + pd.DateOffset(months=1)
-            
-            # Weekly exact metrics for this breakout month
-            w_candles = df_w[(df_w.index >= month_start) & (df_w.index < next_month)]
-            w_vol_ratio = 0.0
-            w_pos_ratio = 0.0
-            if len(w_candles) > 0:
-              prior_w_vol = df_w.loc[df_w.index < month_start, "Volume"].tail(4).mean()
-              w_vol_ratio = round(float(w_candles["Volume"].iloc[0] / (prior_w_vol + 1)), 2)
-              w_pos_ratio = round(float(sum(w_candles["Close"] > w_candles["Open"]) / len(w_candles)), 2)
-
-            # Daily exact metrics during the breakout month (first 10 trading days or breakout window)
-            d_candles = df_d[(df_d.index >= month_start) & (df_d.index < next_month)]
-            d_upper_wicks_avg = 0.0
-            if len(d_candles) > 0:
-              # Upper wick as % of daily range
-              upper_wicks = (d_candles["High"] - pd.concat([d_candles["Close"], d_candles["Open"]], axis=1).max(axis=1)) / (d_candles["High"] - d_candles["Low"] + 0.0001)
-              d_upper_wicks_avg = round(float(upper_wicks.mean()), 2)
-
-            detailed_trades.append({
+            trades.append({
                 "Symbol": symbol,
                 "Entry_Date": entry_date.strftime("%b %Y"),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "Monthly_Close_Loc": round(float((curr_close - curr_low) / (curr_high - curr_low + 0.0001)), 2),
-                "Weekly_First_Vol_Ratio": w_vol_ratio,
-                "Weekly_Positive_Candle_Ratio": w_pos_ratio,
-                "Daily_Upper_Wick_Pressure": d_upper_wicks_avg,
-                "PnL_%": round(pnl_pct, 2)
+                "PnL_%": round(pnl_pct, 2),
             })
           in_trade = False
         continue
@@ -177,55 +153,71 @@ def analyze_exact_trades(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          pending_entry = True
+          
+          # -------------------------------------------------
+          # FINAL COMBINED EDGE FILTERS
+          # -------------------------------------------------
+          candle_span = curr_high - curr_low
+          close_loc = (curr_close - curr_low) / (candle_span + 0.0001)
+          sma_dist = ((curr_close - curr_sma10) / curr_sma10) * 100 if not np.isnan(curr_sma10) else 0
 
-    return detailed_trades
+          if close_loc >= 0.5 and sma_dist >= 15.0:
+            pending_entry = True
+
+    return trades
 
   except Exception as e:
     return []
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT EXACT TRADE LOG TO GOOGLE SHEET
+# 3. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
-all_exact_trades = []
+all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    res = analyze_exact_trades(sym)
-    if res:
-      all_exact_trades.extend(res)
+    t = backtest_final_optimized(sym)
+    if t:
+      all_trades.extend(t)
 
-if len(all_trades_count := all_exact_trades) > 0:
-  df_exact = pd.DataFrame(all_exact_trades)
-  
+if len(all_trades) > 0:
+  df_res = pd.DataFrame(all_trades)
+  total = len(df_res)
+  wins = len(df_res[df_res["Result"] == "WIN"])
+  win_rate = round((wins / total) * 100, 2)
+  total_pnl = round(df_res["PnL_%"].sum(), 2)
+
   print(f"\n========================================")
-  print(f" EXACT TRADE-BY-TRADE LOG GENERATED: {len(df_exact)} trades")
+  print(f" FINAL OPTIMIZED STRATEGY RESULTS (2025-2026)")
+  print(f"========================================")
+  print(f" Total Trades : {total}")
+  print(f" Wins         : {wins} | Losses: {total - wins}")
+  print(f" Win Rate     : {win_rate}%")
+  print(f" Total PnL    : {total_pnl}%")
   print(f"========================================")
 
   try:
     ws = (
-        sh.worksheet("EXACT_TRADE_LOG")
-        if "EXACT_TRADE_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("EXACT_TRADE_LOG", 2000, 10)
+        sh.worksheet("FINAL_OPTIMIZED_LOG")
+        if "FINAL_OPTIMIZED_LOG" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("FINAL_OPTIMIZED_LOG", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"EXACT TRADE-BY-TRADE TIMEFRAME LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"FINAL OPTIMIZED LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
         "Entry Date",
+        "Entry Price",
+        "Max Profit %",
         "Result",
-        "Monthly Close Loc",
-        "Weekly First Vol Ratio",
-        "Weekly Positive Candle Ratio",
-        "Daily Upper Wick Pressure",
-        "PnL %"
+        "PnL %",
     ])
-    ws.append_rows(df_exact.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Exact trade-by-trade data successfully saved to 'EXACT_TRADE_LOG' tab in Google Sheet!")
+    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+    print("✅ Data successfully saved to 'FINAL_OPTIMIZED_LOG' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Koi trade nahi mili.")
-      
+    print("⚠️ Koi trade nahi mili.")
+  
