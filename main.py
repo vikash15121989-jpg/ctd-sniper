@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER STRICT NEXT-MONTH ENTRY SCANNER ===")
+print("=== CTD_SNIPER PERFECT SHIFTED MAPPING SCANNER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. SCANNER WITH STRICT NEXT-MONTH MAPPING
+# 2. SCANNER WITH SHIFTED INDEX MAPPING
 # -------------------------------------------------------------
-def scan_next_month_entry(symbol, min_consolidation_months=3):
+def scan_shifted_mapping(symbol, min_consolidation_months=3):
   signal_data = None
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -55,12 +55,12 @@ def scan_next_month_entry(symbol, min_consolidation_months=3):
     df["Range_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
     ranges = df["Range_Ratio"].values
 
-    # STRICT MAPPING:
-    # n-2 index is the last fully completed closed month (e.g., October close)
-    # n-1 index is the immediate next month where trade/entry is taken (e.g., November entry)
-    i = n - 2  
-    breakout_month_date = df.index[i]     # Mahina jisme candle close hui (e.g. Oct 2026)
-    entry_month_date = df.index[i + 1]    # Agla mahina jisme entry leni hai (e.g. Nov 2026)
+    # SHIFTED INDEX MAPPING:
+    # Target n-3 so that a September close maps to October entry, 
+    # and an October close maps to November entry.
+    i = n - 3  
+    breakout_month_date = df.index[i]     # Candle close month (e.g. Sep 2026)
+    entry_month_date = df.index[i + 1]    # Entry trading month (e.g. Oct 2026)
     
     curr_close = closes[i]
     curr_range = ranges[i]
@@ -100,7 +100,7 @@ def scan_next_month_entry(symbol, min_consolidation_months=3):
     # Check if breakout month closed above active resistance
     if active_resistance is not None and curr_close > active_resistance:
       post_swing_ranges = ranges[resistance_index + 1 : i]
-      if len(post_sighting := post_swing_ranges) > 0 and curr_range <= post_sighting.max():
+      if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
         
         tv_link = f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{symbol}", "{symbol} Chart")'
         
@@ -128,9 +128,9 @@ def scan_next_month_entry(symbol, min_consolidation_months=3):
 # -------------------------------------------------------------
 all_signals = []
 if len(STOCKS) > 0:
-  print(f"🔍 Scanning {len(STOCKS)} stocks with strict next-month entry rule...")
+  print(f"🔍 Scanning {len(STOCKS)} stocks with shifted mapping rule...")
   for sym in STOCKS:
-    res = scan_next_month_entry(sym)
+    res = scan_shifted_mapping(sym)
     if res:
       all_signals.append(res)
 
@@ -138,7 +138,6 @@ print(f"\nTotal valid signals found: {len(all_signals)}")
 
 if len(all_signals) > 0:
   df_res = pd.DataFrame(all_signals)
-  # Target tab name based strictly on the Entry Trading Month
   target_tab = df_res['Entry_Trading_Month'].iloc[0].replace(" ", "_").upper() + "_SIGNALS"
   
   try:
@@ -149,7 +148,7 @@ if len(all_signals) > 0:
     )
     ws.clear()
     ws.append_row([
-        f"STRICT NEXT-MONTH ENTRY SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"SHIFTED MAPPING SIGNALS | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
