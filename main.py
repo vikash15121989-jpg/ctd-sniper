@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER DUAL BACKTEST ENGINE (RECENT VS MAJOR) ===")
+print("=== CTD_SNIPER LIVE MAJOR SWING SCANNER (413-TRADE LOGIC) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,207 +29,146 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. CORE BACKTEST FUNCTION (SUPPORTS SWING TYPE)
+# 2. LIVE SCANNER FUNCTION (MAJOR SWING 413-TRADE ENGINE)
 # -------------------------------------------------------------
-def run_backtest_engine(
-    symbol,
-    swing_type="RECENT",
-    min_consolidation_months=3,
-    stop_loss_pct=0.07,
-    take_profit_pct=0.14,
-):
-  trades = []
+def scan_live_major_swing(symbol, min_consolidation_months=3):
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+    # Fetch monthly data from 2012 onwards
     df = yf.download(
         ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
 
     if df is None or df.empty or len(df) < 30:
-      return trades
+      return None
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     highs = df["High"].values
-    lows = df["Low"].values
     closes = df["Close"].values
-    opens = df["Open"].values
+    dates = df.index
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
     ranges = df["Range_Pct"].values
 
-    in_trade = False
-    pending_entry = False
-    entry_price = 0
-    stop_loss = 0
-    take_profit = 0
-    entry_date = None
-    resistance_level = 0
-    max_price_reached = 0
+    # We check the latest closed candle (penultimate index or last completed month)
+    # i = n - 2 represents the last fully closed monthly candle that triggered the breakout into current month
+    i = n - 2
+    if i < min_consolidation_months * 2 + 3:
+      return None
 
-    start_idx = max(min_consolidation_months * 2 + 3, 10)
+    signal_date = dates[i]
+    curr_close = closes[i]
+    curr_range = ranges[i]
 
-    for i in range(start_idx, n):
-      current_date = df.index[i]
-      curr_close = closes[i]
-      curr_high = highs[i]
-      curr_low = lows[i]
-      curr_open = opens[i]
-      curr_range = ranges[i]
+    # MAJOR SWING DETECTION LOGIC
+    active_resistance = None
+    resistance_index = -1
 
-      if in_trade:
-        if curr_high > max_price_reached:
-          max_price_reached = curr_high
+    search_range = range(
+        i - min_consolidation_months, min_consolidation_months - 1, -1
+    )
 
-        if curr_low <= stop_loss or curr_high >= take_profit:
-          is_win = curr_high >= take_profit
-          pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
-              if is_win
-              else (stop_loss - entry_price) / entry_price * 100
-          )
-          max_profit_pct = (
-              (max_price_reached - entry_price) / entry_price
-          ) * 100
-
-          if entry_date.year in [2025, 2026] or current_date.year in [
-              2025,
-              2026,
-          ]:
-            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
-
-            trades.append({
-                "Symbol": symbol,
-                "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Resistance": round(resistance_level, 2),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
-                "Result": "WIN" if is_win else "LOSS",
-                "PnL_%": round(pnl_pct, 2),
-                "TradingView_Chart": sheet_link_formula,
-            })
-          in_trade = False
+    for j in search_range:
+      is_valid_swing = True
+      for k in range(j - min_consolidation_months, j):
+        if highs[j] <= highs[k]:
+          is_valid_swing = False
+          break
+      if not is_valid_swing:
         continue
 
-      if pending_entry:
-        entry_price = curr_open
-        stop_loss = entry_price * (1 - stop_loss_pct)
-        take_profit = entry_price * (1 + take_profit_pct)
-        entry_date = current_date
-        max_price_reached = curr_high
-        in_trade = True
-        pending_entry = False
+      for k in range(j + 1, j + min_consolidation_months + 1):
+        if highs[j] <= highs[k]:
+          is_valid_swing = False
+          break
+      if not is_valid_swing:
         continue
 
-      # Swing Detection Logic based on Type
-      active_resistance = None
-      resistance_index = -1
+      ever_broken = False
+      for k in range(j + 1, i):
+        if highs[k] > highs[j]:
+          ever_broken = True
+          break
+      if ever_broken:
+        continue
 
-      if swing_type == "RECENT":
-        search_range = range(i - 1, min_consolidation_months - 1, -1)
-      else:  # MAJOR
-        search_range = range(
-            i - min_consolidation_months, min_consolidation_months - 1, -1
-        )
+      active_resistance = highs[j]
+      resistance_index = j
+      break
 
-      for j in search_range:
-        is_valid_swing = True
-        for k in range(j - min_consolidation_months, j):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
-            break
-        if not is_valid_swing:
-          continue
+    # Check if breakout occurred on this latest closed candle
+    if active_resistance is not None and curr_close > active_resistance:
+      post_swing_ranges = ranges[resistance_index + 1 : i]
+      if len(post_swing_ranges) > 0:
+        if curr_range <= post_swing_ranges.max():
+          # Breakout confirmed! Calculate live levels
+          entry_price = closes[i]  # Breakout close / Live reference price
+          stop_loss = round(entry_price * 0.93, 2)  # -7% SL
+          take_profit = round(entry_price * 1.14, 2)  # +14% TP
 
-        for k in range(j + 1, j + min_consolidation_months + 1):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
-            break
-        if not is_valid_swing:
-          continue
+          tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+          sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
 
-        ever_broken = False
-        for k in range(j + 1, i):
-          if highs[k] > highs[j]:
-            ever_broken = True
-            break
-        if ever_broken:
-          continue
-
-        active_resistance = highs[j]
-        resistance_index = j
-        break
-
-      if active_resistance is not None and curr_close > active_resistance:
-        post_swing_ranges = ranges[resistance_index + 1 : i]
-        if len(post_swing_ranges) > 0:
-          if curr_range <= post_swing_ranges.max():
-            resistance_level = active_resistance
-            pending_entry = True
-
-    return trades
+          return {
+              "Symbol": symbol,
+              "Signal_Month": signal_date.strftime("%b %Y"),
+              "Resistance": round(active_resistance, 2),
+              "Trigger_Price": round(entry_price, 2),
+              "Stop_Loss (-7%)": stop_loss,
+              "Take_Profit (+14%)": take_profit,
+              "TradingView_Chart": sheet_link_formula,
+          }
 
   except Exception as e:
-    return []
+    pass
+
+  return None
 
 
 # -------------------------------------------------------------
-# 3. RUN BOTH ENGINES & EXPORT TO GOOGLE SHEETS
+# 3. EXECUTE & EXPORT LIVE SIGNALS TO GOOGLE SHEETS
 # -------------------------------------------------------------
+live_signals = []
 if len(STOCKS) > 0:
-  for s_type in ["RECENT", "MAJOR"]:
-    print(f"\n🚀 Running {s_type} Swing Backtest...")
-    all_trades = []
+  print("🔍 Scanning live market for Major Swing breakouts...")
+  for sym in STOCKS:
+    signal = scan_live_major_swing(sym)
+    if signal:
+      live_signals.append(signal)
 
-    for sym in STOCKS:
-      t = run_backtest_engine(sym, swing_type=s_type)
-      if t:
-        all_trades.extend(t)
+if len(live_signals) > 0:
+  df_live = pd.DataFrame(live_signals)
+  print(f"🚀 Found {len(live_signals)} active live breakout signals!")
 
-    if len(all_trades) > 0:
-      df_res = pd.DataFrame(all_trades)
-      wins = len(df_res[df_res["Result"] == "WIN"])
-      total = len(df_res)
-      win_rate = round((wins / total) * 100, 2)
-      total_pnl = round(df_res["PnL_%"].sum(), 2)
-
-      print(f"📊 {s_type} Results -> Trades: {total} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%")
-
-      tab_name = f"BT_{s_type}_LOG"
-      try:
-        ws = (
-            sh.worksheet(tab_name)
-            if tab_name in [x.title for x in sh.worksheets()]
-            else sh.add_worksheet(tab_name, 2000, 10)
-        )
-        ws.clear()
-        ws.append_row([
-            f"{s_type} SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
-        ])
-        ws.append_row([
-            f"Total Trades: {total} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
-        ])
-        ws.append_row([])
-        ws.append_row([
-            "Symbol",
-            "Breakout Month",
-            "Resistance",
-            "Entry Price",
-            "Max Profit %",
-            "Result",
-            "PnL %",
-            "TradingView Link",
-        ])
-        ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-        print(f"✅ Saved to '{tab_name}' tab successfully!")
-      except Exception as e:
-        print(f"Sheet update error for {s_type}: {e}")
-    else:
-      print(f"⚠️ No trades found for {s_type} swing.")
+  tab_name = "LIVE_MAJOR_SIGNALS"
+  try:
+    ws = (
+        sh.worksheet(tab_name)
+        if tab_name in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet(tab_name, 2000, 10)
+    )
+    ws.clear()
+    ws.append_row([
+        "LIVE MAJOR SWING BREAKOUT SIGNALS | Generated on"
+        f" {datetime.now(IST).strftime('%d-%b-%Y %H:%M')}"
+    ])
+    ws.append_row([
+        "Symbol",
+        "Signal Month",
+        "Resistance",
+        "Trigger Price",
+        "Stop Loss (-7%)",
+        "Take Profit (+14%)",
+        "TradingView Link",
+    ])
+    ws.append_rows(df_live.values.tolist(), value_input_option="USER_ENTERED")
+    print(f"✅ Successfully updated '{tab_name}' tab in Google Sheet!")
+  except Exception as e:
+    print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Watchlist is empty.")
+    print("⚠️ Is samay koi naya live breakout signal nahi mila.")
   
