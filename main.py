@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER FINAL OPTIMIZED STRATEGY BACKTEST ===")
+print("=== CTD_SNIPER PURE MONTHLY BREAKOUT CORE SYSTEM ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH COMBINED EDGE FILTERS
+# 2. PURE MONTHLY BREAKOUT BACKTEST ENGINE (NO FILTERS)
 # -------------------------------------------------------------
-def backtest_final_optimized(
+def backtest_pure_breakout(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
@@ -51,14 +51,11 @@ def backtest_final_optimized(
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-    df["SMA_10"] = df["Close"].rolling(window=10).mean()
 
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
     opens = df["Open"].values
-    volumes = df["Volume"].values
-    sma10 = df["SMA_10"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -79,7 +76,6 @@ def backtest_final_optimized(
       curr_low = lows[i]
       curr_open = opens[i]
       curr_range = ranges[i]
-      curr_sma10 = sma10[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -153,16 +149,8 @@ def backtest_final_optimized(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # -------------------------------------------------
-          # FINAL COMBINED EDGE FILTERS
-          # -------------------------------------------------
-          candle_span = curr_high - curr_low
-          close_loc = (curr_close - curr_low) / (candle_span + 0.0001)
-          sma_dist = ((curr_close - curr_sma10) / curr_sma10) * 100 if not np.isnan(curr_sma10) else 0
-
-          if close_loc >= 0.5 and sma_dist >= 15.0:
-            pending_entry = True
+          # Pure breakout trigger without any secondary filter restrictions
+          pending_entry = True
 
     return trades
 
@@ -176,7 +164,7 @@ def backtest_final_optimized(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_final_optimized(sym)
+    t = backtest_pure_breakout(sym)
     if t:
       all_trades.extend(t)
 
@@ -188,7 +176,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n========================================")
-  print(f" FINAL OPTIMIZED STRATEGY RESULTS (2025-2026)")
+  print(f" PURE BREAKOUT SYSTEM RESULTS (2025-2026)")
   print(f"========================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -198,13 +186,13 @@ if len(all_trades) > 0:
 
   try:
     ws = (
-        sh.worksheet("FINAL_OPTIMIZED_LOG")
-        if "FINAL_OPTIMIZED_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("FINAL_OPTIMIZED_LOG", 2000, 10)
+        sh.worksheet("PURE_BREAKOUT_LOG")
+        if "PURE_BREAKOUT_LOG" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("PURE_BREAKOUT_LOG", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"FINAL OPTIMIZED LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+        f"PURE BREAKOUT LOG (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
@@ -215,9 +203,9 @@ if len(all_trades) > 0:
         "PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Data successfully saved to 'FINAL_OPTIMIZED_LOG' tab in Google Sheet!")
+    print("✅ Data successfully saved to 'PURE_BREAKOUT_LOG' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-    print("⚠️ Koi trade nahi mili.")
+  print("⚠️ Koi trade nahi mili.")
   
