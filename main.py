@@ -8,11 +8,9 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MAJOR SWING 2025-2026 BACKTEST ===")
+print("=== CTD_SNIPER DUAL BACKTESTING ENGINE (2025-2026) ===")
 
-# -------------------------------------------------------------
-# 1. LOAD WATCHLIST FROM GOOGLE SHEETS
-# -------------------------------------------------------------
+# 1. LOAD WATCHLIST
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
@@ -22,101 +20,112 @@ try:
       for s in raw
       if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
   ]
-  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist for Backtesting.")
+  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = ["RELIANCE", "TCS", "INFY", "SBIN", "TATAMOTORS"]
 
 
-# -------------------------------------------------------------
-# 2. BACKTEST FUNCTION WITH MAJOR SWING HIGH LOGIC (2025-2026)
-# -------------------------------------------------------------
-def backtest_major_swing(symbol, min_consolidation_months=3):
-  trades = []
-  try:
-    ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
-    df = yf.download(
-        ticker_symbol,
-        start="2025-01-01",
-        interval="1mo",
-        auto_adjust=False,
-        progress=False,
-    )
+def run_backtest_for_logic(logic_type="RECENT"):
+  all_trades = []
+  min_consolidation_months = 3
 
-    if df is None or df.empty or len(df) < 15:
-      return trades
+  for symbol in STOCKS:
+    try:
+      ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+      df = yf.download(
+          ticker_symbol,
+          start="2022-01-01",
+          interval="1mo",
+          auto_adjust=False,
+          progress=False,
+      )
+      if df is None or df.empty or len(df) < 20:
+        continue
+      if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+      df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
 
-    if isinstance(df.columns, pd.MultiIndex):
-      df.columns = df.columns.get_level_values(0)
+      highs = df["High"].values
+      lows = df["Low"].values
+      closes = df["Close"].values
+      dates = df.index
+      n = len(df)
 
-    df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
+      start_idx = min_consolidation_months * 2 + 2
+      end_idx = n - 1
 
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
-    dates = df.index
-    n = len(df)
-
-    df["Range_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
-    ranges = df["Range_Ratio"].values
-
-    start_idx = min_consolidation_months + 2
-    end_idx = n - 1
-
-    if start_idx >= end_idx:
-      return trades
-
-    for i in range(start_idx, end_idx):
-      curr_close = closes[i]
-      prev_close = closes[i - 1]
-      curr_range = ranges[i]
-
-      # MAJOR SWING HIGH LOGIC
-      active_resistance = None
-      resistance_index = -1
-
-      for j in range(
-          i - min_consolidation_months, min_consolidation_months - 1, -1
-      ):
-        is_valid_swing = True
-        for k in range(j - min_consolidation_months, j):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
-            break
-        if not is_valid_swing:
+      for i in range(start_idx, end_idx):
+        signal_date = dates[i]
+        if signal_date.year < 2025:
           continue
 
-        for k in range(j + 1, j + min_consolidation_months + 1):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
+        curr_close = closes[i]
+        prev_close = closes[i - 1]
+        active_resistance = None
+
+        if logic_type == "RECENT":
+          # IMMEDIATE / RECENT SWING HIGH (Scans backwards from i-1)
+          for j in range(i - 1, min_consolidation_months - 1, -1):
+            is_valid = True
+            for k in range(j - min_consolidation_months, j):
+              if highs[j] <= highs[k]:
+                is_valid = False
+                break
+            if not is_valid:
+              continue
+            for k in range(j + 1, j + min_consolidation_months + 1):
+              if highs[j] <= highs[k]:
+                is_valid = False
+                break
+            if not is_valid:
+              continue
+            ever_broken = False
+            for k in range(j + 1, i):
+              if highs[k] > highs[j]:
+                ever_broken = True
+                break
+            if ever_broken:
+              continue
+            active_resistance = highs[j]
             break
-        if not is_valid_swing:
-          continue
 
-        ever_broken = False
-        for k in range(j + 1, i):
-          if highs[k] > highs[j]:
-            ever_broken = True
+        else:
+          # MAJOR SWING HIGH (Scans within window)
+          for j in range(
+              i - min_consolidation_months, min_consolidation_months - 1, -1
+          ):
+            is_valid = True
+            for k in range(j - min_consolidation_months, j):
+              if highs[j] <= highs[k]:
+                is_valid = False
+                break
+            if not is_valid:
+              continue
+            for k in range(j + 1, j + min_consolidation_months + 1):
+              if highs[j] <= highs[k]:
+                is_valid = False
+                break
+            if not is_valid:
+              continue
+            ever_broken = False
+            for k in range(j + 1, i):
+              if highs[k] > highs[j]:
+                ever_broken = True
+                break
+            if ever_broken:
+              continue
+            active_resistance = highs[j]
             break
-        if ever_broken:
-          continue
 
-        active_resistance = highs[j]
-        resistance_index = j
-        break
-
-      # FRESH BREAKOUT CHECK
-      if (
-          active_resistance is not None
-          and curr_close > active_resistance
-          and prev_close <= active_resistance
-      ):
-        post_swing_ranges = ranges[resistance_index + 1 : i]
-        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
+        if (
+            active_resistance is not None
+            and curr_close > active_resistance
+            and prev_close <= active_resistance
+        ):
           entry_price = curr_close
-          stop_loss = entry_price * 0.93  # -7%
-          take_profit = entry_price * 1.14  # +14%
-          signal_date = dates[i]
+          stop_loss = entry_price * 0.93
+          take_profit = entry_price * 1.14
           entry_month_date = dates[i + 1]
 
           trade_result = "OPEN"
@@ -126,16 +135,10 @@ def backtest_major_swing(symbol, min_consolidation_months=3):
           for m in range(i + 1, n):
             m_high = highs[m]
             m_low = lows[m]
-
             hit_tp = m_high >= take_profit
             hit_sl = m_low <= stop_loss
 
-            if hit_tp and hit_sl:
-              trade_result = "LOSS"
-              pnl_percent = -7.0
-              exit_date = dates[m]
-              break
-            elif hit_sl:
+            if hit_tp and hit_sl or hit_sl:
               trade_result = "LOSS"
               pnl_percent = -7.0
               exit_date = dates[m]
@@ -147,7 +150,7 @@ def backtest_major_swing(symbol, min_consolidation_months=3):
               break
 
           if trade_result != "OPEN":
-            trades.append({
+            all_trades.append({
                 "Symbol": symbol,
                 "Signal_Month": signal_date.strftime("%b %Y"),
                 "Entry_Month": entry_month_date.strftime("%b %Y"),
@@ -159,78 +162,41 @@ def backtest_major_swing(symbol, min_consolidation_months=3):
                     exit_date.strftime("%b %Y") if exit_date else "Ongoing"
                 ),
             })
+    except Exception:
+      continue
 
-  except Exception as e:
-    pass
-
-  return trades
+  return all_trades
 
 
-# -------------------------------------------------------------
-# 3. RUN BACKTEST ACROSS WATCHLIST
-# -------------------------------------------------------------
-all_backtest_results = []
-print("🚀 Running 2025-2026 backtest with Major Swing logic...")
+# Run both logics and export separately
+for logic in ["RECENT", "MAJOR"]:
+  print(f"\n🚀 Running {logic} Swing Backtest...")
+  trades = run_backtest_for_logic(logic)
 
-for sym in STOCKS:
-  stock_trades = backtest_major_swing(sym)
-  if stock_trades:
-    all_backtest_results.extend(stock_trades)
+  if len(trades) > 0:
+    df_bt = pd.DataFrame(trades)
+    total_trades = len(df_bt)
+    wins = len(df_bt[df_bt["Result"] == "WIN"])
+    losses = len(df_bt[df_bt["Result"] == "LOSS"])
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    total_return = df_bt["Return_%"].sum()
 
-# -------------------------------------------------------------
-# 4. AGGREGATE METRICS & EXPORT TO GOOGLE SHEETS
-# -------------------------------------------------------------
-if len(all_backtest_results) > 0:
-  df_bt = pd.DataFrame(all_backtest_results)
+    print(f"📊 {logic} RESULTS -> Trades: {total_trades} | Win Rate: {win_rate:.2f}% | Return: {total_return:.2f}%")
 
-  total_trades = len(df_bt)
-  wins = len(df_bt[df_bt["Result"] == "WIN"])
-  losses = len(df_bt[df_bt["Result"] == "LOSS"])
-  win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-  total_return = df_bt["Return_%"].sum()
-
-  print("\n========================================")
-  print("📊 MAJOR SWING 2025-2026 BACKTEST SUMMARY")
-  print("========================================")
-  print(f"Total Trades Simulated : {total_trades}")
-  print(f"Winning Trades (+14%)  : {wins}")
-  print(f"Losing Trades (-7%)    : {losses}")
-  print(f"Strategy Win Rate      : {win_rate:.2f}%")
-  print(f"Cumulative Return      : {total_return:.2f}%")
-  print("========================================\n")
-
-  try:
-    bt_tab_name = "BACKTEST_MAJOR_2025_2026"
-    ws_bt = (
-        sh.worksheet(bt_tab_name)
-        if bt_tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(bt_tab_name, 2000, 10)
-    )
-    ws_bt.clear()
-    ws_bt.append_row([
-        f"MAJOR SWING 2025-2026 BACKTEST REPORT | Generated on {datetime.now(IST).strftime('%d-%b-%Y')}"
-    ])
-    ws_bt.append_row([
-        f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}% | Total Return: {total_return:.2f}%"
-    ])
-    ws_bt.append_row([])
-    ws_bt.append_row([
-        "Symbol",
-        "Signal Month",
-        "Entry Month",
-        "Trigger Price",
-        "Resistance",
-        "Result",
-        "Return %",
-        "Exit Month",
-    ])
-    ws_bt.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
-    print(
-        f"✅ Major swing backtest log saved to '{bt_tab_name}' tab in Google"
-        " Sheet!"
-    )
-  except Exception as e:
-    print(f"Sheet update error: {e}")
-else:
-  print("⚠️ 2025-2026 ke period mein major swing logic par koi trades nahi mile.")
-  
+    tab_name = f"BT_{logic}_2025_2026"
+    try:
+      ws = (
+          sh.worksheet(tab_name)
+          if tab_name in [x.title for x in sh.worksheets()]
+          else sh.add_worksheet(tab_name, 2000, 10)
+      )
+      ws.clear()
+      ws.append_row([f"{logic} SWING BACKTEST REPORT (2025-2026) | Generated: {datetime.now(IST).strftime('%d-%b-%Y')}"])
+      ws.append_row([f"Total Trades: {total_trades} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}% | Return: {total_return:.2f}%"])
+      ws.append_row([])
+      ws.append_row(["Symbol", "Signal Month", "Entry Month", "Trigger Price", "Resistance", "Result", "Return %", "Exit Month"])
+      ws.append_rows(df_bt.values.tolist(), value_input_option="USER_ENTERED")
+      print(f"✅ Saved to tab '{tab_name}'")
+    except Exception as e:
+      print(f"Sheet error: {e}")
+      
