@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER 3-MONTH DOWNTREND + PRICE ACTION BACKTEST ===")
+print("=== CTD_SNIPER 3M DOWNTREND WINNERS VS LOSERS PATTERN ANALYZER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,12 +29,12 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. 3-MONTH DOWNTREND + BREAKOUT STRATEGY FUNCTION
+# 2. PATTERN ANALYSIS ENGINE FOR 3M DOWNTREND TRADES
 # -------------------------------------------------------------
-def backtest_3m_downtrend_strategy(
+def analyze_3m_downtrend_patterns(
     symbol, stop_loss_pct=0.07, take_profit_pct=0.14
 ):
-  trades = []
+  trade_features = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
@@ -46,16 +46,20 @@ def backtest_3m_downtrend_strategy(
     )
 
     if df is None or df.empty or len(df) < 12:
-      return trades
+      return trade_features
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if "Volume" not in df.columns:
+      df["Volume"] = 100000
 
     highs = df["High"].values
     lows = df["Low"].values
+    closes = df["Close"].values
     opens = df["Open"].values
+    volumes = df["Volume"].values
     dates = df.index
     n = len(df)
 
@@ -68,50 +72,42 @@ def backtest_3m_downtrend_strategy(
     trigger_high = 0
     max_price_reached = 0
 
-    # Start from index 3 to safely check 3 preceding months (i-3, i-2, i-1) and current month (i)
+    # Storing breakout candle metrics for the active trade
+    breakout_vol = 0
+    breakout_body_pct = 0
+    breakout_upper_wick_pct = 0
+    breakout_range_pct = 0
+
     for i in range(3, n):
       current_date = dates[i]
       curr_high = highs[i]
       curr_low = lows[i]
       curr_open = opens[i]
+      curr_close = closes[i]
+      curr_vol = volumes[i]
 
-      # Managing active trade
       if in_trade:
         if curr_high > max_price_reached:
           max_price_reached = curr_high
 
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
-          pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
-              if is_win
-              else (stop_loss - entry_price) / entry_price * 100
-          )
-          max_profit_pct = (
-              (max_price_reached - entry_price) / entry_price
-          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
               2026,
           ]:
-            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
-
-            trades.append({
+            trade_features.append({
                 "Symbol": symbol,
-                "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Trigger_High": round(trigger_high, 2),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "PnL_%": round(pnl_pct, 2),
-                "TradingView_Chart": sheet_link_formula,
+                "Volume_Ratio": round(breakout_vol, 2),
+                "Body_Pct": round(breakout_body_pct, 2),
+                "Upper_Wick_Pct": round(breakout_upper_wick_pct, 2),
+                "Range_Pct": round(breakout_range_pct, 2),
             })
           in_trade = False
         continue
 
-      # Executing pending entry at current month's open
       if pending_entry:
         entry_price = curr_open
         stop_loss = entry_price * (1 - stop_loss_pct)
@@ -122,8 +118,7 @@ def backtest_3m_downtrend_strategy(
         pending_entry = False
         continue
 
-      # --- AAPKA EXACT LOGIC ---
-      # 1. Check for at least 3 months of lower lows and lower highs (i-3, i-2, i-1)
+      # --- 3M DOWNTREND RULE ---
       is_3m_lower_highs = (
           (highs[i - 3] > highs[i - 2])
           and (highs[i - 2] > highs[i - 1])
@@ -134,48 +129,94 @@ def backtest_3m_downtrend_strategy(
       )
 
       if is_3m_lower_highs and is_3m_lower_lows:
-        # 2. Current month does not break previous month's low, but breaks previous month's high
         prev_high = highs[i - 1]
         prev_low = lows[i - 1]
 
         if curr_low >= prev_low and curr_high > prev_high:
           trigger_high = prev_high
+
+          # Calculate Breakout Candle Metrics for Pattern Analysis
+          avg_vol_3m = np.mean(volumes[i - 3 : i])
+          breakout_vol = (curr_vol / avg_vol_3m) if avg_vol_3m > 0 else 1.0
+
+          candle_range = curr_high - curr_low
+          body_size = abs(curr_close - curr_open)
+          breakout_body_pct = (
+              (body_size / candle_range) * 100 if candle_range > 0 else 0
+          )
+
+          upper_wick = curr_high - max(curr_open, curr_close)
+          breakout_upper_wick_pct = (
+              (upper_wick / candle_range) * 100 if candle_range > 0 else 0
+          )
+
+          breakout_range_pct = (
+              (candle_range / curr_close) * 100 if curr_close > 0 else 0
+          )
+
           pending_entry = True
 
-    return trades
+    return trade_features
 
   except Exception as e:
     return []
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEETS
+# 3. RUN, COMPARE & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
-all_trades = []
+all_features = []
 if len(STOCKS) > 0:
-  print("🚀 Running 3-Month Downtrend Strategy Backtest...")
+  print("🚀 Analyzing Winners vs Losers Patterns for 3M Downtrend...")
   for sym in STOCKS:
-    t = backtest_3m_downtrend_strategy(sym)
-    if t:
-      all_trades.extend(t)
+    res = analyze_3m_downtrend_patterns(sym)
+    if res:
+      all_features.extend(res)
 
-  if len(all_trades) > 0:
-    df_res = pd.DataFrame(all_trades)
-    wins = len(df_res[df_res["Result"] == "WIN"])
-    total = len(df_res)
-    win_rate = round((wins / total) * 100, 2) if total > 0 else 0
-    total_pnl = round(df_res["PnL_%"].sum(), 2)
+  if len(all_features) > 0:
+    df_all = pd.DataFrame(all_features)
+    wins_df = df_all[df_all["Result"] == "WIN"]
+    losses_df = df_all[df_all["Result"] == "LOSS"]
+
+    total_trades = len(df_all)
+    total_wins = len(wins_df)
+    total_losses = len(losses_df)
+    win_rate = round((total_wins / total_trades) * 100, 2)
+
+    # Averages comparison
+    win_vol = round(wins_df["Volume_Ratio"].mean(), 2)
+    loss_vol = round(losses_df["Volume_Ratio"].mean(), 2)
+
+    win_body = round(wins_df["Body_Pct"].mean(), 2)
+    loss_body = round(losses_df["Body_Pct"].mean(), 2)
+
+    win_wick = round(wins_df["Upper_Wick_Pct"].mean(), 2)
+    loss_wick = round(losses_df["Upper_Wick_Pct"].mean(), 2)
+
+    win_range = round(wins_df["Range_Pct"].mean(), 2)
+    loss_range = round(losses_df["Range_Pct"].mean(), 2)
 
     print(f"\n========================================")
-    print(f" 3M DOWNTREND STRATEGY RESULTS (2025-2026)")
+    print(f" WINNERS VS LOSERS PATTERN COMPARISON")
     print(f"========================================")
-    print(f" Total Trades : {total}")
-    print(f" Wins         : {wins} | Losses: {total - wins}")
-    print(f" Win Rate     : {win_rate}%")
-    print(f" Total PnL    : {total_pnl}%")
+    print(f" Total Trades Analyzed : {total_trades}")
+    print(f" Wins : {total_wins} | Losses : {total_losses}")
+    print(f" Baseline Win Rate     : {win_rate}%")
+    print(f"----------------------------------------")
+    print(f" 🟢 WINNERS AVERAGE PATTERN:")
+    print(f"    - Volume Ratio   : {win_vol}x")
+    print(f"    - Candle Body %  : {win_body}%")
+    print(f"    - Upper Wick %   : {win_wick}%")
+    print(f"    - Candle Range % : {win_range}%")
+    print(f"----------------------------------------")
+    print(f" 🔴 LOSERS AVERAGE PATTERN:")
+    print(f"    - Volume Ratio   : {loss_vol}x")
+    print(f"    - Candle Body %  : {loss_body}%")
+    print(f"    - Upper Wick %   : {loss_wick}%")
+    print(f"    - Candle Range % : {loss_range}%")
     print(f"========================================")
 
-    tab_name = "BT_3M_DOWNTREND_LOG"
+    tab_name = "BT_3M_PATTERN_ANALYSIS"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -184,28 +225,57 @@ if len(STOCKS) > 0:
       )
       ws.clear()
       ws.append_row([
-          f"3M DOWNTREND SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+          f"3M DOWNTREND PATTERN ANALYSIS | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
-          f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
+          f"Total Trades: {total_trades} | Wins: {total_wins} | Losses: {total_losses} | Win Rate: {win_rate}%"
+      ])
+      ws.append_row([])
+      ws.append_row([
+          "Metric",
+          "Winners Average",
+          "Losers Average",
+          "What to Filter Out / Keep",
+      ])
+      ws.append_row([
+          "Volume Ratio",
+          win_vol,
+          loss_vol,
+          "Keep higher volume ratio",
+      ])
+      ws.append_row([
+          "Candle Body %",
+          win_body,
+          loss_body,
+          "Keep strong body candles",
+      ])
+      ws.append_row([
+          "Upper Wick %",
+          win_wick,
+          loss_wick,
+          "Filter out high upper wick rejection",
+      ])
+      ws.append_row([
+          "Candle Range %",
+          win_range,
+          loss_range,
+          "Monitor range size",
       ])
       ws.append_row([])
       ws.append_row([
           "Symbol",
-          "Breakout Month",
-          "Trigger High",
-          "Entry Price",
-          "Max Profit %",
           "Result",
-          "PnL %",
-          "TradingView Link",
+          "Volume Ratio",
+          "Body %",
+          "Upper Wick %",
+          "Range %",
       ])
-      ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-      print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
+      ws.append_rows(df_all.values.tolist(), value_input_option="USER_ENTERED")
+      print(f"✅ Saved Pattern Analysis to '{tab_name}' tab successfully!")
     except Exception as e:
       print(f"Sheet update error: {e}")
   else:
-    print("⚠️ Is criteria par koi trade nahi mili.")
+    print("⚠️ Koi trade data nahi mila.")
 else:
   print("⚠️ Watchlist is empty.")
   
