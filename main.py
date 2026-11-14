@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER STRICT STRUCTURAL SWING BACKTEST (HH-HL & LH-LL) ===")
+print("=== CTD_SNIPER HIGHER CLOSE / BREAKOUT BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH STRICT STRUCTURAL SWING RULES
+# 2. BACKTEST ENGINE FOR BREAKOUT STRATEGY
 # -------------------------------------------------------------
-def backtest_strict_structural(
+def backtest_breakout_strategy(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
@@ -43,7 +43,7 @@ def backtest_strict_structural(
         ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
 
-    if df is None or df.empty or len(df) < 40:
+    if df is None or df.empty or len(df) < 20:
       return trades
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -54,11 +54,7 @@ def backtest_strict_structural(
     lows = df["Low"].values
     closes = df["Close"].values
     opens = df["Open"].values
-    dates = df.index
     n = len(df)
-
-    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
-    ranges = df["Range_Pct"].values
 
     in_trade = False
     pending_entry = False
@@ -66,10 +62,10 @@ def backtest_strict_structural(
     stop_loss = 0
     take_profit = 0
     entry_date = None
-    resistance_level = 0
+    trigger_ref = 0
     max_price_reached = 0
 
-    start_idx = 10
+    start_idx = 5  # Need buffer for previous candles check
 
     for i in range(start_idx, n):
       current_date = df.index[i]
@@ -77,7 +73,6 @@ def backtest_strict_structural(
       curr_high = highs[i]
       curr_low = lows[i]
       curr_open = opens[i]
-      curr_range = ranges[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -104,7 +99,7 @@ def backtest_strict_structural(
             trades.append({
                 "Symbol": symbol,
                 "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Resistance": round(resistance_level, 2),
+                "Trigger_High": round(trigger_ref, 2),
                 "Entry_Price": round(entry_price, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
@@ -124,54 +119,22 @@ def backtest_strict_structural(
         pending_entry = False
         continue
 
-      # STRICT STRUCTURAL SWING DETECTION
-      active_resistance = None
-      resistance_index = -1
+      # LOGIC CHECK:
+      # 1. Previous month(s) were making lower lows and lower highs (downtrend / contraction context)
+      # 2. Current month: Low did NOT break previous month's low (lows[i] > lows[i-1])
+      # 3. Current month: Close broke above previous month's high (closes[i] > highs[i-1])
+      prev_high = highs[i - 1]
+      prev_low = lows[i - 1]
 
-      for j in range(i - 3, 2, -1):
-        # Left 3 candles Higher High / Higher Low sequence check
-        left_hh_hl = (
-            highs[j - 3] < highs[j - 2]
-            and highs[j - 2] < highs[j - 1]
-            and highs[j - 1] < highs[j]
-            and lows[j - 3] < lows[j - 2]
-            and lows[j - 2] < lows[j - 1]
-        )
-        if not left_hh_hl:
-          continue
+      is_downtrend_context = (highs[i - 2] < highs[i - 1]) or (
+          lows[i - 2] < lows[i - 1]
+      )  # Optional context check or strict breakdown check
 
-        # Right 3 candles Lower High / Lower Low sequence check
-        right_lh_ll = (
-            j + 3 < i
-            and highs[j] > highs[j + 1]
-            and highs[j + 1] > highs[j + 2]
-            and highs[j + 2] > highs[j + 3]
-            and lows[j] > lows[j + 1]
-            and lows[j + 1] > lows[j + 2]
-            and lows[j + 2] > lows[j + 3]
-        )
-        if not right_lh_ll:
-          continue
-
-        # Check if resistance was ever broken before index i
-        ever_broken = False
-        for k in range(j + 4, i):
-          if highs[k] > highs[j]:
-            ever_broken = True
-            break
-        if ever_broken:
-          continue
-
-        active_resistance = highs[j]
-        resistance_index = j
-        break
-
-      if active_resistance is not None and curr_close > active_resistance:
-        post_swing_ranges = ranges[resistance_index + 1 : i]
-        if len(post_swing_ranges) > 0:
-          if curr_range <= post_swing_ranges.max():
-            resistance_level = active_resistance
-            pending_entry = True
+      # Strict condition as requested:
+      # "pichle mahine ka low break nahi hua, pichle mahine ka high break karke close diya"
+      if curr_low >= prev_low and curr_close > prev_high:
+        trigger_ref = prev_high
+        pending_entry = True
 
     return trades
 
@@ -184,9 +147,9 @@ def backtest_strict_structural(
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
-  print("🚀 Running Strict Structural Swing Backtest...")
+  print("🚀 Running Breakout Reversal Backtest...")
   for sym in STOCKS:
-    t = backtest_strict_structural(sym)
+    t = backtest_breakout_strategy(sym)
     if t:
       all_trades.extend(t)
 
@@ -198,7 +161,7 @@ if len(STOCKS) > 0:
     total_pnl = round(df_res["PnL_%"].sum(), 2)
 
     print(f"\n========================================")
-    print(f" STRICT STRUCTURAL RESULTS (2025-2026)")
+    print(f" BREAKOUT STRATEGY RESULTS (2025-2026)")
     print(f"========================================")
     print(f" Total Trades : {total}")
     print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -206,7 +169,7 @@ if len(STOCKS) > 0:
     print(f" Total PnL    : {total_pnl}%")
     print(f"========================================")
 
-    tab_name = "BT_STRUCTURAL_LOG"
+    tab_name = "BT_BREAKOUT_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -215,7 +178,7 @@ if len(STOCKS) > 0:
       )
       ws.clear()
       ws.append_row([
-          f"STRICT STRUCTURAL SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+          f"BREAKOUT REVERSAL BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
           f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
@@ -224,7 +187,7 @@ if len(STOCKS) > 0:
       ws.append_row([
           "Symbol",
           "Breakout Month",
-          "Resistance",
+          "Prev High Ref",
           "Entry Price",
           "Max Profit %",
           "Result",
@@ -236,7 +199,7 @@ if len(STOCKS) > 0:
     except Exception as e:
       print(f"Sheet update error: {e}")
   else:
-    print("⚠️ Is strict structural criteria par koi trade nahi mili.")
+    print("⚠️ Is breakout criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
   
