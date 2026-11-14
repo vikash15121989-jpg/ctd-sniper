@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY MAJOR SWING BACKTEST ===")
+print("=== CTD_SNIPER MONTHLY MAJOR SWING PATTERN ANALYZER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,14 +29,14 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. MONTHLY MAJOR SWING STRATEGY FUNCTION
+# 2. PATTERN ANALYSIS ENGINE FOR MONTHLY MAJOR SWING
 # -------------------------------------------------------------
-def backtest_monthly_major_swing(
+def analyze_monthly_swing_patterns(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
 ):
-  trades = []
+  trade_features = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
@@ -48,7 +48,7 @@ def backtest_monthly_major_swing(
     )
 
     if df is None or df.empty or len(df) < 40:
-      return trades
+      return trade_features
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
@@ -78,6 +78,12 @@ def backtest_monthly_major_swing(
     resistance_level = 0
     max_price_reached = 0
 
+    # Storing breakout candle metrics for active trade
+    breakout_vol = 0
+    breakout_body_pct = 0
+    breakout_upper_wick_pct = 0
+    breakout_range_pct = 0
+
     start_idx = min_consolidation_months * 2 + 5
 
     for i in range(start_idx, n):
@@ -87,6 +93,7 @@ def backtest_monthly_major_swing(
       curr_low = lows[i]
       curr_open = opens[i]
       curr_range = ranges[i]
+      curr_vol = volumes[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -94,31 +101,18 @@ def backtest_monthly_major_swing(
 
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
-          pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
-              if is_win
-              else (stop_loss - entry_price) / entry_price * 100
-          )
-          max_profit_pct = (
-              (max_price_reached - entry_price) / entry_price
-          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
               2026,
           ]:
-            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
-
-            trades.append({
+            trade_features.append({
                 "Symbol": symbol,
-                "Breakout_Month": entry_date.strftime("%b %Y"),
-                "Resistance": round(resistance_level, 2),
-                "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "PnL_%": round(pnl_pct, 2),
-                "TradingView_Chart": sheet_link_formula,
+                "Volume_Ratio": round(breakout_vol, 2),
+                "Body_Pct": round(breakout_body_pct, 2),
+                "Upper_Wick_Pct": round(breakout_upper_wick_pct, 2),
+                "Range_Pct": round(breakout_range_pct, 2),
             })
           in_trade = False
         continue
@@ -169,74 +163,5 @@ def backtest_monthly_major_swing(
 
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
-        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          resistance_level = active_resistance
-          pending_entry = True
-
-    return trades
-
-  except Exception as e:
-    return []
-
-
-# -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEETS
-# -------------------------------------------------------------
-all_trades = []
-if len(STOCKS) > 0:
-  print("🚀 Running Monthly Major Swing Backtest...")
-  for sym in STOCKS:
-    t = backtest_monthly_major_swing(sym)
-    if t:
-      all_trades.extend(t)
-
-  if len(all_trades) > 0:
-    df_res = pd.DataFrame(all_trades)
-    wins = len(df_res[df_res["Result"] == "WIN"])
-    total = len(df_res)
-    win_rate = round((wins / total) * 100, 2) if total > 0 else 0
-    total_pnl = round(df_res["PnL_%"].sum(), 2)
-
-    print(f"\n========================================")
-    print(f" MONTHLY MAJOR SWING RESULTS (2025-2026)")
-    print(f"========================================")
-    print(f" Total Trades : {total}")
-    print(f" Wins         : {wins} | Losses: {total - wins}")
-    print(f" Win Rate     : {win_rate}%")
-    print(f" Total PnL    : {total_pnl}%")
-    print(f"========================================")
-
-    tab_name = "BT_MONTHLY_SWING_LOG"
-    try:
-      ws = (
-          sh.worksheet(tab_name)
-          if tab_name in [x.title for x in sh.worksheets()]
-          else sh.add_worksheet(tab_name, 2000, 10)
-      )
-      ws.clear()
-      ws.append_row([
-          f"MONTHLY MAJOR SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
-      ])
-      ws.append_row([
-          f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
-      ])
-      ws.append_row([])
-      ws.append_row([
-          "Symbol",
-          "Breakout Month",
-          "Resistance",
-          "Entry Price",
-          "Max Profit %",
-          "Result",
-          "PnL %",
-          "TradingView Link",
-      ])
-      ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-      print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
-    except Exception as e:
-      print(f"Sheet update error: {e}")
-  else:
-    print("⚠️ Is criteria par koi trade nahi mili.")
-else:
-  print("⚠️ Watchlist is empty.")
-  
+        if len(post_swing_
+               
