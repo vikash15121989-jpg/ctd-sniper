@@ -120,4 +120,123 @@ def backtest_monthly_major_swing(
                 "PnL_%": round(pnl_pct, 2),
                 "TradingView_Chart": sheet_link_formula,
             })
-            
+          in_trade = False
+        continue
+
+      if pending_entry:
+        entry_price = curr_open
+        stop_loss = entry_price * (1 - stop_loss_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        pending_entry = False
+        continue
+
+      # Major Swing Resistance Detection Logic
+      active_resistance = None
+      resistance_index = -1
+      search_range = range(
+          i - min_consolidation_months, min_consolidation_months - 1, -1
+      )
+
+      for j in search_range:
+        is_valid_swing = True
+        for k in range(j - min_consolidation_months, j):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+        for k in range(j + 1, j + min_consolidation_months + 1):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        ever_broken = False
+        for k in range(j + 1, i):
+          if highs[k] > highs[j]:
+            ever_broken = True
+            break
+        if ever_broken:
+          continue
+
+        active_resistance = highs[j]
+        resistance_index = j
+        break
+
+      if active_resistance is not None and curr_close > active_resistance:
+        post_swing_ranges = ranges[resistance_index + 1 : i]
+        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
+          resistance_level = active_resistance
+          pending_entry = True
+
+    return trades
+
+  except Exception as e:
+    return []
+
+
+# -------------------------------------------------------------
+# 3. RUN & EXPORT TO GOOGLE SHEETS
+# -------------------------------------------------------------
+all_trades = []
+if len(STOCKS) > 0:
+  print("🚀 Running Monthly Major Swing Backtest...")
+  for sym in STOCKS:
+    t = backtest_monthly_major_swing(sym)
+    if t:
+      all_trades.extend(t)
+
+  if len(all_trades) > 0:
+    df_res = pd.DataFrame(all_trades)
+    wins = len(df_res[df_res["Result"] == "WIN"])
+    total = len(df_res)
+    win_rate = round((wins / total) * 100, 2) if total > 0 else 0
+    total_pnl = round(df_res["PnL_%"].sum(), 2)
+
+    print(f"\n========================================")
+    print(f" MONTHLY MAJOR SWING RESULTS (2025-2026)")
+    print(f"========================================")
+    print(f" Total Trades : {total}")
+    print(f" Wins         : {wins} | Losses: {total - wins}")
+    print(f" Win Rate     : {win_rate}%")
+    print(f" Total PnL    : {total_pnl}%")
+    print(f"========================================")
+
+    tab_name = "BT_MONTHLY_SWING_LOG"
+    try:
+      ws = (
+          sh.worksheet(tab_name)
+          if tab_name in [x.title for x in sh.worksheets()]
+          else sh.add_worksheet(tab_name, 2000, 10)
+      )
+      ws.clear()
+      ws.append_row([
+          f"MONTHLY MAJOR SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+      ])
+      ws.append_row([
+          f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
+      ])
+      ws.append_row([])
+      ws.append_row([
+          "Symbol",
+          "Breakout Month",
+          "Resistance",
+          "Entry Price",
+          "Max Profit %",
+          "Result",
+          "PnL %",
+          "TradingView Link",
+      ])
+      ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+      print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
+    except Exception as e:
+      print(f"Sheet update error: {e}")
+  else:
+    print("⚠️ Is criteria par koi trade nahi mili.")
+else:
+  print("⚠️ Watchlist is empty.")
+  
