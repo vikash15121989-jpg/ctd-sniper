@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER WINNERS VS LOSERS PATTERN ANALYZER ===")
+print("=== CTD_SNIPER OPTIMIZED FILTERED SWING BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,10 +29,14 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. DEEP PATTERN ANALYSIS BACKTEST ENGINE
+# 2. BACKTEST ENGINE WITH WINNER PATTERN FILTERS
 # -------------------------------------------------------------
-def analyze_trade_patterns(symbol, stop_loss_pct=0.07, take_profit_pct=0.14):
-  trades_data = []
+def backtest_filtered_strategy(
+    symbol,
+    stop_loss_pct=0.07,
+    take_profit_pct=0.14,
+):
+  trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
@@ -44,7 +48,7 @@ def analyze_trade_patterns(symbol, stop_loss_pct=0.07, take_profit_pct=0.14):
     )
 
     if df is None or df.empty or len(df) < 40:
-      return trades_data
+      return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
@@ -65,7 +69,18 @@ def analyze_trade_patterns(symbol, stop_loss_pct=0.07, take_profit_pct=0.14):
     ranges = df["Range_Pct"].values
     min_consolidation_months = 3
 
-    for i in range(min_consolidation_months * 2 + 5, n):
+    in_trade = False
+    pending_entry = False
+    entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    entry_date = None
+    resistance_level = 0
+    max_price_reached = 0
+
+    start_idx = min_consolidation_months * 2 + 5
+
+    for i in range(start_idx, n):
       current_date = dates[i]
       curr_close = closes[i]
       curr_high = highs[i]
@@ -73,6 +88,51 @@ def analyze_trade_patterns(symbol, stop_loss_pct=0.07, take_profit_pct=0.14):
       curr_open = opens[i]
       curr_range = ranges[i]
       curr_vol = volumes[i]
+
+      if in_trade:
+        if curr_high > max_price_reached:
+          max_price_reached = curr_high
+
+        if curr_low <= stop_loss or curr_high >= take_profit:
+          is_win = curr_high >= take_profit
+          pnl_pct = (
+              (take_profit - entry_price) / entry_price * 100
+              if is_win
+              else (stop_loss - entry_price) / entry_price * 100
+          )
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100
+
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+
+            trades.append({
+                "Symbol": symbol,
+                "Breakout_Month": entry_date.strftime("%b %Y"),
+                "Resistance": round(resistance_level, 2),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Result": "WIN" if is_win else "LOSS",
+                "PnL_%": round(pnl_pct, 2),
+                "TradingView_Chart": sheet_link_formula,
+            })
+          in_trade = False
+        continue
+
+      if pending_entry:
+        entry_price = curr_open
+        stop_loss = entry_price * (1 - stop_loss_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        pending_entry = False
+        continue
 
       # Major Swing Resistance Detection
       active_resistance = None
@@ -112,89 +172,61 @@ def analyze_trade_patterns(symbol, stop_loss_pct=0.07, take_profit_pct=0.14):
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
           
-          # Calculate metrics for pattern study
+          # --- WINNER PATTERN FILTERS ---
+          # 1. Volume Surge Filter: Volume > 2.0x of 3-month average
           avg_vol_3m = np.mean(volumes[i - 3 : i])
-          vol_ratio = round(curr_vol / avg_vol_3m, 2) if avg_vol_3m > 0 else 1.0
-          
+          vol_ratio = (curr_vol / avg_vol_3m) if avg_vol_3m > 0 else 0
+          has_volume_surge = vol_ratio >= 2.0
+
+          # 2. Strong Candle Body Filter: Body >= 60% of total candle range
           body_size = abs(curr_close - curr_open)
           total_candle_range = curr_high - curr_low
-          body_ratio = round((body_size / total_candle_range) * 100, 1) if total_candle_range > 0 else 0
+          body_pct = (
+              (body_size / total_candle_range) * 100
+              if total_candle_range > 0
+              else 0
+          )
+          has_strong_body = body_pct >= 60.0
 
-          # Simulate Trade Outcome
-          entry_price = curr_open
-          stop_loss = entry_price * (1 - stop_loss_pct)
-          take_profit = entry_price * (1 + take_profit_pct)
-          max_price = curr_high
-          trade_result = None
-          pnl = 0
+          # Apply both winner filters
+          if has_volume_surge and has_strong_body:
+            resistance_level = active_resistance
+            pending_entry = True
 
-          for f_idx in range(i + 1, n):
-            f_high = highs[f_idx]
-            f_low = lows[f_idx]
-            if f_high > max_price:
-              max_price = f_high
-            if f_low <= stop_loss or f_high >= take_profit:
-              is_win = f_high >= take_profit
-              pnl = (
-                  ((take_profit - entry_price) / entry_price * 100)
-                  if is_win
-                  else ((stop_loss - entry_price) / entry_price * 100)
-              )
-              trade_result = "WIN" if is_win else "LOSS"
-              break
-
-          if trade_result and current_date.year in [2025, 2026]:
-            trades_data.append({
-                "Symbol": symbol,
-                "Date": current_date.strftime("%b %Y"),
-                "Result": trade_result,
-                "Volume_Ratio": vol_ratio,
-                "Candle_Body_%": body_ratio,
-                "Breakout_Range_%": round(curr_range, 2),
-                "PnL_%": round(pnl, 2)
-            })
+    return trades
 
   except Exception as e:
-    pass
-  return trades_data
+    return []
 
 
 # -------------------------------------------------------------
-# 3. EXECUTE & COMPARE PATTERNS
+# 3. RUN & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
-all_analyzed_trades = []
+all_trades = []
 if len(STOCKS) > 0:
-  print("🔍 Analyzing Winners vs Losers patterns...")
+  print("🚀 Running Optimized Filtered Backtest...")
   for sym in STOCKS:
-    t_list = analyze_trade_patterns(sym)
-    if t_list:
-      all_analyzed_trades.extend(t_list)
+    t = backtest_filtered_strategy(sym)
+    if t:
+      all_trades.extend(t)
 
-  if len(all_analyzed_trades) > 0:
-    df_all = pd.DataFrame(all_analyzed_trades)
-    df_wins = df_all[df_all["Result"] == "WIN"]
-    df_losses = df_all[df_all["Result"] == "LOSS"]
+  if len(all_trades) > 0:
+    df_res = pd.DataFrame(all_trades)
+    wins = len(df_res[df_res["Result"] == "WIN"])
+    total = len(df_res)
+    win_rate = round((wins / total) * 100, 2) if total > 0 else 0
+    total_pnl = round(df_res["PnL_%"].sum(), 2)
 
-    print("\n==================================================")
-    print(" 🔬 WINNERS VS LOSERS PATTERN INSIGHTS (2025-2026)")
-    print("==================================================")
-    print(f" Total Trades Analyzed : {len(df_all)}")
-    print(f" Total Wins            : {len(df_wins)}")
-    print(f" Total Losses          : {len(df_losses)}")
-    print("--------------------------------------------------")
-    print(f" 🟢 WINNERS AVERAGE PATTERN:")
-    print(f"    - Avg Volume Surge Ratio : {df_wins['Volume_Ratio'].mean():.2f}x")
-    print(f"    - Avg Candle Body %      : {df_wins['Candle_Body_%'].mean():.1f}%")
-    print(f"    - Avg Breakout Range %   : {df_wins['Breakout_Range_%'].mean():.1f}%")
-    print("--------------------------------------------------")
-    print(f" 🔴 LOSERS AVERAGE PATTERN:")
-    print(f"    - Avg Volume Surge Ratio : {df_losses['Volume_Ratio'].mean():.2f}x")
-    print(f"    - Avg Candle Body %      : {df_losses['Candle_Body_%'].mean():.1f}%")
-    print(f"    - Avg Breakout Range %   : {df_losses['Breakout_Range_%'].mean():.1f}%")
-    print("==================================================")
+    print(f"\n========================================")
+    print(f" OPTIMIZED FILTERED RESULTS (2025-2026)")
+    print(f"========================================")
+    print(f" Total Trades : {total}")
+    print(f" Wins         : {wins} | Losses: {total - wins}")
+    print(f" Win Rate     : {win_rate}%")
+    print(f" Total PnL    : {total_pnl}%")
+    print(f"========================================")
 
-    # Save to Google Sheets for detailed visual check
-    tab_name = "BT_PATTERN_ANALYSIS"
+    tab_name = "BT_FILTERED_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -202,16 +234,29 @@ if len(STOCKS) > 0:
           else sh.add_worksheet(tab_name, 2000, 10)
       )
       ws.clear()
-      ws.append_row([f"PATTERN ANALYSIS: WINNERS VS LOSERS | {datetime.now(IST).strftime('%d-%b-%Y')}"])
-      ws.append_row(["Winners Avg Vol:", f"{df_wins['Volume_Ratio'].mean():.2f}x", "Losers Avg Vol:", f"{df_losses['Volume_Ratio'].mean():.2f}x"])
+      ws.append_row([
+          f"OPTIMIZED FILTERED SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+      ])
+      ws.append_row([
+          f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
+      ])
       ws.append_row([])
-      ws.append_row(["Symbol", "Date", "Result", "Volume Ratio", "Candle Body %", "Breakout Range %", "PnL %"])
-      ws.append_rows(df_all.values.tolist(), value_input_option="USER_ENTERED")
-      print("✅ Pattern analysis saved to 'BT_PATTERN_ANALYSIS' tab in Google Sheet!")
+      ws.append_row([
+          "Symbol",
+          "Breakout Month",
+          "Resistance",
+          "Entry Price",
+          "Max Profit %",
+          "Result",
+          "PnL %",
+          "TradingView Link",
+      ])
+      ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+      print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
     except Exception as e:
-      print(f"Sheet error: {e}")
+      print(f"Sheet update error: {e}")
   else:
-    print("⚠️ No trades found for pattern analysis.")
+    print("⚠️ Is filtered criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
   
