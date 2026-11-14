@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER OPTIMIZED FILTERED SWING BACKTEST ===")
+print("=== CTD_SNIPER BALANCED MAJOR SWING BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST ENGINE WITH WINNER PATTERN FILTERS
+# 2. BALANCED STRATEGY BACKTEST ENGINE
 # -------------------------------------------------------------
-def backtest_filtered_strategy(
+def backtest_balanced_strategy(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
@@ -87,7 +87,6 @@ def backtest_filtered_strategy(
       curr_low = lows[i]
       curr_open = opens[i]
       curr_range = ranges[i]
-      curr_vol = volumes[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -171,25 +170,9 @@ def backtest_filtered_strategy(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # --- WINNER PATTERN FILTERS ---
-          # 1. Volume Surge Filter: Volume > 2.0x of 3-month average
+          # Balanced rule: Sirf ek normal volume check taaki bilkul zero volume wale stocks hatein, baaki saare Major Swing trades aayein
           avg_vol_3m = np.mean(volumes[i - 3 : i])
-          vol_ratio = (curr_vol / avg_vol_3m) if avg_vol_3m > 0 else 0
-          has_volume_surge = vol_ratio >= 2.0
-
-          # 2. Strong Candle Body Filter: Body >= 60% of total candle range
-          body_size = abs(curr_close - curr_open)
-          total_candle_range = curr_high - curr_low
-          body_pct = (
-              (body_size / total_candle_range) * 100
-              if total_candle_range > 0
-              else 0
-          )
-          has_strong_body = body_pct >= 60.0
-
-          # Apply both winner filters
-          if has_volume_surge and has_strong_body:
+          if volumes[i] > (avg_vol_3m * 0.8):  # Halki si flexibility
             resistance_level = active_resistance
             pending_entry = True
 
@@ -204,9 +187,9 @@ def backtest_filtered_strategy(
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
-  print("🚀 Running Optimized Filtered Backtest...")
+  print("🚀 Running Balanced Swing Backtest...")
   for sym in STOCKS:
-    t = backtest_filtered_strategy(sym)
+    t = backtest_balanced_strategy(sym)
     if t:
       all_trades.extend(t)
 
@@ -218,7 +201,7 @@ if len(STOCKS) > 0:
     total_pnl = round(df_res["PnL_%"].sum(), 2)
 
     print(f"\n========================================")
-    print(f" OPTIMIZED FILTERED RESULTS (2025-2026)")
+    print(f" BALANCED STRATEGY RESULTS (2025-2026)")
     print(f"========================================")
     print(f" Total Trades : {total}")
     print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -226,7 +209,7 @@ if len(STOCKS) > 0:
     print(f" Total PnL    : {total_pnl}%")
     print(f"========================================")
 
-    tab_name = "BT_FILTERED_LOG"
+    tab_name = "BT_BALANCED_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -235,7 +218,7 @@ if len(STOCKS) > 0:
       )
       ws.clear()
       ws.append_row([
-          f"OPTIMIZED FILTERED SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+          f"BALANCED SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
           f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
@@ -256,7 +239,7 @@ if len(STOCKS) > 0:
     except Exception as e:
       print(f"Sheet update error: {e}")
   else:
-    print("⚠️ Is filtered criteria par koi trade nahi mili.")
+    print("⚠️ Is criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
   
