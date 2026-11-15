@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY MAJOR SWING + REJECTION & PIN BAR FILTER ===")
+print("=== CTD_SNIPER MONTHLY MAJOR SWING + 2% CLOSE & LOW INTACT FILTER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,9 +29,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. MONTHLY MAJOR SWING + CANDLE REJECTION / PIN BAR FILTER
+# 2. MONTHLY MAJOR SWING + 2% BREAKOUT & LOW INTACT FILTER
 # -------------------------------------------------------------
-def backtest_monthly_swing_with_filter(
+def backtest_monthly_swing_2pct_filter(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
@@ -77,6 +77,7 @@ def backtest_monthly_swing_with_filter(
     entry_date = None
     resistance_level = 0
     max_price_reached = 0
+    breakout_candle_low = 0
 
     start_idx = min_consolidation_months * 2 + 5
 
@@ -124,12 +125,14 @@ def backtest_monthly_swing_with_filter(
         continue
 
       if pending_entry:
-        entry_price = curr_open
-        stop_loss = entry_price * (1 - stop_loss_pct)
-        take_profit = entry_price * (1 + take_profit_pct)
-        entry_date = current_date
-        max_price_reached = curr_high
-        in_trade = True
+        # Check if breakout candle's low is intact in the entry month
+        if curr_low >= breakout_candle_low:
+          entry_price = curr_open
+          stop_loss = entry_price * (1 - stop_loss_pct)
+          take_profit = entry_price * (1 + take_profit_pct)
+          entry_date = current_date
+          max_price_reached = curr_high
+          in_trade = True
         pending_entry = False
         continue
 
@@ -167,29 +170,17 @@ def backtest_monthly_swing_with_filter(
         resistance_index = j
         break
 
-      if active_resistance is not None and curr_close > active_resistance:
+      # Condition 1: Close is above resistance AND at least 2% above resistance
+      if (
+          active_resistance is not None
+          and curr_close > active_resistance
+          and curr_close >= active_resistance * 1.02
+      ):
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          
-          # --- NEW CANDLE REJECTION & PIN BAR / HAMMER FILTER ---
-          candle_total_range = curr_high - curr_low
-          if candle_total_range > 0:
-            upper_wick = curr_high - max(curr_open, curr_close)
-            lower_wick = min(curr_open, curr_close) - curr_low
-            body_size = abs(curr_close - curr_open)
-
-            upper_wick_pct = (upper_wick / candle_total_range) * 100
-            lower_wick_pct = (lower_wick / candle_total_range) * 100
-            body_pct = (body_size / candle_total_range) * 100
-
-            # Condition: Upper wick should be low (<= 30%) OR if upper wick is high, 
-            # lower wick / pin bar buying pressure must be strong (>= 30%)
-            is_low_rejection = upper_wick_pct <= 30.0
-            is_pinbar_hammer = (lower_wick_pct >= 30.0) or (body_pct >= 50.0)
-
-            if is_low_rejection or is_pinbar_hammer:
-              resistance_level = active_resistance
-              pending_entry = True
+          resistance_level = active_resistance
+          breakout_candle_low = curr_low
+          pending_entry = True
 
     return trades
 
@@ -202,9 +193,9 @@ def backtest_monthly_swing_with_filter(
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
-  print("🚀 Running Filtered Monthly Swing Backtest...")
+  print("🚀 Running 2% Close & Low Intact Filtered Monthly Swing Backtest...")
   for sym in STOCKS:
-    t = backtest_monthly_swing_with_filter(sym)
+    t = backtest_monthly_swing_2pct_filter(sym)
     if t:
       all_trades.extend(t)
 
@@ -216,7 +207,7 @@ if len(STOCKS) > 0:
     total_pnl = round(df_res["PnL_%"].sum(), 2)
 
     print(f"\n========================================")
-    print(f" FILTERED MONTHLY SWING RESULTS (2025-2026)")
+    print(f" 2% FILTERED MONTHLY SWING RESULTS (2025-2026)")
     print(f"========================================")
     print(f" Total Trades : {total}")
     print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -224,7 +215,7 @@ if len(STOCKS) > 0:
     print(f" Total PnL    : {total_pnl}%")
     print(f"========================================")
 
-    tab_name = "BT_FILTERED_MONTHLY_LOG"
+    tab_name = "BT_2PCT_BREAKOUT_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -233,7 +224,7 @@ if len(STOCKS) > 0:
       )
       ws.clear()
       ws.append_row([
-          f"FILTERED MONTHLY SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
+          f"2% FILTERED MONTHLY SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
           f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
@@ -257,4 +248,3 @@ if len(STOCKS) > 0:
     print("⚠️ Is criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
-  
