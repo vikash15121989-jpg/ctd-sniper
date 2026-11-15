@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY MAJOR SWING PATTERN ANALYZER ===")
+print("=== CTD_SNIPER MONTHLY MAJOR SWING + REJECTION & PIN BAR FILTER ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,14 +29,14 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. PATTERN ANALYSIS ENGINE FOR MONTHLY MAJOR SWING
+# 2. MONTHLY MAJOR SWING + CANDLE REJECTION / PIN BAR FILTER
 # -------------------------------------------------------------
-def analyze_monthly_swing_patterns(
+def backtest_monthly_swing_with_filter(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
 ):
-  trade_features = []
+  trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
@@ -48,7 +48,7 @@ def analyze_monthly_swing_patterns(
     )
 
     if df is None or df.empty or len(df) < 40:
-      return trade_features
+      return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
@@ -78,11 +78,6 @@ def analyze_monthly_swing_patterns(
     resistance_level = 0
     max_price_reached = 0
 
-    breakout_vol = 0
-    breakout_body_pct = 0
-    breakout_upper_wick_pct = 0
-    breakout_range_pct = 0
-
     start_idx = min_consolidation_months * 2 + 5
 
     for i in range(start_idx, n):
@@ -92,7 +87,6 @@ def analyze_monthly_swing_patterns(
       curr_low = lows[i]
       curr_open = opens[i]
       curr_range = ranges[i]
-      curr_vol = volumes[i]
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -100,18 +94,31 @@ def analyze_monthly_swing_patterns(
 
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
+          pnl_pct = (
+              (take_profit - entry_price) / entry_price * 100
+              if is_win
+              else (stop_loss - entry_price) / entry_price * 100
+          )
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
               2026,
           ]:
-            trade_features.append({
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+            sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+
+            trades.append({
                 "Symbol": symbol,
+                "Breakout_Month": entry_date.strftime("%b %Y"),
+                "Resistance": round(resistance_level, 2),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
-                "Volume_Ratio": round(breakout_vol, 2),
-                "Body_Pct": round(breakout_body_pct, 2),
-                "Upper_Wick_Pct": round(breakout_upper_wick_pct, 2),
-                "Range_Pct": round(breakout_range_pct, 2),
+                "PnL_%": round(pnl_pct, 2),
+                "TradingView_Chart": sheet_link_formula,
             })
           in_trade = False
         continue
@@ -126,6 +133,7 @@ def analyze_monthly_swing_patterns(
         pending_entry = False
         continue
 
+      # Major Swing Resistance Detection Logic
       active_resistance = None
       resistance_index = -1
       search_range = range(
@@ -162,91 +170,61 @@ def analyze_monthly_swing_patterns(
       if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          resistance_level = active_resistance
-
-          avg_vol_3m = np.mean(volumes[i - 3 : i])
-          breakout_vol = (curr_vol / avg_vol_3m) if avg_vol_3m > 0 else 1.0
-
+          
+          # --- NEW CANDLE REJECTION & PIN BAR / HAMMER FILTER ---
           candle_total_range = curr_high - curr_low
-          body_size = abs(curr_close - curr_open)
-          breakout_body_pct = (
-              (body_size / candle_total_range) * 100
-              if candle_total_range > 0
-              else 0
-          )
+          if candle_total_range > 0:
+            upper_wick = curr_high - max(curr_open, curr_close)
+            lower_wick = min(curr_open, curr_close) - curr_low
+            body_size = abs(curr_close - curr_open)
 
-          upper_wick = curr_high - max(curr_open, curr_close)
-          breakout_upper_wick_pct = (
-              (upper_wick / candle_total_range) * 100
-              if candle_total_range > 0
-              else 0
-          )
+            upper_wick_pct = (upper_wick / candle_total_range) * 100
+            lower_wick_pct = (lower_wick / candle_total_range) * 100
+            body_pct = (body_size / candle_total_range) * 100
 
-          breakout_range_pct = curr_range
-          pending_entry = True
+            # Condition: Upper wick should be low (<= 30%) OR if upper wick is high, 
+            # lower wick / pin bar buying pressure must be strong (>= 30%)
+            is_low_rejection = upper_wick_pct <= 30.0
+            is_pinbar_hammer = (lower_wick_pct >= 30.0) or (body_pct >= 50.0)
 
-    return trade_features
+            if is_low_rejection or is_pinbar_hammer:
+              resistance_level = active_resistance
+              pending_entry = True
+
+    return trades
 
   except Exception as e:
     return []
 
 
 # -------------------------------------------------------------
-# 3. RUN, COMPARE & EXPORT TO GOOGLE SHEETS
+# 3. RUN & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
-all_features = []
+all_trades = []
 if len(STOCKS) > 0:
-  print("🚀 Analyzing Monthly Major Swing Winners vs Losers Patterns...")
+  print("🚀 Running Filtered Monthly Swing Backtest...")
   for sym in STOCKS:
-    res = analyze_monthly_swing_patterns(sym)
-    if res:
-      all_features.extend(res)
+    t = backtest_monthly_swing_with_filter(sym)
+    if t:
+      all_trades.extend(t)
 
-  if len(all_features) > 0:
-    df_all = pd.DataFrame(all_features)
-    wins_df = df_all[df_all["Result"] == "WIN"]
-    losses_df = df_all[df_all["Result"] == "LOSS"]
-
-    total_trades = len(df_all)
-    total_wins = len(wins_df)
-    total_losses = len(losses_df)
-    win_rate = (
-        round((total_wins / total_trades) * 100, 2) if total_trades > 0 else 0
-    )
-
-    win_vol = round(wins_df["Volume_Ratio"].mean(), 2)
-    loss_vol = round(losses_df["Volume_Ratio"].mean(), 2)
-
-    win_body = round(wins_df["Body_Pct"].mean(), 2)
-    loss_body = round(losses_df["Body_Pct"].mean(), 2)
-
-    win_wick = round(wins_df["Upper_Wick_Pct"].mean(), 2)
-    loss_wick = round(losses_df["Upper_Wick_Pct"].mean(), 2)
-
-    win_range = round(wins_df["Range_Pct"].mean(), 2)
-    loss_range = round(losses_df["Range_Pct"].mean(), 2)
+  if len(all_trades) > 0:
+    df_res = pd.DataFrame(all_trades)
+    wins = len(df_res[df_res["Result"] == "WIN"])
+    total = len(df_res)
+    win_rate = round((wins / total) * 100, 2) if total > 0 else 0
+    total_pnl = round(df_res["PnL_%"].sum(), 2)
 
     print(f"\n========================================")
-    print(f" MONTHLY SWING WINNERS VS LOSERS PATTERN")
+    print(f" FILTERED MONTHLY SWING RESULTS (2025-2026)")
     print(f"========================================")
-    print(f" Total Trades Analyzed : {total_trades}")
-    print(f" Wins : {total_wins} | Losses : {total_losses}")
-    print(f" Baseline Win Rate     : {win_rate}%")
-    print(f"----------------------------------------")
-    print(f" 🟢 WINNERS AVERAGE PATTERN:")
-    print(f"    - Volume Ratio   : {win_vol}x")
-    print(f"    - Candle Body %  : {win_body}%")
-    print(f"    - Upper Wick %   : {win_wick}%")
-    print(f"    - Candle Range % : {win_range}%")
-    print(f"----------------------------------------")
-    print(f" 🔴 LOSERS AVERAGE PATTERN:")
-    print(f"    - Volume Ratio   : {loss_vol}x")
-    print(f"    - Candle Body %  : {loss_body}%")
-    print(f"    - Upper Wick %   : {loss_wick}%")
-    print(f"    - Candle Range % : {loss_range}%")
+    print(f" Total Trades : {total}")
+    print(f" Wins         : {wins} | Losses: {total - wins}")
+    print(f" Win Rate     : {win_rate}%")
+    print(f" Total PnL    : {total_pnl}%")
     print(f"========================================")
 
-    tab_name = "BT_MONTHLY_SWING_PATTERN"
+    tab_name = "BT_FILTERED_MONTHLY_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
@@ -255,57 +233,28 @@ if len(STOCKS) > 0:
       )
       ws.clear()
       ws.append_row([
-          f"MONTHLY SWING PATTERN ANALYSIS | {datetime.now(IST).strftime('%d-%b-%Y')}"
+          f"FILTERED MONTHLY SWING BACKTEST (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
-          f"Total Trades: {total_trades} | Wins: {total_wins} | Losses: {total_losses} | Win Rate: {win_rate}%"
-      ])
-      ws.append_row([])
-      ws.append_row([
-          "Metric",
-          "Winners Average",
-          "Losers Average",
-          "Key Difference / Observation",
-      ])
-      ws.append_row([
-          "Volume Ratio",
-          win_vol,
-          loss_vol,
-          "Compare volume surge strength",
-      ])
-      ws.append_row([
-          "Candle Body %",
-          win_body,
-          loss_body,
-          "Compare breakout candle body strength",
-      ])
-      ws.append_row([
-          "Upper Wick %",
-          win_wick,
-          loss_wick,
-          "Compare selling rejection wick",
-      ])
-      ws.append_row([
-          "Candle Range %",
-          win_range,
-          loss_range,
-          "Compare volatility expansion",
+          f"Total Trades: {total} | Wins: {wins} | Win Rate: {win_rate}% | Total PnL: {total_pnl}%"
       ])
       ws.append_row([])
       ws.append_row([
           "Symbol",
+          "Breakout Month",
+          "Resistance",
+          "Entry Price",
+          "Max Profit %",
           "Result",
-          "Volume Ratio",
-          "Body %",
-          "Upper Wick %",
-          "Range %",
+          "PnL %",
+          "TradingView Link",
       ])
-      ws.append_rows(df_all.values.tolist(), value_input_option="USER_ENTERED")
-      print(f"✅ Saved Pattern Analysis to '{tab_name}' tab successfully!")
+      ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+      print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
     except Exception as e:
       print(f"Sheet update error: {e}")
   else:
-    print("⚠️ Koi trade data nahi mila.")
+    print("⚠️ Is criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
   
