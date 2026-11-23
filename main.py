@@ -8,7 +8,10 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER ORIGINAL MONTHLY OPEN STRATEGY BACKTEST ===")
+print(
+    "=== CTD_SNIPER MONTHLY OPEN STRATEGY BACKTEST (2% BREAKOUT + RANGE"
+    " FILTER) ==="
+)
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,19 +32,24 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. ORIGINAL MONTHLY BACKTEST ENGINE
+# 2. MONTHLY BACKTEST ENGINE WITH >= 2% BREAKOUT & RANGE FILTER
 # -------------------------------------------------------------
 def backtest_monthly_direct(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
+    min_breakout_pct=0.02,
 ):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
-        ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
+        ticker_symbol,
+        start="2012-01-01",
+        interval="1mo",
+        auto_adjust=False,
+        progress=False,
     )
 
     if df is None or df.empty or len(df) < 30:
@@ -51,9 +59,13 @@ def backtest_monthly_direct(
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if len(df) < min_consolidation_months * 2 + 4:
+      return trades
+
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
+    opens = df["Open"].values
     n = len(df)
 
     df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
@@ -61,19 +73,19 @@ def backtest_monthly_direct(
 
     in_trade = False
     pending_entry = False
-    entry_price = 0
-    stop_loss = 0
-    take_profit = 0
+    entry_price = 0.0
+    stop_loss = 0.0
+    take_profit = 0.0
     entry_date = None
-    max_price_reached = 0
+    max_price_reached = 0.0
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
-      curr_close = closes[i]
-      curr_high = highs[i]
-      curr_low = lows[i]
-      curr_open = df["Open"].iloc[i]
-      curr_range = ranges[i]
+      curr_close = float(closes[i])
+      curr_high = float(highs[i])
+      curr_low = float(lows[i])
+      curr_open = float(opens[i])
+      curr_range = float(ranges[i])
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -82,14 +94,19 @@ def backtest_monthly_direct(
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
           pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100
+              (take_profit - entry_price) / entry_price * 100.0
               if is_win
-              else (stop_loss - entry_price) / entry_price * 100
+              else (stop_loss - entry_price) / entry_price * 100.0
           )
-          max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100.0
 
           # Filter strictly for 2025-2026 execution
-          if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
             trades.append({
                 "Symbol": symbol,
                 "Entry_Date": entry_date.strftime("%b %Y"),
@@ -103,8 +120,8 @@ def backtest_monthly_direct(
 
       if pending_entry:
         entry_price = curr_open
-        stop_loss = entry_price * (1 - stop_loss_pct)
-        take_profit = entry_price * (1 + take_profit_pct)
+        stop_loss = entry_price * (1.0 - stop_loss_pct)
+        take_profit = entry_price * (1.0 + take_profit_pct)
         entry_date = current_date
         max_price_reached = curr_high
         in_trade = True
@@ -141,18 +158,23 @@ def backtest_monthly_direct(
         if ever_broken:
           continue
 
-        active_resistance = highs[j]
+        active_resistance = float(highs[j])
         resistance_index = j
         break
 
-      if active_resistance is not None and curr_close > active_resistance:
+      # Direct >= 2% Breakout + Post-Swing Range Filter
+      if (
+          active_resistance is not None
+          and active_resistance > 0
+          and curr_close >= active_resistance * (1.0 + min_breakout_pct)
+      ):
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
           pending_entry = True
 
     return trades
 
-  except Exception as e:
+  except Exception:
     return []
 
 
@@ -174,7 +196,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n========================================")
-  print(f" ORIGINAL MONTHLY STRATEGY RESULTS (2025-2026)")
+  print(f" MONTHLY 2% BREAKOUT + RANGE RESULTS (2025-2026)")
   print(f"========================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -182,15 +204,16 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"========================================")
 
+  tab_name = "MONTHLY_2PCT_RANGE_LOG"
   try:
     ws = (
-        sh.worksheet("MONTHLY_DIRECT_LOG")
-        if "MONTHLY_DIRECT_LOG" in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet("MONTHLY_DIRECT_LOG", 2000, 10)
+        sh.worksheet(tab_name)
+        if tab_name in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet(tab_name, 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "ORIGINAL MONTHLY DIRECT LOG (2025-2026) |"
+        "MONTHLY >=2% BREAKOUT + RANGE LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -202,7 +225,7 @@ if len(all_trades) > 0:
         "PnL %",
     ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print("✅ Data successfully saved to 'MONTHLY_DIRECT_LOG' tab in Google Sheet!")
+    print(f"✅ Data successfully saved to '{tab_name}' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
