@@ -9,8 +9,7 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER MONTHLY SWING: 2% CLOSE -> NEXT MONTH LOW INTACT -> 3RD"
-    " MONTH OPEN ENTRY ==="
+    "=== CTD_SNIPER MONTHLY SWING: 2% CLOSE -> NEXT MONTH OPEN ENTRY ==="
 )
 
 # -------------------------------------------------------------
@@ -32,9 +31,9 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. BACKTEST LOGIC: BREAKOUT (i) -> LOW INTACT (i+1) -> ENTRY AT OPEN (i+2)
+# 2. BACKTEST LOGIC: BREAKOUT (i) >= 2% -> ENTRY AT NEXT MONTH OPEN (i+1)
 # -------------------------------------------------------------
-def backtest_2m_confirm_entry(
+def backtest_direct_2pct_entry(
     symbol,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
@@ -57,8 +56,6 @@ def backtest_2m_confirm_entry(
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if "Volume" not in df.columns:
-      df["Volume"] = 100000
 
     highs = df["High"].values
     lows = df["Low"].values
@@ -78,18 +75,11 @@ def backtest_2m_confirm_entry(
     breakout_date = None
     entry_date = None
     resistance_level = 0.0
-    breakout_candle_low = 0.0
     max_price_reached = 0.0
 
-    # State machine for 2-month confirmation before entry:
-    # waiting_confirm_idx = i + 1 (month after breakout i)
-    # waiting_entry_idx   = i + 2 (month after confirmation i + 1)
-    waiting_confirm_idx = None
     waiting_entry_idx = None
-
     start_idx = min_consolidation_months * 2 + 5
 
-    # Need at least index n - 1, so loop up to n - 1
     for i in range(start_idx, n):
       current_date = dates[i]
       curr_close = closes[i]
@@ -131,7 +121,6 @@ def backtest_2m_confirm_entry(
                     entry_date.strftime("%b %Y") if entry_date else ""
                 ),
                 "Resistance": round(resistance_level, 2),
-                "Breakout_Low": round(breakout_candle_low, 2),
                 "Entry_Price": round(entry_price, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
@@ -140,36 +129,22 @@ def backtest_2m_confirm_entry(
             })
 
           in_trade = False
-          waiting_confirm_idx = None
           waiting_entry_idx = None
         continue
 
-      # B. Check confirmation month (e.g., March if breakout was in February)
-      if waiting_confirm_idx is not None and i == waiting_confirm_idx:
-        if curr_low >= breakout_candle_low:
-          # Breakout candle's low remained intact in the confirmation month
-          waiting_entry_idx = i + 1
-        else:
-          # Breakout low broke in the next month -> setup invalidated
-          waiting_confirm_idx = None
-          waiting_entry_idx = None
-        continue
-
-      # C. Check entry month (e.g., April if breakout was Feb and Mar low stayed intact)
+      # B. Enter immediately at Open of the month right after breakout
       if waiting_entry_idx is not None and i == waiting_entry_idx:
-        if i < n:
-          entry_price = curr_open
-          stop_loss = entry_price * (1 - stop_loss_pct)
-          take_profit = entry_price * (1 + take_profit_pct)
-          entry_date = current_date
-          max_price_reached = curr_high
-          in_trade = True
-        waiting_confirm_idx = None
+        entry_price = curr_open
+        stop_loss = entry_price * (1 - stop_loss_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
         waiting_entry_idx = None
         continue
 
-      # D. Detect Major Swing Resistance & >= 2% Closing Breakout
-      if waiting_confirm_idx is None and waiting_entry_idx is None:
+      # C. Detect Major Swing Resistance & >= 2% Closing Breakout
+      if waiting_entry_idx is None:
         active_resistance = None
         resistance_index = -1
         search_range = range(
@@ -211,12 +186,10 @@ def backtest_2m_confirm_entry(
         ):
           post_swing_ranges = ranges[resistance_index + 1 : i]
           if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-            if i + 2 < n:
+            if i + 1 < n:
               resistance_level = active_resistance
-              breakout_candle_low = curr_low
               breakout_date = current_date
-              waiting_confirm_idx = i + 1
-              waiting_entry_idx = None
+              waiting_entry_idx = i + 1
 
     return trades
 
@@ -229,9 +202,9 @@ def backtest_2m_confirm_entry(
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
-  print("🚀 Running 2% Close -> Next Month Low Intact -> Entry Backtest...")
+  print("🚀 Running 2% Close -> Next Month Open Entry Backtest...")
   for sym in STOCKS:
-    t = backtest_2m_confirm_entry(sym)
+    t = backtest_direct_2pct_entry(sym)
     if t:
       all_trades.extend(t)
 
@@ -243,7 +216,7 @@ if len(STOCKS) > 0:
     total_pnl = round(df_res["PnL_%"].sum(), 2)
 
     print(f"\n=======================================================")
-    print(f" 2M CONFIRMATION MONTHLY SWING RESULTS (2025-2026)")
+    print(f" DIRECT 2% BREAKOUT -> NEXT MONTH ENTRY (2025-2026)")
     print(f"=======================================================")
     print(f" Total Trades : {total}")
     print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -251,16 +224,16 @@ if len(STOCKS) > 0:
     print(f" Total PnL    : {total_pnl}%")
     print(f"=======================================================")
 
-    tab_name = "BT_2M_CONFIRM_ENTRY_LOG"
+    tab_name = "BT_DIRECT_2PCT_ENTRY_LOG"
     try:
       ws = (
           sh.worksheet(tab_name)
           if tab_name in [x.title for x in sh.worksheets()]
-          else sh.add_worksheet(tab_name, 2000, 12)
+          else sh.add_worksheet(tab_name, 2000, 11)
       )
       ws.clear()
       ws.append_row([
-          "2% CLOSE -> NEXT MONTH LOW INTACT -> 3RD MONTH OPEN ENTRY"
+          "MAJOR SWING BREAKOUT (>=2% CLOSE) -> NEXT MONTH OPEN ENTRY"
           f" (2025-2026) | {datetime.now(IST).strftime('%d-%b-%Y')}"
       ])
       ws.append_row([
@@ -273,7 +246,6 @@ if len(STOCKS) > 0:
           "Breakout Month",
           "Entry Month",
           "Resistance",
-          "Breakout Low",
           "Entry Price",
           "Max Profit %",
           "Result",
@@ -288,4 +260,4 @@ if len(STOCKS) > 0:
     print("⚠️ Is criteria par koi trade nahi mili.")
 else:
   print("⚠️ Watchlist is empty.")
-  
+    
