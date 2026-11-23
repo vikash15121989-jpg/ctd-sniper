@@ -8,10 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print(
-    "=== CTD_SNIPER MONTHLY OPEN STRATEGY BACKTEST (2% BREAKOUT + RANGE"
-    " FILTER) ==="
-)
+print("=== CTD_SNIPER DIRECT SWING-HIGH ENTRY BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -32,14 +29,50 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. MONTHLY BACKTEST ENGINE WITH >= 2% BREAKOUT & RANGE FILTER
+# 2. FIND LATEST VALID UNBROKEN SWING HIGH BEFORE INDEX `idx`
 # -------------------------------------------------------------
-def backtest_monthly_direct(
+def get_active_swing_high(highs, idx, min_consolidation_months=3):
+  # Need at least min_consolidation_months after candidate index j before idx
+  start_j = min(idx - min_consolidation_months, len(highs) - 1)
+  end_j = min_consolidation_months - 1
+
+  for j in range(start_j, end_j, -1):
+    is_valid_swing = True
+    for k in range(j - min_consolidation_months, j):
+      if highs[j] <= highs[k]:
+        is_valid_swing = False
+        break
+    if not is_valid_swing:
+      continue
+
+    for k in range(j + 1, j + min_consolidation_months + 1):
+      if k < len(highs) and highs[j] <= highs[k]:
+        is_valid_swing = False
+        break
+    if not is_valid_swing:
+      continue
+
+    ever_broken = False
+    for k in range(j + 1, idx):
+      if highs[k] > highs[j]:
+        ever_broken = True
+        break
+    if ever_broken:
+      continue
+
+    return float(highs[j]), j
+
+  return None, -1
+
+
+# -------------------------------------------------------------
+# 3. BACKTEST ENGINE: ENTRY DIRECTLY AT MAJOR SWING HIGH
+# -------------------------------------------------------------
+def backtest_swing_high_entry(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
-    min_breakout_pct=0.02,
 ):
   trades = []
   try:
@@ -68,24 +101,19 @@ def backtest_monthly_direct(
     opens = df["Open"].values
     n = len(df)
 
-    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
-    ranges = df["Range_Pct"].values
-
     in_trade = False
-    pending_entry = False
     entry_price = 0.0
     stop_loss = 0.0
     take_profit = 0.0
     entry_date = None
     max_price_reached = 0.0
+    used_swing_indices = set()
 
     for i in range(min_consolidation_months * 2 + 3, n):
       current_date = df.index[i]
-      curr_close = float(closes[i])
       curr_high = float(highs[i])
       curr_low = float(lows[i])
       curr_open = float(opens[i])
-      curr_range = float(ranges[i])
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -94,15 +122,14 @@ def backtest_monthly_direct(
         if curr_low <= stop_loss or curr_high >= take_profit:
           is_win = curr_high >= take_profit
           pnl_pct = (
-              (take_profit - entry_price) / entry_price * 100.0
+              ((take_profit - entry_price) / entry_price) * 100.0
               if is_win
-              else (stop_loss - entry_price) / entry_price * 100.0
+              else ((stop_loss - entry_price) / entry_price) * 100.0
           )
           max_profit_pct = (
-              (max_price_reached - entry_price) / entry_price
-          ) * 100.0
+              ((max_price_reached - entry_price) / entry_price) * 100.0
+          )
 
-          # Filter strictly for 2025-2026 execution
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
               2026,
@@ -118,59 +145,24 @@ def backtest_monthly_direct(
           in_trade = False
         continue
 
-      if pending_entry:
-        entry_price = curr_open
+      swing_level, swing_idx = get_active_swing_high(
+          highs, i, min_consolidation_months
+      )
+
+      if (
+          swing_level is not None
+          and swing_level > 0
+          and swing_idx not in used_swing_indices
+          and curr_high >= swing_level
+      ):
+        # Direct entry at the major swing high level itself
+        entry_price = swing_level
         stop_loss = entry_price * (1.0 - stop_loss_pct)
         take_profit = entry_price * (1.0 + take_profit_pct)
         entry_date = current_date
         max_price_reached = curr_high
         in_trade = True
-        pending_entry = False
-        continue
-
-      # Find True Swing High
-      active_resistance = None
-      resistance_index = -1
-
-      for j in range(
-          i - min_consolidation_months, min_consolidation_months - 1, -1
-      ):
-        is_valid_swing = True
-        for k in range(j - min_consolidation_months, j):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
-            break
-        if not is_valid_swing:
-          continue
-
-        for k in range(j + 1, j + min_consolidation_months + 1):
-          if highs[j] <= highs[k]:
-            is_valid_swing = False
-            break
-        if not is_valid_swing:
-          continue
-
-        ever_broken = False
-        for k in range(j + 1, i):
-          if highs[k] > highs[j]:
-            ever_broken = True
-            break
-        if ever_broken:
-          continue
-
-        active_resistance = float(highs[j])
-        resistance_index = j
-        break
-
-      # Direct >= 2% Breakout + Post-Swing Range Filter
-      if (
-          active_resistance is not None
-          and active_resistance > 0
-          and curr_close >= active_resistance * (1.0 + min_breakout_pct)
-      ):
-        post_swing_ranges = ranges[resistance_index + 1 : i]
-        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
-          pending_entry = True
+        used_swing_indices.add(swing_idx)
 
     return trades
 
@@ -179,12 +171,12 @@ def backtest_monthly_direct(
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEET
+# 4. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_monthly_direct(sym)
+    t = backtest_swing_high_entry(sym)
     if t:
       all_trades.extend(t)
 
@@ -196,7 +188,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n========================================")
-  print(f" MONTHLY 2% BREAKOUT + RANGE RESULTS (2025-2026)")
+  print(f" DIRECT SWING-HIGH ENTRY RESULTS (2025-2026)")
   print(f"========================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -204,7 +196,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"========================================")
 
-  tab_name = "MONTHLY_2PCT_RANGE_LOG"
+  tab_name = "SWING_HIGH_ENTRY_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -213,7 +205,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY >=2% BREAKOUT + RANGE LOG (2025-2026) |"
+        "DIRECT SWING-HIGH ENTRY LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -230,4 +222,4 @@ if len(all_trades) > 0:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-  
+    
