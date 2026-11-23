@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import os
 import gspread
@@ -8,231 +8,203 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print(
-    "=== CTD_SNIPER DYNAMIC SCANNER: CURRENT MONTH ENTRY <- PREV MONTH"
-    " BREAKOUT ==="
-)
-
-# Set to None for live current month, or e.g. "2026-02" to test Feb -> Jan breakout
-OVERRIDE_CURRENT_YM = None
-
-now_ist = datetime.now(IST)
-if OVERRIDE_CURRENT_YM:
-  ref_dt = datetime.strptime(OVERRIDE_CURRENT_YM + "-01", "%Y-%m-%d")
-else:
-  ref_dt = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-curr_entry_ym = ref_dt.strftime("%Y-%m")
-curr_entry_label = ref_dt.strftime("%b %Y")
-
-prev_month_dt = ref_dt - timedelta(days=1)
-target_breakout_ym = prev_month_dt.strftime("%Y-%m")
-target_breakout_label = prev_month_dt.strftime("%b %Y")
-
-print(
-    f"📅 Active Entry Month : {curr_entry_label} ({curr_entry_ym}) | Required"
-    f" Breakout Month : {target_breakout_label} ({target_breakout_ym})"
-)
-
-EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
+print("=== CTD_SNIPER ORIGINAL MONTHLY OPEN STRATEGY BACKTEST ===")
 
 # -------------------------------------------------------------
-# 1. GOOGLE SHEETS CONNECTION & CLEAN WATCHLIST LOAD
+# 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
 # -------------------------------------------------------------
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
   raw = sh.worksheet("Watchlist").col_values(1)
-  STOCKS = []
-  for s in raw:
-    sym = s.strip().upper()
-    if (
-        sym
-        and len(sym) > 2
-        and sym not in ["STOCK", "SYMBOL"]
-        and not any(k in sym for k in EXCLUDE_KEYWORDS)
-    ):
-      STOCKS.append(sym)
-  print(f"✅ Loaded {len(STOCKS)} clean stocks from Watchlist.")
+  STOCKS = [
+      s.strip().upper()
+      for s in raw
+      if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
+  ]
+  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
 
 
 # -------------------------------------------------------------
-# 2. FIND VALID SWING RESISTANCE BEFORE INDEX `idx`
+# 2. ORIGINAL MONTHLY BACKTEST ENGINE
 # -------------------------------------------------------------
-def get_active_resistance(highs, idx, min_consolidation_months=3):
-  search_range = range(
-      idx - min_consolidation_months, min_consolidation_months - 1, -1
-  )
-
-  for j in search_range:
-    is_valid_swing = True
-    for k in range(j - min_consolidation_months, j):
-      if highs[j] <= highs[k]:
-        is_valid_swing = False
-        break
-    if not is_valid_swing:
-      continue
-
-    for k in range(j + 1, j + min_consolidation_months + 1):
-      if highs[j] <= highs[k]:
-        is_valid_swing = False
-        break
-    if not is_valid_swing:
-      continue
-
-    ever_broken = False
-    for k in range(j + 1, idx):
-      if highs[k] > highs[j]:
-        ever_broken = True
-        break
-    if ever_broken:
-      continue
-
-    return float(highs[j])
-
-  return None
-
-
-# -------------------------------------------------------------
-# 3. SCAN ONLY STOCKS WITH BREAKOUT IN `target_breakout_ym`
-# -------------------------------------------------------------
-def scan_prev_month_breakout(symbol, min_consolidation_months=3):
+def backtest_monthly_direct(
+    symbol,
+    min_consolidation_months=3,
+    stop_loss_pct=0.07,
+    take_profit_pct=0.14,
+):
+  trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
-        ticker_symbol,
-        start="2012-01-01",
-        interval="1mo",
-        auto_adjust=False,
-        progress=False,
+        ticker_symbol, start="2012-01-01", interval="1mo", auto_adjust=False, progress=False
     )
 
-    if df is None or df.empty or len(df) < 40:
-      return None
+    if df is None or df.empty or len(df) < 30:
+      return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < min_consolidation_months * 2 + 6:
-      return None
-
     highs = df["High"].values
+    lows = df["Low"].values
     closes = df["Close"].values
-    opens = df["Open"].values
-    dates = df.index
     n = len(df)
 
-    brk_idx = None
-    for idx in range(min_consolidation_months * 2 + 5, n):
-      if dates[idx].strftime("%Y-%m") == target_breakout_ym:
-        brk_idx = idx
+    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Pct"].values
+
+    in_trade = False
+    pending_entry = False
+    entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    entry_date = None
+    max_price_reached = 0
+
+    for i in range(min_consolidation_months * 2 + 3, n):
+      current_date = df.index[i]
+      curr_close = closes[i]
+      curr_high = highs[i]
+      curr_low = lows[i]
+      curr_open = df["Open"].iloc[i]
+      curr_range = ranges[i]
+
+      if in_trade:
+        if curr_high > max_price_reached:
+          max_price_reached = curr_high
+
+        if curr_low <= stop_loss or curr_high >= take_profit:
+          is_win = curr_high >= take_profit
+          pnl_pct = (
+              (take_profit - entry_price) / entry_price * 100
+              if is_win
+              else (stop_loss - entry_price) / entry_price * 100
+          )
+          max_profit_pct = ((max_price_reached - entry_price) / entry_price) * 100
+
+          # Filter strictly for 2025-2026 execution
+          if entry_date.year in [2025, 2026] or current_date.year in [2025, 2026]:
+            trades.append({
+                "Symbol": symbol,
+                "Entry_Date": entry_date.strftime("%b %Y"),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Result": "WIN" if is_win else "LOSS",
+                "PnL_%": round(pnl_pct, 2),
+            })
+          in_trade = False
+        continue
+
+      if pending_entry:
+        entry_price = curr_open
+        stop_loss = entry_price * (1 - stop_loss_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        pending_entry = False
+        continue
+
+      # Find True Swing High
+      active_resistance = None
+      resistance_index = -1
+
+      for j in range(
+          i - min_consolidation_months, min_consolidation_months - 1, -1
+      ):
+        is_valid_swing = True
+        for k in range(j - min_consolidation_months, j):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        for k in range(j + 1, j + min_consolidation_months + 1):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        ever_broken = False
+        for k in range(j + 1, i):
+          if highs[k] > highs[j]:
+            ever_broken = True
+            break
+        if ever_broken:
+          continue
+
+        active_resistance = highs[j]
+        resistance_index = j
         break
 
-    if brk_idx is None:
-      return None
+      if active_resistance is not None and curr_close > active_resistance:
+        post_swing_ranges = ranges[resistance_index + 1 : i]
+        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
+          pending_entry = True
 
-    res = get_active_resistance(highs, brk_idx, min_consolidation_months)
-    if res is None or res <= 0:
-      return None
+    return trades
 
-    brk_close = float(closes[brk_idx])
-    breakout_pct = ((brk_close - res) / res) * 100.0
-
-    if brk_close > res and breakout_pct >= 2.0:
-      curr_month_open = (
-          float(opens[brk_idx + 1]) if (brk_idx + 1) < n else brk_close
-      )
-      tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-      sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
-
-      return {
-          "Symbol": symbol,
-          "Breakout_Month": dates[brk_idx].strftime("%b %Y"),
-          "Entry_Month": curr_entry_label,
-          "Resistance": round(res, 2),
-          "Breakout_Close": round(brk_close, 2),
-          "Breakout_%": round(breakout_pct, 2),
-          "Entry_Month_Open_Ref": round(curr_month_open, 2),
-          "TradingView_Chart": sheet_link_formula,
-      }
-
-    return None
-
-  except Exception:
-    return None
+  except Exception as e:
+    return []
 
 
 # -------------------------------------------------------------
-# 4. RUN SCANNER & EXPORT TO GOOGLE SHEETS
+# 3. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
-matched_stocks = []
+all_trades = []
 if len(STOCKS) > 0:
-  print(
-      f"🚀 Scanning {target_breakout_label} (>=2%) breakouts for"
-      f" {curr_entry_label} entry..."
-  )
   for sym in STOCKS:
-    item = scan_prev_month_breakout(sym)
-    if item:
-      matched_stocks.append(item)
+    t = backtest_monthly_direct(sym)
+    if t:
+      all_trades.extend(t)
 
-  print(f"\n=======================================================")
-  print(f" {target_breakout_label} BREAKOUTS -> {curr_entry_label} ENTRY")
-  print(f" Total Matched Stocks : {len(matched_stocks)}")
-  print(f"=======================================================")
+if len(all_trades) > 0:
+  df_res = pd.DataFrame(all_trades)
+  total = len(df_res)
+  wins = len(df_res[df_res["Result"] == "WIN"])
+  win_rate = round((wins / total) * 100, 2)
+  total_pnl = round(df_res["PnL_%"].sum(), 2)
 
-  tab_name = "PREV_MONTH_BREAKOUT_SIGNALS"
+  print(f"\n========================================")
+  print(f" ORIGINAL MONTHLY STRATEGY RESULTS (2025-2026)")
+  print(f"========================================")
+  print(f" Total Trades : {total}")
+  print(f" Wins         : {wins} | Losses: {total - wins}")
+  print(f" Win Rate     : {win_rate}%")
+  print(f" Total PnL    : {total_pnl}%")
+  print(f"========================================")
+
   try:
     ws = (
-        sh.worksheet(tab_name)
-        if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 1000, 10)
+        sh.worksheet("MONTHLY_DIRECT_LOG")
+        if "MONTHLY_DIRECT_LOG" in [x.title for x in sh.worksheets()]
+        else sh.add_worksheet("MONTHLY_DIRECT_LOG", 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        f"{target_breakout_label} BREAKOUT (>=2%) -> {curr_entry_label} ENTRY"
-        f" | {now_ist.strftime('%d-%b-%Y %H:%M IST')}"
+        "ORIGINAL MONTHLY DIRECT LOG (2025-2026) |"
+        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
-    ws.append_row([f"Total Matched Stocks: {len(matched_stocks)}"])
-    ws.append_row([])
     ws.append_row([
         "Symbol",
-        "Breakout Month",
-        "Entry Month",
-        "Resistance",
-        "Breakout Close",
-        "Breakout %",
-        "Entry Month Open Ref",
-        "TradingView Link",
+        "Entry Date",
+        "Entry Price",
+        "Max Profit %",
+        "Result",
+        "PnL %",
     ])
-
-    if len(matched_stocks) > 0:
-      df_out = pd.DataFrame(matched_stocks).sort_values(
-          by="Breakout_%", ascending=False
-      )
-      ws.append_rows(df_out.values.tolist(), value_input_option="USER_ENTERED")
-      for _, row in df_out.iterrows():
-        print(
-            f" {row['Symbol']:<14} | Res: {row['Resistance']:<8} | Close:"
-            f" {row['Breakout_Close']:<8} | +{row['Breakout_%']}% | Open Ref:"
-            f" {row['Entry_Month_Open_Ref']}"
-        )
-    else:
-      ws.append_row([
-          f"No stock had a >= 2% breakout in {target_breakout_label}."
-      ])
-      print(
-          f"⚠️ {target_breakout_label} mein >= 2% breakout wala koi stock nahi"
-          " mila."
-      )
-
-    print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
+    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
+    print("✅ Data successfully saved to 'MONTHLY_DIRECT_LOG' tab in Google Sheet!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
-  print("⚠️ Watchlist is empty.")
+  print("⚠️ Koi trade nahi mili.")
   
