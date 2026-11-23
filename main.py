@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import gspread
@@ -8,13 +8,37 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER FINAL SCANNER: DIRECT 2% MONTHLY BREAKOUT ===")
+print(
+    "=== CTD_SNIPER DYNAMIC SCANNER: CURRENT MONTH ENTRY <- PREV MONTH"
+    " BREAKOUT ==="
+)
+
+# Set to None for live current month, or e.g. "2026-02" to test Feb -> Jan breakout
+OVERRIDE_CURRENT_YM = None
+
+now_ist = datetime.now(IST)
+if OVERRIDE_CURRENT_YM:
+  ref_dt = datetime.strptime(OVERRIDE_CURRENT_YM + "-01", "%Y-%m-%d")
+else:
+  ref_dt = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+curr_entry_ym = ref_dt.strftime("%Y-%m")
+curr_entry_label = ref_dt.strftime("%b %Y")
+
+prev_month_dt = ref_dt - timedelta(days=1)
+target_breakout_ym = prev_month_dt.strftime("%Y-%m")
+target_breakout_label = prev_month_dt.strftime("%b %Y")
+
+print(
+    f"📅 Active Entry Month : {curr_entry_label} ({curr_entry_ym}) | Required"
+    f" Breakout Month : {target_breakout_label} ({target_breakout_ym})"
+)
+
+EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & CLEAN WATCHLIST LOAD
 # -------------------------------------------------------------
-EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
-
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
@@ -73,10 +97,9 @@ def get_active_resistance(highs, idx, min_consolidation_months=3):
 
 
 # -------------------------------------------------------------
-# 3. SCAN LATEST & LAST COMPLETED MONTH FOR DIRECT >= 2% BREAKOUT
+# 3. SCAN ONLY STOCKS WITH BREAKOUT IN `target_breakout_ym`
 # -------------------------------------------------------------
-def scan_direct_2pct_signals(symbol, min_consolidation_months=3):
-  found = []
+def scan_prev_month_breakout(symbol, min_consolidation_months=3):
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
@@ -88,70 +111,81 @@ def scan_direct_2pct_signals(symbol, min_consolidation_months=3):
     )
 
     if df is None or df.empty or len(df) < 40:
-      return found
+      return None
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < 40:
-      return found
+    if len(df) < min_consolidation_months * 2 + 6:
+      return None
 
     highs = df["High"].values
     closes = df["Close"].values
+    opens = df["Open"].values
     dates = df.index
     n = len(df)
 
-    # Check index n-1 (latest bar) and n-2 (last completed month)
-    check_indices = [
-        (idx, "LATEST_BAR" if idx == n - 1 else "LAST_CLOSED_MONTH")
-        for idx in (n - 1, n - 2)
-        if idx >= min_consolidation_months * 2 + 5
-    ]
+    brk_idx = None
+    for idx in range(min_consolidation_months * 2 + 5, n):
+      if dates[idx].strftime("%Y-%m") == target_breakout_ym:
+        brk_idx = idx
+        break
 
-    for idx, bar_tag in check_indices:
-      res = get_active_resistance(highs, idx, min_consolidation_months)
-      if res is not None and res > 0:
-        curr_close = float(closes[idx])
-        breakout_pct = ((curr_close - res) / res) * 100.0
+    if brk_idx is None:
+      return None
 
-        if curr_close > res and breakout_pct >= 2.0:
-          tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-          sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+    res = get_active_resistance(highs, brk_idx, min_consolidation_months)
+    if res is None or res <= 0:
+      return None
 
-          found.append({
-              "Symbol": symbol,
-              "Signal_Month": dates[idx].strftime("%b %Y"),
-              "Bar_Status": bar_tag,
-              "Resistance": round(res, 2),
-              "Close_Price": round(curr_close, 2),
-              "Breakout_%": round(breakout_pct, 2),
-              "Ref_Entry_Zone": round(curr_close, 2),
-              "TradingView_Chart": sheet_link_formula,
-          })
+    brk_close = float(closes[brk_idx])
+    breakout_pct = ((brk_close - res) / res) * 100.0
 
-    return found
+    if brk_close > res and breakout_pct >= 2.0:
+      curr_month_open = (
+          float(opens[brk_idx + 1]) if (brk_idx + 1) < n else brk_close
+      )
+      tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+      sheet_link_formula = f'=HYPERLINK("{tv_url}", "{symbol} Chart")'
+
+      return {
+          "Symbol": symbol,
+          "Breakout_Month": dates[brk_idx].strftime("%b %Y"),
+          "Entry_Month": curr_entry_label,
+          "Resistance": round(res, 2),
+          "Breakout_Close": round(brk_close, 2),
+          "Breakout_%": round(breakout_pct, 2),
+          "Entry_Month_Open_Ref": round(curr_month_open, 2),
+          "TradingView_Chart": sheet_link_formula,
+      }
+
+    return None
 
   except Exception:
-    return []
+    return None
 
 
 # -------------------------------------------------------------
 # 4. RUN SCANNER & EXPORT TO GOOGLE SHEETS
 # -------------------------------------------------------------
-all_signals = []
+matched_stocks = []
 if len(STOCKS) > 0:
-  print("🚀 Running Final Direct >= 2% Monthly Breakout Scanner...")
+  print(
+      f"🚀 Scanning {target_breakout_label} (>=2%) breakouts for"
+      f" {curr_entry_label} entry..."
+  )
   for sym in STOCKS:
-    sigs = scan_direct_2pct_signals(sym)
-    if sigs:
-      all_signals.extend(sigs)
+    item = scan_prev_month_breakout(sym)
+    if item:
+      matched_stocks.append(item)
 
   print(f"\n=======================================================")
-  print(f" FINAL DIRECT 2% BREAKOUT SIGNALS FOUND: {len(all_signals)}")
+  print(f" {target_breakout_label} BREAKOUTS -> {curr_entry_label} ENTRY")
+  print(f" Total Matched Stocks : {len(matched_stocks)}")
   print(f"=======================================================")
 
-  tab_name = "LATEST_2PCT_SIGNALS"
+  tab_name = "PREV_MONTH_BREAKOUT_SIGNALS"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -160,40 +194,45 @@ if len(STOCKS) > 0:
     )
     ws.clear()
     ws.append_row([
-        "FINAL DIRECT 2% MONTHLY BREAKOUT SIGNALS |"
-        f" {datetime.now(IST).strftime('%d-%b-%Y %H:%M IST')}"
+        f"{target_breakout_label} BREAKOUT (>=2%) -> {curr_entry_label} ENTRY"
+        f" | {now_ist.strftime('%d-%b-%Y %H:%M IST')}"
     ])
-    ws.append_row([f"Total Signals Found: {len(all_signals)}"])
+    ws.append_row([f"Total Matched Stocks: {len(matched_stocks)}"])
     ws.append_row([])
     ws.append_row([
         "Symbol",
-        "Signal Month",
-        "Bar Status",
+        "Breakout Month",
+        "Entry Month",
         "Resistance",
-        "Close Price",
+        "Breakout Close",
         "Breakout %",
-        "Ref Entry Price",
+        "Entry Month Open Ref",
         "TradingView Link",
     ])
 
-    if len(all_signals) > 0:
-      df_out = pd.DataFrame(all_signals).sort_values(
-          by=["Signal_Month", "Breakout_%"], ascending=[False, False]
+    if len(matched_stocks) > 0:
+      df_out = pd.DataFrame(matched_stocks).sort_values(
+          by="Breakout_%", ascending=False
       )
       ws.append_rows(df_out.values.tolist(), value_input_option="USER_ENTERED")
       for _, row in df_out.iterrows():
         print(
-            f" {row['Symbol']:<14} | {row['Signal_Month']:<8} |"
-            f" {row['Bar_Status']:<17} | Res: {row['Resistance']:<8} | Close:"
-            f" {row['Close_Price']:<8} | +{row['Breakout_%']}%"
+            f" {row['Symbol']:<14} | Res: {row['Resistance']:<8} | Close:"
+            f" {row['Breakout_Close']:<8} | +{row['Breakout_%']}% | Open Ref:"
+            f" {row['Entry_Month_Open_Ref']}"
         )
     else:
-      ws.append_row(["No fresh >= 2% breakout signals found."])
-      print("⚠️ Koi naya >= 2% breakout signal nahi mila.")
+      ws.append_row([
+          f"No stock had a >= 2% breakout in {target_breakout_label}."
+      ])
+      print(
+          f"⚠️ {target_breakout_label} mein >= 2% breakout wala koi stock nahi"
+          " mila."
+      )
 
     print(f"✅ Saved to '{tab_name}' tab in Google Sheet successfully!")
   except Exception as e:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Watchlist is empty.")
-    
+  
