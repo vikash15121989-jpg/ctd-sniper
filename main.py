@@ -8,40 +8,43 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print(
-    "=== CTD_SNIPER MONTHLY SWING -> DAILY ULTRA-VOL BREAKOUT -> NEXT-DAY"
-    " ENTRY ==="
-)
+print("=== CTD_SNIPER FILTERED SWING-HIGH ENTRY (FEWER TRADES / HIGHER WR) ===")
 
-# Parameters you can tune easily
-MIN_CONSOLIDATION_MONTHS = 3
-VOL_LOOKBACK_DAYS = 20
-ULTRA_VOL_MULT = 2.5  # e.g., 2.5x of 20-day average daily volume
+# Tunable quality filters to cut noisy trades and improve win rate
+MIN_CONSOLIDATION_MONTHS = 4  # 3 ke bajay 4-5 months ka strong swing high
+MIN_BREAK_BUFFER_PCT = 0.01  # Swing high ke kam se kam 1% upar high jaye
+MAX_CANDLE_RANGE_PCT = 18.0  # Bahut lambi/volatile extension candle skip
 STOP_LOSS_PCT = 0.07
 TAKE_PROFIT_PCT = 0.14
+EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
 
 # -------------------------------------------------------------
-# 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
+# 1. GOOGLE SHEETS CONNECTION & CLEAN WATCHLIST LOAD
 # -------------------------------------------------------------
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
   raw = sh.worksheet("Watchlist").col_values(1)
-  STOCKS = [
-      s.strip().upper()
-      for s in raw
-      if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
-  ]
-  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
+  STOCKS = []
+  for s in raw:
+    sym = s.strip().upper()
+    if (
+        sym
+        and len(sym) > 2
+        and sym not in ["STOCK", "SYMBOL"]
+        and not any(k in sym for k in EXCLUDE_KEYWORDS)
+    ):
+      STOCKS.append(sym)
+  print(f"✅ Loaded {len(STOCKS)} clean stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
 
 
 # -------------------------------------------------------------
-# 2. FIND VALID UNBROKEN MONTHLY SWING HIGH BEFORE INDEX `idx`
+# 2. FIND STRONG UNBROKEN SWING HIGH BEFORE INDEX `idx`
 # -------------------------------------------------------------
-def get_monthly_swing_high(highs, idx, min_consolidation_months=3):
+def get_strong_swing_high(highs, idx, min_consolidation_months=4):
   start_j = min(idx - min_consolidation_months, len(highs) - 1)
   end_j = min_consolidation_months - 1
 
@@ -74,107 +77,59 @@ def get_monthly_swing_high(highs, idx, min_consolidation_months=3):
   return None, -1
 
 
-def build_monthly_resistance_map(df_monthly, min_consolidation_months=3):
-  """Maps each 'YYYY-MM' to the active swing high available entering that month."""
-  res_map = {}
-  highs = df_monthly["High"].values
-  m_len = len(df_monthly)
-
-  for m_idx in range(min_consolidation_months * 2 + 2, m_len):
-    ym = df_monthly.index[m_idx].strftime("%Y-%m")
-    swing_lvl, swing_idx = get_monthly_swing_high(
-        highs, m_idx, min_consolidation_months
-    )
-    if swing_lvl is not None and swing_lvl > 0:
-      res_map[ym] = (swing_lvl, swing_idx)
-  return res_map
-
-
 # -------------------------------------------------------------
-# 3. BACKTEST ENGINE: MONTHLY SWING -> DAILY ULTRA-VOL -> NEXT DAY OPEN
+# 3. FILTERED SWING-HIGH BACKTEST ENGINE
 # -------------------------------------------------------------
-def backtest_monthly_swing_daily_vol(
+def backtest_filtered_swing_entry(
     symbol,
     min_consolidation_months=MIN_CONSOLIDATION_MONTHS,
-    vol_lookback=VOL_LOOKBACK_DAYS,
-    ultra_vol_mult=ULTRA_VOL_MULT,
+    min_break_buffer_pct=MIN_BREAK_BUFFER_PCT,
+    max_candle_range_pct=MAX_CANDLE_RANGE_PCT,
     stop_loss_pct=STOP_LOSS_PCT,
     take_profit_pct=TAKE_PROFIT_PCT,
 ):
   trades = []
   try:
     ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
-
-    df_m = yf.download(
+    df = yf.download(
         ticker_symbol,
         start="2012-01-01",
         interval="1mo",
         auto_adjust=False,
         progress=False,
     )
-    df_d = yf.download(
-        ticker_symbol,
-        start="2012-01-01",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-    )
 
-    if df_m is None or df_m.empty or df_d is None or df_d.empty:
+    if df is None or df.empty or len(df) < 36:
       return trades
 
-    if isinstance(df_m.columns, pd.MultiIndex):
-      df_m.columns = df_m.columns.get_level_values(0)
-    if isinstance(df_d.columns, pd.MultiIndex):
-      df_d.columns = df_d.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+      df.columns = df.columns.get_level_values(0)
 
-    df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    df_d.dropna(
-        subset=["Open", "High", "Low", "Close", "Volume"], inplace=True
-    )
-
-    if (
-        len(df_m) < min_consolidation_months * 2 + 4
-        or len(df_d) < vol_lookback + 10
-    ):
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if len(df) < min_consolidation_months * 2 + 4:
       return trades
 
-    res_map = build_monthly_resistance_map(df_m, min_consolidation_months)
-    if not res_map:
-      return trades
-
-    opens = df_d["Open"].values
-    highs = df_d["High"].values
-    lows = df_d["Low"].values
-    closes = df_d["Close"].values
-    vols = df_d["Volume"].values.astype(float)
-    dates = df_d.index
-    n = len(df_d)
-
-    # Prior 20-day volume average (excluding current day `i`)
-    vol_series = pd.Series(vols)
-    avg_vol_20 = vol_series.shift(1).rolling(vol_lookback).mean().values
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    n = len(df)
+    range_pcts = ((df["High"] - df["Low"]) / df["Close"]) * 100.0
+    ranges = range_pcts.values
 
     in_trade = False
-    pending_entry = False
     entry_price = 0.0
     stop_loss = 0.0
     take_profit = 0.0
     entry_date = None
-    breakout_date_str = ""
-    breakout_vol_ratio = 0.0
-    swing_lvl_used = 0.0
     max_price_reached = 0.0
-    used_swing_keys = set()
+    used_swing_indices = set()
 
-    for i in range(vol_lookback + 1, n):
-      curr_dt = dates[i]
-      curr_open = float(opens[i])
+    for i in range(min_consolidation_months * 2 + 3, n):
+      current_date = df.index[i]
       curr_high = float(highs[i])
       curr_low = float(lows[i])
       curr_close = float(closes[i])
-      curr_vol = float(vols[i])
-      prev_avg_vol = avg_vol_20[i]
+      curr_range = float(ranges[i])
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -191,14 +146,14 @@ def backtest_monthly_swing_daily_vol(
               ((max_price_reached - entry_price) / entry_price) * 100.0
           )
 
-          if entry_date.year in [2025, 2026] or curr_dt.year in [2025, 2026]:
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
             trades.append({
                 "Symbol": symbol,
-                "Breakout_Date": breakout_date_str,
-                "Entry_Date": entry_date.strftime("%Y-%m-%d"),
-                "Swing_High": round(swing_lvl_used, 2),
+                "Entry_Date": entry_date.strftime("%b %Y"),
                 "Entry_Price": round(entry_price, 2),
-                "Vol_Ratio": round(breakout_vol_ratio, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
                 "PnL_%": round(pnl_pct, 2),
@@ -206,39 +161,27 @@ def backtest_monthly_swing_daily_vol(
           in_trade = False
         continue
 
-      if pending_entry:
-        if curr_open <= 0:
-          pending_entry = False
-          continue
-        entry_price = curr_open
-        stop_loss = entry_price * (1.0 - stop_loss_pct)
-        take_profit = entry_price * (1.0 + take_profit_pct)
-        entry_date = curr_dt
-        max_price_reached = curr_high
-        in_trade = True
-        pending_entry = False
-        continue
+      swing_level, swing_idx = get_strong_swing_high(
+          highs, i, min_consolidation_months
+      )
 
-      ym_key = curr_dt.strftime("%Y-%m")
-      if ym_key not in res_map:
-        continue
-
-      swing_lvl, swing_idx = res_map[ym_key]
-      swing_tag = f"{swing_idx}_{round(swing_lvl, 4)}"
+      trigger_level = swing_level * (1.0 + min_break_buffer_pct) if swing_level else None
 
       if (
-          swing_tag not in used_swing_keys
-          and prev_avg_vol is not None
-          and not np.isnan(prev_avg_vol)
-          and prev_avg_vol > 0
+          swing_level is not None
+          and swing_level > 0
+          and swing_idx not in used_swing_indices
+          and curr_high >= trigger_level
+          and curr_close >= swing_level
+          and curr_range <= max_candle_range_pct
       ):
-        vol_ratio = curr_vol / prev_avg_vol
-        if curr_close > swing_lvl and vol_ratio >= ultra_vol_mult:
-          pending_entry = True
-          breakout_date_str = curr_dt.strftime("%Y-%m-%d")
-          breakout_vol_ratio = vol_ratio
-          swing_lvl_used = swing_lvl
-          used_swing_keys.add(swing_tag)
+        entry_price = swing_level
+        stop_loss = entry_price * (1.0 - stop_loss_pct)
+        take_profit = entry_price * (1.0 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        used_swing_indices.add(swing_idx)
 
     return trades
 
@@ -252,7 +195,7 @@ def backtest_monthly_swing_daily_vol(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_monthly_swing_daily_vol(sym)
+    t = backtest_filtered_swing_entry(sym)
     if t:
       all_trades.extend(t)
 
@@ -264,7 +207,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n=======================================================")
-  print(f" MONTHLY SWING -> DAILY ULTRA-VOL RESULTS (2025-2026)")
+  print(f" FILTERED SWING-HIGH ENTRY RESULTS (2025-2026)")
   print(f"=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -272,25 +215,22 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"=======================================================")
 
-  tab_name = "MSWING_DVOL_LOG"
+  tab_name = "SWING_FILTERED_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 2000, 12)
+        else sh.add_worksheet(tab_name, 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY SWING -> DAILY ULTRA-VOL LOG (2025-2026) |"
+        "FILTERED SWING-HIGH ENTRY LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
-        "Breakout Date",
         "Entry Date",
-        "Swing High",
         "Entry Price",
-        "Vol Ratio",
         "Max Profit %",
         "Result",
         "PnL %",
@@ -301,4 +241,4 @@ if len(all_trades) > 0:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-  
+    
