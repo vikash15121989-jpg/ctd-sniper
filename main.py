@@ -8,11 +8,14 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER NEXT-MONTH OPEN ENTRY BACKTEST (NO LOOKAHEAD) ===")
+print(
+    "=== CTD_SNIPER SWING HIGH + RANGE + 2% BUFFER (NEXT-MONTH OPEN) ==="
+)
 
+# Strategy Parameters
 MIN_CONSOLIDATION_MONTHS = 4
-MIN_BREAK_BUFFER_PCT = 0.01
-MAX_CANDLE_RANGE_PCT = 18.0
+MIN_BREAK_BUFFER_PCT = 0.02  # 2% breakout buffer
+MAX_CANDLE_RANGE_PCT = 18.0  # Max candle range % filter
 STOP_LOSS_PCT = 0.07
 TAKE_PROFIT_PCT = 0.14
 EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
@@ -77,9 +80,9 @@ def get_strong_swing_high(highs, end_idx, min_consolidation_months=4):
 
 
 # -------------------------------------------------------------
-# 3. BACKTEST: SIGNAL AT MONTH `i-1` CLOSE -> ENTRY AT MONTH `i` OPEN
+# 3. BACKTEST: 2% BUFFER + RANGE AT MONTH `i-1` -> ENTRY AT MONTH `i` OPEN
 # -------------------------------------------------------------
-def backtest_next_month_open(symbol):
+def backtest_swing_range_2pct_next_open(symbol):
   trades = []
   try:
     clean_sym = symbol.replace(".NS", "").strip().upper()
@@ -118,7 +121,6 @@ def backtest_next_month_open(symbol):
     used_swing_indices = set()
     pending_entry_swing = None  # (swing_level, swing_idx, signal_month_str)
 
-    # Loop up to n - 1 so next month's Open (opens[i]) actually exists
     for i in range(MIN_CONSOLIDATION_MONTHS * 2 + 3, n):
       current_date = df.index[i]
       curr_open = float(opens[i])
@@ -157,7 +159,7 @@ def backtest_next_month_open(symbol):
           in_trade = False
         continue
 
-      # Execute pending signal confirmed at previous month `i - 1` on current month `i` Open
+      # Execute signal confirmed in previous completed month on current month Open
       if pending_entry_swing is not None:
         s_level, s_idx, sig_month_str = pending_entry_swing
         pending_entry_swing = None
@@ -171,7 +173,6 @@ def backtest_next_month_open(symbol):
           in_trade = True
           used_swing_indices.add(s_idx)
 
-          # Check if SL or TP also triggers within entry month `i`
           if curr_low <= stop_loss or curr_high >= take_profit:
             is_win = curr_high >= take_profit
             pnl_pct = (
@@ -199,21 +200,25 @@ def backtest_next_month_open(symbol):
             in_trade = False
         continue
 
-      # Evaluate completed month `i` as a signal for next month `i + 1` Open (only if `i + 1 < n`)
+      # Evaluate completed month `i` for next month `i + 1` Open entry
       if i + 1 < n:
         swing_level, swing_idx = get_strong_swing_high(
             highs, i, MIN_CONSOLIDATION_MONTHS
         )
-        if swing_level is not None and swing_level > 0 and swing_idx not in used_swing_indices:
+        if (
+            swing_level is not None
+            and swing_level > 0
+            and swing_idx not in used_swing_indices
+        ):
           month_range_pct = (
               ((curr_high - curr_low) / curr_close) * 100.0
               if curr_close > 0
               else 999.0
           )
-          trigger_level = swing_level * (1.0 + MIN_BREAK_BUFFER_PCT)
+          trigger_2pct = swing_level * (1.0 + MIN_BREAK_BUFFER_PCT)
 
           if (
-              curr_high >= trigger_level
+              curr_high >= trigger_2pct
               and curr_close >= swing_level
               and month_range_pct <= MAX_CANDLE_RANGE_PCT
           ):
@@ -235,7 +240,7 @@ def backtest_next_month_open(symbol):
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_next_month_open(sym)
+    t = backtest_swing_range_2pct_next_open(sym)
     if t:
       all_trades.extend(t)
 
@@ -247,7 +252,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n=======================================================")
-  print(f" NEXT-MONTH OPEN ENTRY RESULTS (2025-2026)")
+  print(f" SWING + RANGE + 2% BUFFER NEXT-OPEN (2025-2026)")
   print(f"=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -255,7 +260,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"=======================================================")
 
-  tab_name = "SWING_NEXT_OPEN_LOG"
+  tab_name = "SWING_R2PCT_NEXT_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -264,7 +269,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "NEXT-MONTH OPEN ENTRY LOG (2025-2026) |"
+        "SWING + RANGE + 2% BUFFER NEXT-OPEN (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -282,3 +287,4 @@ if len(all_trades) > 0:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
+  
