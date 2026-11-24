@@ -8,12 +8,11 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER FILTERED SWING-HIGH ENTRY (FEWER TRADES / HIGHER WR) ===")
+print("=== CTD_SNIPER NEXT-MONTH OPEN ENTRY BACKTEST (NO LOOKAHEAD) ===")
 
-# Tunable quality filters to cut noisy trades and improve win rate
-MIN_CONSOLIDATION_MONTHS = 4  # 3 ke bajay 4-5 months ka strong swing high
-MIN_BREAK_BUFFER_PCT = 0.01  # Swing high ke kam se kam 1% upar high jaye
-MAX_CANDLE_RANGE_PCT = 18.0  # Bahut lambi/volatile extension candle skip
+MIN_CONSOLIDATION_MONTHS = 4
+MIN_BREAK_BUFFER_PCT = 0.01
+MAX_CANDLE_RANGE_PCT = 18.0
 STOP_LOSS_PCT = 0.07
 TAKE_PROFIT_PCT = 0.14
 EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
@@ -42,10 +41,10 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. FIND STRONG UNBROKEN SWING HIGH BEFORE INDEX `idx`
+# 2. FIND STRONG UNBROKEN SWING HIGH BEFORE INDEX `end_idx`
 # -------------------------------------------------------------
-def get_strong_swing_high(highs, idx, min_consolidation_months=4):
-  start_j = min(idx - min_consolidation_months, len(highs) - 1)
+def get_strong_swing_high(highs, end_idx, min_consolidation_months=4):
+  start_j = min(end_idx - min_consolidation_months, len(highs) - 1)
   end_j = min_consolidation_months - 1
 
   for j in range(start_j, end_j, -1):
@@ -65,7 +64,7 @@ def get_strong_swing_high(highs, idx, min_consolidation_months=4):
       continue
 
     ever_broken = False
-    for k in range(j + 1, idx):
+    for k in range(j + 1, end_idx):
       if highs[k] > highs[j]:
         ever_broken = True
         break
@@ -78,19 +77,14 @@ def get_strong_swing_high(highs, idx, min_consolidation_months=4):
 
 
 # -------------------------------------------------------------
-# 3. FILTERED SWING-HIGH BACKTEST ENGINE
+# 3. BACKTEST: SIGNAL AT MONTH `i-1` CLOSE -> ENTRY AT MONTH `i` OPEN
 # -------------------------------------------------------------
-def backtest_filtered_swing_entry(
-    symbol,
-    min_consolidation_months=MIN_CONSOLIDATION_MONTHS,
-    min_break_buffer_pct=MIN_BREAK_BUFFER_PCT,
-    max_candle_range_pct=MAX_CANDLE_RANGE_PCT,
-    stop_loss_pct=STOP_LOSS_PCT,
-    take_profit_pct=TAKE_PROFIT_PCT,
-):
+def backtest_next_month_open(symbol):
   trades = []
   try:
-    ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+    clean_sym = symbol.replace(".NS", "").strip().upper()
+    ticker_symbol = f"{clean_sym}.NS"
+
     df = yf.download(
         ticker_symbol,
         start="2012-01-01",
@@ -99,22 +93,21 @@ def backtest_filtered_swing_entry(
         progress=False,
     )
 
-    if df is None or df.empty or len(df) < 36:
+    if df is None or df.empty or len(df) < MIN_CONSOLIDATION_MONTHS * 2 + 5:
       return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < min_consolidation_months * 2 + 4:
+    if len(df) < MIN_CONSOLIDATION_MONTHS * 2 + 5:
       return trades
 
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
+    opens = df["Open"].values.astype(float)
+    highs = df["High"].values.astype(float)
+    lows = df["Low"].values.astype(float)
+    closes = df["Close"].values.astype(float)
     n = len(df)
-    range_pcts = ((df["High"] - df["Low"]) / df["Close"]) * 100.0
-    ranges = range_pcts.values
 
     in_trade = False
     entry_price = 0.0
@@ -123,13 +116,15 @@ def backtest_filtered_swing_entry(
     entry_date = None
     max_price_reached = 0.0
     used_swing_indices = set()
+    pending_entry_swing = None  # (swing_level, swing_idx, signal_month_str)
 
-    for i in range(min_consolidation_months * 2 + 3, n):
+    # Loop up to n - 1 so next month's Open (opens[i]) actually exists
+    for i in range(MIN_CONSOLIDATION_MONTHS * 2 + 3, n):
       current_date = df.index[i]
+      curr_open = float(opens[i])
       curr_high = float(highs[i])
       curr_low = float(lows[i])
       curr_close = float(closes[i])
-      curr_range = float(ranges[i])
 
       if in_trade:
         if curr_high > max_price_reached:
@@ -151,9 +146,10 @@ def backtest_filtered_swing_entry(
               2026,
           ]:
             trades.append({
-                "Symbol": symbol,
+                "Symbol": clean_sym,
+                "Signal_Month": sig_month_str,
                 "Entry_Date": entry_date.strftime("%b %Y"),
-                "Entry_Price": round(entry_price, 2),
+                "Entry_Open": round(entry_price, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
                 "PnL_%": round(pnl_pct, 2),
@@ -161,27 +157,71 @@ def backtest_filtered_swing_entry(
           in_trade = False
         continue
 
-      swing_level, swing_idx = get_strong_swing_high(
-          highs, i, min_consolidation_months
-      )
+      # Execute pending signal confirmed at previous month `i - 1` on current month `i` Open
+      if pending_entry_swing is not None:
+        s_level, s_idx, sig_month_str = pending_entry_swing
+        pending_entry_swing = None
 
-      trigger_level = swing_level * (1.0 + min_break_buffer_pct) if swing_level else None
+        if curr_open > 0 and s_idx not in used_swing_indices:
+          entry_price = curr_open
+          stop_loss = entry_price * (1.0 - STOP_LOSS_PCT)
+          take_profit = entry_price * (1.0 + TAKE_PROFIT_PCT)
+          entry_date = current_date
+          max_price_reached = curr_high
+          in_trade = True
+          used_swing_indices.add(s_idx)
 
-      if (
-          swing_level is not None
-          and swing_level > 0
-          and swing_idx not in used_swing_indices
-          and curr_high >= trigger_level
-          and curr_close >= swing_level
-          and curr_range <= max_candle_range_pct
-      ):
-        entry_price = swing_level
-        stop_loss = entry_price * (1.0 - stop_loss_pct)
-        take_profit = entry_price * (1.0 + take_profit_pct)
-        entry_date = current_date
-        max_price_reached = curr_high
-        in_trade = True
-        used_swing_indices.add(swing_idx)
+          # Check if SL or TP also triggers within entry month `i`
+          if curr_low <= stop_loss or curr_high >= take_profit:
+            is_win = curr_high >= take_profit
+            pnl_pct = (
+                ((take_profit - entry_price) / entry_price) * 100.0
+                if is_win
+                else ((stop_loss - entry_price) / entry_price) * 100.0
+            )
+            max_profit_pct = (
+                ((max_price_reached - entry_price) / entry_price) * 100.0
+            )
+
+            if entry_date.year in [2025, 2026] or current_date.year in [
+                2025,
+                2026,
+            ]:
+              trades.append({
+                  "Symbol": clean_sym,
+                  "Signal_Month": sig_month_str,
+                  "Entry_Date": entry_date.strftime("%b %Y"),
+                  "Entry_Open": round(entry_price, 2),
+                  "Max_Profit_%": round(max_profit_pct, 2),
+                  "Result": "WIN" if is_win else "LOSS",
+                  "PnL_%": round(pnl_pct, 2),
+              })
+            in_trade = False
+        continue
+
+      # Evaluate completed month `i` as a signal for next month `i + 1` Open (only if `i + 1 < n`)
+      if i + 1 < n:
+        swing_level, swing_idx = get_strong_swing_high(
+            highs, i, MIN_CONSOLIDATION_MONTHS
+        )
+        if swing_level is not None and swing_level > 0 and swing_idx not in used_swing_indices:
+          month_range_pct = (
+              ((curr_high - curr_low) / curr_close) * 100.0
+              if curr_close > 0
+              else 999.0
+          )
+          trigger_level = swing_level * (1.0 + MIN_BREAK_BUFFER_PCT)
+
+          if (
+              curr_high >= trigger_level
+              and curr_close >= swing_level
+              and month_range_pct <= MAX_CANDLE_RANGE_PCT
+          ):
+            pending_entry_swing = (
+                swing_level,
+                swing_idx,
+                df.index[i].strftime("%b %Y"),
+            )
 
     return trades
 
@@ -195,7 +235,7 @@ def backtest_filtered_swing_entry(
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_filtered_swing_entry(sym)
+    t = backtest_next_month_open(sym)
     if t:
       all_trades.extend(t)
 
@@ -207,7 +247,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n=======================================================")
-  print(f" FILTERED SWING-HIGH ENTRY RESULTS (2025-2026)")
+  print(f" NEXT-MONTH OPEN ENTRY RESULTS (2025-2026)")
   print(f"=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -215,7 +255,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"=======================================================")
 
-  tab_name = "SWING_FILTERED_LOG"
+  tab_name = "SWING_NEXT_OPEN_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -224,13 +264,14 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "FILTERED SWING-HIGH ENTRY LOG (2025-2026) |"
+        "NEXT-MONTH OPEN ENTRY LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
+        "Signal Month",
         "Entry Date",
-        "Entry Price",
+        "Entry Open",
         "Max Profit %",
         "Result",
         "PnL %",
