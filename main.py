@@ -241,4 +241,3 @@ if len(all_trades) > 0:
     print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
