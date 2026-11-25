@@ -8,12 +8,11 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY BASE ACCUMULATION BACKTEST (NO LOOKAHEAD) ===")
+print("=== CTD_SNIPER BASE DEFENSE + SWING BREAKOUT BACKTEST (NO LOOKAHEAD) ===")
 
-# Strategy Parameters
-BASE_MONTHS = 4  # 4-month consolidation base window
-MAX_BASE_WIDTH_PCT = 45.0  # Realistic monthly base height % (updated from 22%)
-MIN_BREAK_BUFFER_PCT = 0.01  # Close >= Base_High * 1.01 to confirm breakout
+LOOKBACK_SWING = 3
+BASE_DEFENSE_TOLERANCE = 0.02  # Allow at most 2% wick/close tolerance below Base Low
+MIN_BREAK_BUFFER_PCT = 0.01  # Close >= Swing_High * 1.01
 STOP_LOSS_PCT = 0.07
 TAKE_PROFIT_PCT = 0.14
 EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
@@ -42,63 +41,72 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. CHECK ACCUMULATION BASE & BREAKOUT ON COMPLETED MONTH `sig_idx`
+# 2. DETECT SWING HIGH + DEFENDED BASE FLOOR BEFORE `sig_idx`
 # -------------------------------------------------------------
-def check_base_accumulation_breakout(opens, highs, lows, closes, sig_idx):
-  start_b = sig_idx - BASE_MONTHS
-  if start_b < 2:
-    return False, None, None, None
+def check_base_defense_swing_breakout(highs, lows, closes, sig_idx):
+  """
+  Looks for:
+  1. A swing high `swing_val` at index `s_idx` (before `sig_idx`)
+  2. A base support `base_low` prior to/around the swing formation that price
+     does NOT break down below (`closes[k] >= base_low * (1 - tol)`)
+  3. Pullback/consolidation after `s_idx` where price holds above `base_low`
+     without breaking `swing_val` earlier
+  4. Signal month `sig_idx` closes >= `swing_val * (1 + MIN_BREAK_BUFFER_PCT)`
+  """
+  if sig_idx < LOOKBACK_SWING * 2 + 3:
+    return False, None, None
 
-  base_highs = highs[start_b:sig_idx]
-  base_lows = lows[start_b:sig_idx]
-  base_closes = closes[start_b:sig_idx]
+  # Search recent swing high `s_idx` (at least 2 months before `sig_idx` so pullback/base test happens)
+  for s_idx in range(sig_idx - 2, LOOKBACK_SWING, -1):
+    swing_val = float(highs[s_idx])
+    if swing_val <= 0:
+      continue
 
-  base_high = float(np.max(base_highs))
-  base_low = float(np.min(base_lows))
-  if base_low <= 0 or base_high <= base_low:
-    return False, None, None, None
-
-  base_width_pct = ((base_high - base_low) / base_low) * 100.0
-  if base_width_pct > MAX_BASE_WIDTH_PCT:
-    return False, None, None, None
-
-  # Rule: Price dipped into lower 35% of the base range (tested demand)
-  lower_zone = base_low + 0.35 * (base_high - base_low)
-  dipped_in_base = np.any(base_lows <= lower_zone)
-  if not dipped_in_base:
-    return False, None, None, None
-
-  # Rule: Accumulation hold (no distribution breakdown close below Base_Low)
-  if np.any(base_closes < base_low * 0.98):
-    return False, None, None, None
-
-  # Rule: Prior trend check
-  if start_b - 3 >= 0:
-    earlier_close = float(closes[start_b - 3])
-    if earlier_close > 0 and base_high < earlier_close * 0.95:
-      return False, None, None, None
-
-  # Rule: Completed signal month `sig_idx` closes cleanly above Base_High
-  sig_close = float(closes[sig_idx])
-  sig_low = float(lows[sig_idx])
-  if sig_low < base_low * 0.98:
-    return False, None, None, None
-
-  if sig_close >= base_high * (1.0 + MIN_BREAK_BUFFER_PCT):
-    return (
-        True,
-        round(base_high, 2),
-        round(base_low, 2),
-        round(base_width_pct, 2),
+    # Check local swing high around `s_idx`
+    left_ok = all(swing_val >= highs[k] for k in range(max(0, s_idx - LOOKBACK_SWING), s_idx))
+    right_ok = all(
+        swing_val >= highs[k] for k in range(s_idx + 1, min(sig_idx, s_idx + LOOKBACK_SWING + 1))
     )
+    if not (left_ok and right_ok):
+      continue
 
-  return False, None, None, None
+    # Ensure `swing_val` was not already broken before `sig_idx`
+    if any(highs[k] > swing_val for k in range(s_idx + 1, sig_idx)):
+      continue
+
+    # Base floor from window leading into and through the post-swing pullback
+    base_start = max(0, s_idx - 6)
+    base_low = float(np.min(lows[base_start:sig_idx]))
+    if base_low <= 0 or swing_val <= base_low:
+      continue
+
+    # Base width shouldn't be an extreme multi-bagger blow-off box (e.g., <= 120%)
+    base_span_pct = ((swing_val - base_low) / base_low) * 100.0
+    if base_span_pct > 120.0:
+      continue
+
+    # Price must NOT break down below base support (price "niche nahi jaane de raha")
+    floor_limit = base_low * (1.0 - BASE_DEFENSE_TOLERANCE)
+    if np.any(closes[base_start : sig_idx + 1] < floor_limit):
+      continue
+
+    # Post-swing pullback must have occurred (at least one month after swing_val closed below swing_val)
+    post_swing_closes = closes[s_idx + 1 : sig_idx]
+    if len(post_swing_closes) == 0 or not np.any(post_swing_closes < swing_val):
+      continue
+
+    # Signal month `sig_idx` breaks out cleanly above `swing_val` on close
+    sig_close = float(closes[sig_idx])
+    if sig_close >= swing_val * (1.0 + MIN_BREAK_BUFFER_PCT):
+      return True, round(swing_val, 2), round(base_low, 2)
+
+  return False, None, None
 
 
 # -------------------------------------------------------------
 # 3. BACKTEST ENGINE (SIGNAL AT `i-1` CLOSE -> ENTRY AT `i` OPEN)
 # -------------------------------------------------------------
-def backtest_base_accumulation(symbol):
+def backtest_base_defense_breakout(symbol):
   trades = []
   try:
     clean_sym = symbol.replace(".NS", "").strip().upper()
@@ -112,14 +120,14 @@ def backtest_base_accumulation(symbol):
         progress=False,
     )
 
-    if df is None or df.empty or len(df) < BASE_MONTHS + 8:
+    if df is None or df.empty or len(df) < 15:
       return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
 
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < BASE_MONTHS + 8:
+    if len(df) < 15:
       return trades
 
     opens = df["Open"].values.astype(float)
@@ -134,10 +142,10 @@ def backtest_base_accumulation(symbol):
     take_profit = 0.0
     entry_date = None
     max_price_reached = 0.0
-    pending_setup = None
+    pending_setup = None  # (swing_high, base_low, sig_month_str)
     last_entry_idx = -99
 
-    for i in range(BASE_MONTHS + 4, n):
+    for i in range(LOOKBACK_SWING * 2 + 4, n):
       current_date = df.index[i]
       curr_open = float(opens[i])
       curr_high = float(highs[i])
@@ -171,8 +179,8 @@ def backtest_base_accumulation(symbol):
                 "Signal_Month": sig_month_str,
                 "Entry_Date": entry_date.strftime("%b %Y"),
                 "Entry_Open": round(entry_price, 2),
-                "Base_High": b_high,
-                "Base_Width_%": b_width,
+                "Base_Low": b_low,
+                "Swing_High": s_high,
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
                 "PnL_%": round(pnl_pct, 2),
@@ -181,10 +189,10 @@ def backtest_base_accumulation(symbol):
         continue
 
       if pending_setup is not None:
-        b_high, b_low, b_width, sig_month_str = pending_setup
+        s_high, b_low, sig_month_str = pending_setup
         pending_setup = None
 
-        if curr_open > 0 and (i - last_entry_idx) >= BASE_MONTHS:
+        if curr_open > 0 and (i - last_entry_idx) >= 3:
           entry_price = curr_open
           stop_loss = entry_price * (1.0 - STOP_LOSS_PCT)
           take_profit = entry_price * (1.0 + TAKE_PROFIT_PCT)
@@ -217,8 +225,8 @@ def backtest_base_accumulation(symbol):
                   "Signal_Month": sig_month_str,
                   "Entry_Date": entry_date.strftime("%b %Y"),
                   "Entry_Open": round(entry_price, 2),
-                  "Base_High": b_high,
-                  "Base_Width_%": b_width,
+                  "Base_Low": b_low,
+                  "Swing_High": s_high,
                   "Max_Profit_%": round(max_profit_pct, 2),
                   "Result": "WIN" if is_win else "LOSS",
                   "PnL_%": round(pnl_pct, 2),
@@ -226,17 +234,12 @@ def backtest_base_accumulation(symbol):
             in_trade = False
         continue
 
-      if i + 1 < n and (i - last_entry_idx) >= BASE_MONTHS:
-        ok, b_high, b_low, b_width = check_base_accumulation_breakout(
-            opens, highs, lows, closes, i
+      if i + 1 < n and (i - last_entry_idx) >= 3:
+        ok, s_high, b_low = check_base_defense_swing_breakout(
+            highs, lows, closes, i
         )
         if ok:
-          pending_setup = (
-              b_high,
-              b_low,
-              b_width,
-              df.index[i].strftime("%b %Y"),
-          )
+          pending_setup = (s_high, b_low, df.index[i].strftime("%b %Y"))
 
     return trades
 
@@ -250,7 +253,7 @@ def backtest_base_accumulation(symbol):
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_base_accumulation(sym)
+    t = backtest_base_defense_breakout(sym)
     if t:
       all_trades.extend(t)
 
@@ -265,7 +268,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n=======================================================")
-  print(f" MONTHLY BASE ACCUMULATION RESULTS (2025-2026 | <=45% BASE)")
+  print(f" BASE DEFENSE + SWING BREAKOUT RESULTS (2025-2026)")
   print(f"=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -273,7 +276,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"=======================================================")
 
-  tab_name = "MONTHLY_BASE_ACCUM_LOG"
+  tab_name = "BASE_DEFENSE_SWING_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -282,7 +285,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY BASE ACCUMULATION BACKTEST (<=45% BASE, 2025-2026) |"
+        "BASE DEFENSE + SWING BREAKOUT LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row(list(df_res.columns))
@@ -292,4 +295,4 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
+  
