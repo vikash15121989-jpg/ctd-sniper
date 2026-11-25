@@ -8,7 +8,9 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY SWING -> DAILY DEMAND ZONE BACKTEST ===")
+print(
+    "=== CTD_SNIPER MONTHLY SWING -> DAILY DEMAND ZONE (2025-2026 ONLY) ==="
+)
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -29,8 +31,9 @@ except Exception as e:
 
 
 def get_monthly_swing_highs(df_m, lookback=3):
-  """Returns list of (swing_date, swing_high_price, unbroken_until_date)."""
+  """Returns list of dicts with swing_date, level, break_month_start."""
   highs = df_m["High"].values
+  closes = df_m["Close"].values
   dates = df_m.index
   swings = []
   n = len(df_m)
@@ -44,10 +47,9 @@ def get_monthly_swing_highs(df_m, lookback=3):
     if not (left_ok and right_ok):
       continue
 
-    # Find first candle after j that closes above val
     break_idx = None
     for k in range(j + 1, n):
-      if float(df_m["Close"].values[k]) > val:
+      if float(closes[k]) > val:
         break_idx = k
         break
 
@@ -63,8 +65,8 @@ def get_monthly_swing_highs(df_m, lookback=3):
 def find_post_break_demand_zone(df_d, start_dt, level):
   """
     After daily price breaks above `level` from `start_dt` onward,
-    finds a clean base candle(s) followed by an impulsive bullish leg-out.
-    Returns (dz_low, dz_high, zone_formed_idx) or None.
+    finds a clean base candle followed by an impulsive bullish leg-out candle.
+    Returns (dz_low, dz_high, zone_formed_pos_in_sub) or None.
     """
   sub = df_d[df_d.index >= start_dt]
   if len(sub) < 6:
@@ -74,14 +76,10 @@ def find_post_break_demand_zone(df_d, start_dt, level):
   highs = sub["High"].values
   lows = sub["Low"].values
   closes = sub["Close"].values
-  idx_list = sub.index
 
-  # Ensure breakout occurred
-  broke = any(float(closes[k]) > level for k in range(len(sub)))
-  if not broke:
+  if not any(float(closes[k]) > level for k in range(len(sub))):
     return None
 
-  # Look for a base (1-2 small-body candles) after breakout followed by a strong green candle
   for i in range(1, len(sub) - 2):
     if float(closes[i]) <= level:
       continue
@@ -92,7 +90,6 @@ def find_post_break_demand_zone(df_d, start_dt, level):
     next_close = float(closes[i + 1])
     next_body = next_close - next_open
 
-    # Clean base candle + strong bullish leg-out candle
     if (
         body_base <= 0.55 * range_base
         and next_close > next_open
@@ -105,7 +102,7 @@ def find_post_break_demand_zone(df_d, start_dt, level):
   return None
 
 
-def backtest_m_to_d_dz(symbol, sl_pct=0.07, tp_pct=0.14):
+def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
   trades = []
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -152,47 +149,48 @@ def backtest_m_to_d_dz(symbol, sl_pct=0.07, tp_pct=0.14):
       tp_price = 0.0
       entry_dt = None
 
-      # Walk forward after demand zone is formed; wait for retest + bullish candle
       for k in range(formed_pos + 1, len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
         d_close = float(closes[k])
+        curr_dt = dates[k]
 
         if in_trade:
           # Conservative SL check first
           if d_low <= sl_price:
             pnl = ((sl_price - entry_price) / entry_price) * 100.0
-            trades.append({
-                "Symbol": symbol,
-                "Monthly_Swing": round(sw["level"], 2),
-                "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": dates[k].strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "Result": "LOSS",
-                "PnL_%": round(pnl, 2),
-            })
+            if entry_dt.year in [2025, 2026] or curr_dt.year in [2025, 2026]:
+              trades.append({
+                  "Symbol": symbol,
+                  "Monthly_Swing": round(sw["level"], 2),
+                  "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
+                  "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                  "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                  "Entry_Price": round(entry_price, 2),
+                  "Result": "LOSS",
+                  "PnL_%": round(pnl, 2),
+              })
             in_trade = False
             break
 
           if d_high >= tp_price:
             pnl = ((tp_price - entry_price) / entry_price) * 100.0
-            trades.append({
-                "Symbol": symbol,
-                "Monthly_Swing": round(sw["level"], 2),
-                "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": dates[k].strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "Result": "WIN",
-                "PnL_%": round(pnl, 2),
-            })
+            if entry_dt.year in [2025, 2026] or curr_dt.year in [2025, 2026]:
+              trades.append({
+                  "Symbol": symbol,
+                  "Monthly_Swing": round(sw["level"], 2),
+                  "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
+                  "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                  "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                  "Entry_Price": round(entry_price, 2),
+                  "Result": "WIN",
+                  "PnL_%": round(pnl, 2),
+              })
             in_trade = False
             break
           continue
 
-        # Price touches/enters Demand Zone and prints a bullish candle
         touched_dz = (d_low <= dz_high) and (d_high >= dz_low)
         bullish_candle = d_close > d_open
         if touched_dz and bullish_candle:
@@ -200,7 +198,7 @@ def backtest_m_to_d_dz(symbol, sl_pct=0.07, tp_pct=0.14):
           entry_price = d_close
           sl_price = min(dz_low * 0.99, entry_price * (1.0 - sl_pct))
           tp_price = entry_price * (1.0 + tp_pct)
-          entry_dt = dates[k]
+          entry_dt = curr_dt
           in_trade = True
 
     return trades
@@ -209,11 +207,11 @@ def backtest_m_to_d_dz(symbol, sl_pct=0.07, tp_pct=0.14):
 
 
 # -------------------------------------------------------------
-# 2. RUN BACKTEST & EXPORT TO GOOGLE SHEET
+# 2. RUN 2025-2026 FILTERED BACKTEST & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_m_to_d_dz(sym)
+  t = backtest_m_to_d_dz_25_26(sym)
   if t:
     all_trades.extend(t)
 
@@ -226,7 +224,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" MONTHLY SWING -> DAILY DEMAND ZONE RESULTS")
+  print(" MONTHLY SWING -> DAILY DEMAND ZONE RESULTS (2025-2026)")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -234,7 +232,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("=======================================================")
 
-  tab_name = "MONTHLY_TO_DAILY_DZ_LOG"
+  tab_name = "MONTHLY_TO_DAILY_DZ_25_26"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -243,7 +241,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY SWING -> DAILY DZ BACKTEST |"
+        "MONTHLY SWING -> DAILY DZ BACKTEST (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -261,5 +259,5 @@ if len(all_trades) > 0:
   except Exception as e:
     print(f"❌ Sheet update error: {e}")
 else:
-  print("⚠️ Koi trade nahi mili.")
-    
+  print("⚠️ 2025-2026 mein koi trade nahi mili.")
+  
