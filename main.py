@@ -9,7 +9,7 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER MONTHLY SWING -> DAILY DEMAND ZONE (2025-2026 ONLY) ==="
+    "=== CTD_SNIPER RECENT SWING + PULLBACK (ENGULFING / HAMMER) BACKTEST ==="
 )
 
 # -------------------------------------------------------------
@@ -30,15 +30,53 @@ except Exception as e:
   STOCKS = []
 
 
-def get_monthly_swing_highs(df_m, lookback=3):
-  """Returns list of dicts with swing_date, level, break_month_start."""
+def is_bullish_engulfing(prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l, curr_c):
+  """Previous candle is bearish, current candle is bullish and engulfs previous body."""
+  prev_bear = prev_c < prev_o
+  curr_bull = curr_c > curr_o
+  if not (prev_bear and curr_bull):
+    return False
+  prev_body_low = min(prev_o, prev_c)
+  prev_body_high = max(prev_o, prev_c)
+  curr_body_low = min(curr_o, curr_c)
+  curr_body_high = max(curr_o, curr_c)
+  return (curr_body_low <= prev_body_low) and (curr_body_high >= prev_body_high)
+
+
+def is_hammer_candle(o, h, l, c):
+  """Bullish/reversal hammer: lower shadow >= 2x body, small upper shadow, decent body."""
+  total_range = h - l
+  if total_range <= 1e-9:
+    return False
+  body = abs(c - o)
+  if body <= 1e-9:
+    return False
+  lower_wick = min(o, c) - l
+  upper_wick = h - max(o, c)
+  return (
+      (c >= o)
+      and (lower_wick >= 2.0 * body)
+      and (upper_wick <= 0.35 * body)
+      and (body / total_range >= 0.15)
+  )
+
+
+def get_recent_monthly_swing_highs(df_m, lookback=3, max_age_days=730):
+  """Returns recent unbroken-then-broken monthly swing highs within `max_age_days` of last bar."""
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
-  swings = []
   n = len(df_m)
+  if n < (lookback * 2 + 2):
+    return []
+
+  last_dt = dates[-1]
+  swings = []
 
   for j in range(lookback, n - lookback):
+    if (last_dt - dates[j]).days > max_age_days:
+      continue
+
     val = float(highs[j])
     left_ok = all(val > float(highs[k]) for k in range(j - lookback, j))
     right_ok = all(
@@ -59,15 +97,13 @@ def get_monthly_swing_highs(df_m, lookback=3):
           "level": val,
           "break_month_start": dates[break_idx],
       })
-  return swings
+
+  # Keep only the 2 most recent qualifying swings per stock to avoid old noise
+  return swings[-2:]
 
 
 def find_post_break_demand_zone(df_d, start_dt, level):
-  """
-    After daily price breaks above `level` from `start_dt` onward,
-    finds a clean base candle followed by an impulsive bullish leg-out candle.
-    Returns (dz_low, dz_high, zone_formed_pos_in_sub) or None.
-    """
+  """Finds a clean post-breakout base candle + impulsive bullish leg-out on Daily."""
   sub = df_d[df_d.index >= start_dt]
   if len(sub) < 6:
     return None
@@ -91,9 +127,9 @@ def find_post_break_demand_zone(df_d, start_dt, level):
     next_body = next_close - next_open
 
     if (
-        body_base <= 0.55 * range_base
+        body_base <= 0.50 * range_base
         and next_close > next_open
-        and next_body > 1.5 * max(body_base, 1e-9)
+        and next_body > 1.6 * max(body_base, 1e-9)
     ):
       dz_low = float(lows[i])
       dz_high = max(float(opens[i]), float(closes[i]), float(highs[i]))
@@ -102,15 +138,15 @@ def find_post_break_demand_zone(df_d, start_dt, level):
   return None
 
 
-def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
+def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
   trades = []
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df_m = yf.download(
-        ticker, start="2015-01-01", interval="1mo", auto_adjust=False, progress=False
+        ticker, start="2018-01-01", interval="1mo", auto_adjust=False, progress=False
     )
     df_d = yf.download(
-        ticker, start="2015-01-01", interval="1d", auto_adjust=False, progress=False
+        ticker, start="2018-01-01", interval="1d", auto_adjust=False, progress=False
     )
 
     if df_m is None or df_d is None or df_m.empty or df_d.empty:
@@ -123,7 +159,9 @@ def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
     df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
 
-    swings = get_monthly_swing_highs(df_m, lookback=3)
+    swings = get_recent_monthly_swing_highs(
+        df_m, lookback=3, max_age_days=730
+    )
     used_zones = set()
 
     for sw in swings:
@@ -148,8 +186,9 @@ def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
       sl_price = 0.0
       tp_price = 0.0
       entry_dt = None
+      pattern_used = ""
 
-      for k in range(formed_pos + 1, len(sub)):
+      for k in range(max(formed_pos + 1, 1), len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
@@ -160,41 +199,57 @@ def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
           # Conservative SL check first
           if d_low <= sl_price:
             pnl = ((sl_price - entry_price) / entry_price) * 100.0
-            if entry_dt.year in [2025, 2026] or curr_dt.year in [2025, 2026]:
-              trades.append({
-                  "Symbol": symbol,
-                  "Monthly_Swing": round(sw["level"], 2),
-                  "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                  "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                  "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                  "Entry_Price": round(entry_price, 2),
-                  "Result": "LOSS",
-                  "PnL_%": round(pnl, 2),
-              })
+            trades.append({
+                "Symbol": symbol,
+                "Pattern": pattern_used,
+                "Monthly_Swing": round(sw["level"], 2),
+                "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
+                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                "Entry_Price": round(entry_price, 2),
+                "Result": "LOSS",
+                "PnL_%": round(pnl, 2),
+            })
             in_trade = False
             break
 
           if d_high >= tp_price:
             pnl = ((tp_price - entry_price) / entry_price) * 100.0
-            if entry_dt.year in [2025, 2026] or curr_dt.year in [2025, 2026]:
-              trades.append({
-                  "Symbol": symbol,
-                  "Monthly_Swing": round(sw["level"], 2),
-                  "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                  "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                  "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                  "Entry_Price": round(entry_price, 2),
-                  "Result": "WIN",
-                  "PnL_%": round(pnl, 2),
-              })
+            trades.append({
+                "Symbol": symbol,
+                "Pattern": pattern_used,
+                "Monthly_Swing": round(sw["level"], 2),
+                "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
+                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                "Entry_Price": round(entry_price, 2),
+                "Result": "WIN",
+                "PnL_%": round(pnl, 2),
+            })
             in_trade = False
             break
           continue
 
+        # Pullback into Demand Zone + strict Bullish Engulfing or Hammer
         touched_dz = (d_low <= dz_high) and (d_high >= dz_low)
-        bullish_candle = d_close > d_open
-        if touched_dz and bullish_candle:
+        if not touched_dz:
+          continue
+
+        engulf = is_bullish_engulfing(
+            float(opens[k - 1]),
+            float(highs[k - 1]),
+            float(lows[k - 1]),
+            float(closes[k - 1]),
+            d_open,
+            d_high,
+            d_low,
+            d_close,
+        )
+        hammer = is_hammer_candle(d_open, d_high, d_low, d_close)
+
+        if engulf or hammer:
           used_zones.add(zone_key)
+          pattern_used = "ENGULFING" if engulf else "HAMMER"
           entry_price = d_close
           sl_price = min(dz_low * 0.99, entry_price * (1.0 - sl_pct))
           tp_price = entry_price * (1.0 + tp_pct)
@@ -207,11 +262,11 @@ def backtest_m_to_d_dz_25_26(symbol, sl_pct=0.07, tp_pct=0.14):
 
 
 # -------------------------------------------------------------
-# 2. RUN 2025-2026 FILTERED BACKTEST & EXPORT TO GOOGLE SHEET
+# 2. RUN BACKTEST & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_m_to_d_dz_25_26(sym)
+  t = backtest_recent_swing_dz_eh(sym)
   if t:
     all_trades.extend(t)
 
@@ -224,7 +279,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" MONTHLY SWING -> DAILY DEMAND ZONE RESULTS (2025-2026)")
+  print(" RECENT SWING + DZ + BULLISH ENGULFING / HAMMER RESULTS")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -232,7 +287,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("=======================================================")
 
-  tab_name = "MONTHLY_TO_DAILY_DZ_25_26"
+  tab_name = "MONTHLY_RECENT_DZ_EH_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -241,11 +296,12 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY SWING -> DAILY DZ BACKTEST (2025-2026) |"
+        "RECENT SWING + DZ + ENGULFING/HAMMER |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
+        "Pattern",
         "Monthly Swing",
         "DZ Range",
         "Entry Date",
@@ -259,5 +315,5 @@ if len(all_trades) > 0:
   except Exception as e:
     print(f"❌ Sheet update error: {e}")
 else:
-  print("⚠️ 2025-2026 mein koi trade nahi mili.")
-  
+  print("⚠️ Koi trade nahi mili.")
+    
