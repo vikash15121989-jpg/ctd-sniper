@@ -9,7 +9,7 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER RECENT SWING + PULLBACK (ENGULFING / HAMMER) BACKTEST ==="
+    "=== CTD_SNIPER RECENT SWING + DZ + 200 EMA + DYNAMIC 1:2 RR BACKTEST ==="
 )
 
 # -------------------------------------------------------------
@@ -44,7 +44,7 @@ def is_bullish_engulfing(prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l,
 
 
 def is_hammer_candle(o, h, l, c):
-  """Bullish/reversal hammer: lower shadow >= 2x body, small upper shadow, decent body."""
+  """Bullish/reversal hammer: lower shadow >= 2x body, small upper shadow."""
   total_range = h - l
   if total_range <= 1e-9:
     return False
@@ -62,7 +62,7 @@ def is_hammer_candle(o, h, l, c):
 
 
 def get_recent_monthly_swing_highs(df_m, lookback=3, max_age_days=730):
-  """Returns recent unbroken-then-broken monthly swing highs within `max_age_days` of last bar."""
+  """Returns recent unbroken-then-broken monthly swing highs within `max_age_days`."""
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
@@ -98,7 +98,6 @@ def get_recent_monthly_swing_highs(df_m, lookback=3, max_age_days=730):
           "break_month_start": dates[break_idx],
       })
 
-  # Keep only the 2 most recent qualifying swings per stock to avoid old noise
   return swings[-2:]
 
 
@@ -138,7 +137,7 @@ def find_post_break_demand_zone(df_d, start_dt, level):
   return None
 
 
-def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
+def backtest_combined_200ema_1to2(symbol, rr_ratio=2.0):
   trades = []
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -158,6 +157,10 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
 
     df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if len(df_d) < 205:
+      return trades
+
+    df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
 
     swings = get_recent_monthly_swing_highs(
         df_m, lookback=3, max_age_days=730
@@ -179,6 +182,7 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
       highs = sub["High"].values
       lows = sub["Low"].values
       closes = sub["Close"].values
+      ema200 = sub["EMA200"].values
       dates = sub.index
 
       in_trade = False
@@ -193,6 +197,7 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
         d_high = float(highs[k])
         d_low = float(lows[k])
         d_close = float(closes[k])
+        d_ema200 = float(ema200[k])
         curr_dt = dates[k]
 
         if in_trade:
@@ -207,6 +212,8 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
+                "SL_Price": round(sl_price, 2),
+                "TP_Price": round(tp_price, 2),
                 "Result": "LOSS",
                 "PnL_%": round(pnl, 2),
             })
@@ -223,6 +230,8 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
+                "SL_Price": round(sl_price, 2),
+                "TP_Price": round(tp_price, 2),
                 "Result": "WIN",
                 "PnL_%": round(pnl, 2),
             })
@@ -230,9 +239,10 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
             break
           continue
 
-        # Pullback into Demand Zone + strict Bullish Engulfing or Hammer
+        # 200 EMA trend filter + Pullback into Demand Zone + Engulfing / Hammer
+        above_200_ema = d_close > d_ema200
         touched_dz = (d_low <= dz_high) and (d_high >= dz_low)
-        if not touched_dz:
+        if not (above_200_ema and touched_dz):
           continue
 
         engulf = is_bullish_engulfing(
@@ -248,11 +258,16 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
         hammer = is_hammer_candle(d_open, d_high, d_low, d_close)
 
         if engulf or hammer:
+          cand_sl = dz_low * 0.99
+          risk_pts = d_close - cand_sl
+          if risk_pts <= 0:
+            continue
+
           used_zones.add(zone_key)
           pattern_used = "ENGULFING" if engulf else "HAMMER"
           entry_price = d_close
-          sl_price = min(dz_low * 0.99, entry_price * (1.0 - sl_pct))
-          tp_price = entry_price * (1.0 + tp_pct)
+          sl_price = cand_sl
+          tp_price = entry_price + (rr_ratio * risk_pts)
           entry_dt = curr_dt
           in_trade = True
 
@@ -266,7 +281,7 @@ def backtest_recent_swing_dz_eh(symbol, sl_pct=0.07, tp_pct=0.14):
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_recent_swing_dz_eh(sym)
+  t = backtest_combined_200ema_1to2(sym, rr_ratio=2.0)
   if t:
     all_trades.extend(t)
 
@@ -279,7 +294,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" RECENT SWING + DZ + BULLISH ENGULFING / HAMMER RESULTS")
+  print(" RECENT SWING + DZ + 200 EMA + DYNAMIC 1:2 RR RESULTS")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -287,16 +302,16 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("=======================================================")
 
-  tab_name = "MONTHLY_RECENT_DZ_EH_LOG"
+  tab_name = "M_DZ_200EMA_1TO2_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 3000, 10)
+        else sh.add_worksheet(tab_name, 3000, 12)
     )
     ws.clear()
     ws.append_row([
-        "RECENT SWING + DZ + ENGULFING/HAMMER |"
+        "RECENT SWING + DZ + 200 EMA + 1:2 RR |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -307,6 +322,8 @@ if len(all_trades) > 0:
         "Entry Date",
         "Exit Date",
         "Entry Price",
+        "SL Price",
+        "TP Price",
         "Result",
         "PnL %",
     ])
