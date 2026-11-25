@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER MONTHLY OPEN STRATEGY BACKTEST (NO 2% FILTER + PEAK"
-    " BEFORE SL) ==="
+    "=== CTD_SNIPER ORIGINAL MONTHLY OPEN STRATEGY + SL PEAK (1%-10%)"
+    " ANALYSIS ==="
 )
 
 # -------------------------------------------------------------
@@ -32,14 +32,13 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. MONTHLY BACKTEST ENGINE (NO 2% BUFFER + PEAK BEFORE SL)
+# 2. ORIGINAL MONTHLY BACKTEST ENGINE + PEAK BEFORE SL TRACKER
 # -------------------------------------------------------------
-def backtest_monthly_no_2pct(
+def backtest_monthly_direct_with_sl_peak(
     symbol,
     min_consolidation_months=3,
     stop_loss_pct=0.07,
     take_profit_pct=0.14,
-    min_breakout_pct=0.0,
 ):
   trades = []
   try:
@@ -88,13 +87,11 @@ def backtest_monthly_no_2pct(
       curr_range = float(ranges[i])
 
       if in_trade:
-        # SL hit hone se pehle ka peak track karein
+        # Pehle SL check (agar SL hit ho raha ho toh usse pehle ka max high)
         if curr_low <= stop_loss:
-          # Agar SL hit hone se pehle current candle ka high SL se upar tha
           peak_before_sl_pct = (
               ((max_price_reached - entry_price) / entry_price) * 100.0
           )
-          max_profit_pct = peak_before_sl_pct
           pnl_pct = ((stop_loss - entry_price) / entry_price) * 100.0
 
           if entry_date.year in [2025, 2026] or current_date.year in [
@@ -105,7 +102,7 @@ def backtest_monthly_no_2pct(
                 "Symbol": symbol,
                 "Entry_Date": entry_date.strftime("%b %Y"),
                 "Entry_Price": round(entry_price, 2),
-                "Max_Profit_%": round(max_profit_pct, 2),
+                "Max_Profit_%": round(peak_before_sl_pct, 2),
                 "Peak_Before_SL_%": round(peak_before_sl_pct, 2),
                 "Result": "LOSS",
                 "PnL_%": round(pnl_pct, 2),
@@ -147,7 +144,6 @@ def backtest_monthly_no_2pct(
         in_trade = True
         pending_entry = False
 
-        # Entry month mein hi SL/TP check
         if curr_low <= stop_loss:
           peak_before_sl_pct = (
               ((max_price_reached - entry_price) / entry_price) * 100.0
@@ -222,12 +218,7 @@ def backtest_monthly_no_2pct(
         resistance_index = j
         break
 
-      # Breakout above Swing High (without strict >= 2% filter) + Post-Swing Range Filter
-      if (
-          active_resistance is not None
-          and active_resistance > 0
-          and curr_close > active_resistance * (1.0 + min_breakout_pct)
-      ):
+      if active_resistance is not None and curr_close > active_resistance:
         post_swing_ranges = ranges[resistance_index + 1 : i]
         if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
           pending_entry = True
@@ -239,12 +230,12 @@ def backtest_monthly_no_2pct(
 
 
 # -------------------------------------------------------------
-# 3. RUN & EXPORT TO GOOGLE SHEET
+# 3. RUN, COUNT 1%-10% BEFORE SL & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_monthly_no_2pct(sym)
+    t = backtest_monthly_direct_with_sl_peak(sym)
     if t:
       all_trades.extend(t)
 
@@ -252,27 +243,51 @@ if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
   total = len(df_res)
   wins = len(df_res[df_res["Result"] == "WIN"])
-  loss_df = df_res[df_res["Result"] == "LOSS"]
+  loss_df = df_res[df_res["Result"] == "LOSS"].copy()
   losses = len(loss_df)
   win_rate = round((wins / total) * 100, 2)
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
-  peak_vals = pd.to_numeric(loss_df["Peak_Before_SL_%"], errors="coerce").dropna()
-  min_peak_before_sl = round(float(peak_vals.min()), 2) if len(peak_vals) > 0 else None
-  avg_peak_before_sl = round(float(peak_vals.mean()), 2) if len(peak_vals) > 0 else None
+  loss_peaks = pd.to_numeric(
+      loss_df["Peak_Before_SL_%"], errors="coerce"
+  ).dropna()
+
+  bucket_counts = {}
+  for pct in range(1, 11):
+    if pct == 1:
+      cnt = int(((loss_peaks > 0.0) & (loss_peaks <= 1.0)).sum())
+    else:
+      cnt = int(
+          ((loss_peaks > float(pct - 1)) & (loss_peaks <= float(pct))).sum()
+      )
+    bucket_counts[f"{pct}%"] = cnt
+
+  zero_or_neg_cnt = int((loss_peaks <= 0.0).sum())
+  above_10_cnt = int((loss_peaks > 10.0).sum())
+  top_pct = max(bucket_counts, key=bucket_counts.get)
+  top_count = bucket_counts[top_pct]
 
   print(f"\n=======================================================")
-  print(f" MONTHLY NO-2% BREAKOUT + RANGE RESULTS (2025-2026)")
+  print(f" ORIGINAL MONTHLY DIRECT RESULTS (2025-2026)")
   print(f"=======================================================")
-  print(f" Total Trades       : {total}")
-  print(f" Wins               : {wins} | Losses: {losses}")
-  print(f" Win Rate           : {win_rate}%")
-  print(f" Total PnL          : {total_pnl}%")
-  print(f" Min Peak Before SL : {min_peak_before_sl}%")
-  print(f" Avg Peak Before SL : {avg_peak_before_sl}%")
+  print(f" Total Trades : {total}")
+  print(f" Wins         : {wins} | Losses: {losses}")
+  print(f" Win Rate     : {win_rate}%")
+  print(f" Total PnL    : {total_pnl}%")
+  print(f"-------------------------------------------------------")
+  print(f" SL HIT TRADES PEAK BEFORE SL (1% TO 10% BUCKETS)")
+  print(f"-------------------------------------------------------")
+  print(f" <= 0% (No upside before SL) : {zero_or_neg_cnt}")
+  for k, v in bucket_counts.items():
+    print(f" Up to {k:3s} (({int(k[:-1])-1}%-{k}])     : {v}")
+  print(f" > 10%                       : {above_10_cnt}")
+  print(f"-------------------------------------------------------")
+  print(
+      f" MOST FREQUENT (1%-10%)      : {top_pct} ({top_count} loss trades)"
+  )
   print(f"=======================================================")
 
-  tab_name = "MONTHLY_NO2PCT_RANGE_LOG"
+  tab_name = "MONTHLY_DIRECT_SL_PEAK_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -281,7 +296,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY NO-2% BREAKOUT + RANGE LOG (2025-2026) |"
+        "MONTHLY DIRECT + SL PEAK LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -296,7 +311,7 @@ if len(all_trades) > 0:
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
     print(f"✅ Data successfully saved to '{tab_name}' tab in Google Sheet!")
   except Exception as e:
-    print(f"Sheet update error: {e}")
+    print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-  
+    
