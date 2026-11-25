@@ -9,19 +9,15 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BASE (>=2 TESTS) + BULL MATH (VOL + CLV + 10M SMA)"
-    " ==="
+    "=== CTD_SNIPER MONTHLY SWING + DAILY PULLBACK FOOTPRINT + BREAKOUT ==="
 )
 
-# Strategy & Bull-Math Parameters
+# Strategy & Footprint Parameters
 LOOKBACK_SWING = 3
-MIN_BASE_TESTS = 2
-BASE_TEST_TOLERANCE = 0.03
-BASE_BREAK_TOLERANCE = 0.015
 MIN_BREAK_BUFFER_PCT = 0.01
-MIN_UP_DOWN_VOL_RATIO = 1.25  # Base accumulation: green month vol / red month vol
-MIN_CLV = 0.65  # Strong close near candle high on breakout month
-SMA_PERIOD = 10  # 10-Month SMA bull regime filter
+BASE_BREAK_TOLERANCE = 0.02
+MIN_DAILY_VOL_RATIO = 1.15  # Daily up-day vol / down-day vol during pullback
+MIN_AVG_DAILY_CLV = 0.48  # Avg daily close position in range during pullback
 STOP_LOSS_PCT = 0.06
 TAKE_PROFIT_PCT = 0.12
 EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
@@ -50,43 +46,83 @@ except Exception as e:
 
 
 # -------------------------------------------------------------
-# 2. DETECT SWING -> BASE FLOOR (>=2 TESTS) + BULL MATH
+# 2. DAILY FOOTPRINT CHECK INSIDE PULLBACK WINDOW
 # -------------------------------------------------------------
-def check_bull_base_2test_breakout(opens, highs, lows, closes, volumes, sma10, sig_idx):
+def check_daily_pullback_footprint(daily_df, start_dt, end_dt, base_floor):
   """
-  1. Swing high `swing_val` at `s_idx` (< sig_idx)
-  2. Base floor `base_floor` in `[s_idx + 1, sig_idx - 1]` with >= 2 distinct tests
-     and no breakdown close below `base_floor * (1 - BASE_BREAK_TOLERANCE)`
-  3. Bull Math:
-     - Base accumulation volume: `up_vol / down_vol >= MIN_UP_DOWN_VOL_RATIO`
-     - Trend regime: `closes[sig_idx] > sma10[sig_idx]`
-     - Breakout candle CLV: `(close - low) / (high - low) >= MIN_CLV`
-  4. Breakout close: `closes[sig_idx] >= swing_val * (1 + MIN_BREAK_BUFFER_PCT)`
+  Inspects daily candles strictly between `start_dt` and `end_dt` (no lookahead
+  past `end_dt`, i.e., end of pullback month before breakout month):
+  - Checks no daily close breakdown below `base_floor * (1 - BASE_BREAK_TOLERANCE)`
+  - Computes daily Up-Day Volume / Down-Day Volume ratio
+  - Computes average daily CLV to see dip absorption / rejection of lows
   """
-  min_req = max(LOOKBACK_SWING * 2 + 4, SMA_PERIOD + 2)
-  if sig_idx < min_req:
-    return False, None, None, 0, None, None
+  if daily_df is None or daily_df.empty:
+    return False, None, None
 
-  if np.isnan(sma10[sig_idx]) or sma10[sig_idx] <= 0:
-    return False, None, None, 0, None, None
+  sub = daily_df.loc[
+      (daily_df.index >= start_dt) & (daily_df.index <= end_dt)
+  ]
+  if len(sub) < 10:
+    return False, None, None
 
-  # Bull trend filter: stock above 10-Month SMA
-  if float(closes[sig_idx]) <= float(sma10[sig_idx]):
-    return False, None, None, 0, None, None
+  d_opens = sub["Open"].values.astype(float)
+  d_highs = sub["High"].values.astype(float)
+  d_lows = sub["Low"].values.astype(float)
+  d_closes = sub["Close"].values.astype(float)
+  d_vols = (
+      sub["Volume"].values.astype(float)
+      if "Volume" in sub.columns
+      else np.full(len(sub), np.nan)
+  )
 
-  # Breakout candle CLV check
-  c_high = float(highs[sig_idx])
-  c_low = float(lows[sig_idx])
+  # Ensure daily closes didn't break base floor
+  if np.any(d_closes < base_floor * (1.0 - BASE_BREAK_TOLERANCE)):
+    return False, None, None
+
+  # Volume accumulation on daily pullback
+  valid_v = ~np.isnan(d_vols) & (d_vols > 0)
+  if np.sum(valid_v) < 8:
+    return False, None, None
+
+  vo = d_opens[valid_v]
+  vc = d_closes[valid_v]
+  vv = d_vols[valid_v]
+
+  up_vol = float(np.sum(vv[vc >= vo]))
+  down_vol = float(np.sum(vv[vc < vo]))
+  if down_vol <= 0:
+    return False, None, None
+
+  vol_ratio = up_vol / down_vol
+  if vol_ratio < MIN_DAILY_VOL_RATIO:
+    return False, None, None
+
+  # Average daily CLV (dip absorption check)
+  spans = d_highs - d_lows
+  valid_span = spans > 0
+  if np.sum(valid_span) < 5:
+    return False, None, None
+
+  clvs = (d_closes[valid_span] - d_lows[valid_span]) / spans[valid_span]
+  avg_clv = float(np.mean(clvs))
+  if avg_clv < MIN_AVG_DAILY_CLV:
+    return False, None, None
+
+  return True, round(vol_ratio, 2), round(avg_clv, 2)
+
+
+# -------------------------------------------------------------
+# 3. FIND MONTHLY SWING HIGH + PULLBACK + BREAKOUT SIGNAL
+# -------------------------------------------------------------
+def find_monthly_swing_pullback_breakout(
+    monthly_df, daily_df, highs, lows, closes, sig_idx
+):
+  if sig_idx < LOOKBACK_SWING * 2 + 4:
+    return False, None, None, None, None
+
   c_close = float(closes[sig_idx])
-  candle_span = c_high - c_low
-  if candle_span <= 0:
-    return False, None, None, 0, None, None
 
-  clv = (c_close - c_low) / candle_span
-  if clv < MIN_CLV:
-    return False, None, None, 0, None, None
-
-  for s_idx in range(sig_idx - 3, LOOKBACK_SWING, -1):
+  for s_idx in range(sig_idx - 2, LOOKBACK_SWING, -1):
     swing_val = float(highs[s_idx])
     if swing_val <= 0:
       continue
@@ -106,9 +142,10 @@ def check_bull_base_2test_breakout(opens, highs, lows, closes, volumes, sma10, s
     if any(highs[k] > swing_val for k in range(s_idx + 1, sig_idx)):
       continue
 
-    post_lows = lows[s_idx + 1 : sig_idx]
+    # Must have pullback below `swing_val` after `s_idx`
     post_closes = closes[s_idx + 1 : sig_idx]
-    if len(post_lows) < 3:
+    post_lows = lows[s_idx + 1 : sig_idx]
+    if len(post_closes) < 1 or not np.any(post_closes < swing_val):
       continue
 
     base_floor = float(np.min(post_lows))
@@ -118,104 +155,85 @@ def check_bull_base_2test_breakout(opens, highs, lows, closes, volumes, sma10, s
     if ((swing_val - base_floor) / base_floor) * 100.0 > 85.0:
       continue
 
-    if np.any(post_closes < base_floor * (1.0 - BASE_BREAK_TOLERANCE)):
-      continue
-    if c_close < base_floor * (1.0 - BASE_BREAK_TOLERANCE):
-      continue
-
-    # Count distinct monthly tests of `base_floor`
-    test_zone_high = base_floor * (1.0 + BASE_TEST_TOLERANCE)
-    test_indices = []
-    for k in range(s_idx + 1, sig_idx):
-      if lows[k] <= test_zone_high:
-        if not test_indices or (k - test_indices[-1]) >= 2:
-          test_indices.append(k)
-        else:
-          if lows[k] < lows[test_indices[-1]]:
-            test_indices[-1] = k
-
-    test_count = len(test_indices)
-    if test_count < MIN_BASE_TESTS:
+    # Breakout confirmation on completed month `sig_idx`
+    if c_close < swing_val * (1.0 + MIN_BREAK_BUFFER_PCT):
       continue
 
-    # Up-Volume vs Down-Volume ratio across post-swing base window
-    base_slice = slice(s_idx + 1, sig_idx)
-    b_opens = opens[base_slice]
-    b_closes = closes[base_slice]
-    b_vols = volumes[base_slice]
+    # Pullback date window: from start of month `s_idx + 1` to end of month `sig_idx - 1`
+    pb_start_dt = monthly_df.index[s_idx + 1]
+    pb_end_month_start = monthly_df.index[sig_idx]
+    pb_end_dt = pb_end_month_start - pd.Timedelta(days=1)
 
-    valid_vol_mask = ~np.isnan(b_vols) & (b_vols > 0)
-    if np.sum(valid_vol_mask) < 2:
-      continue
-
-    v_opens = b_opens[valid_vol_mask]
-    v_closes = b_closes[valid_vol_mask]
-    v_vols = b_vols[valid_vol_mask]
-
-    up_vol = float(np.sum(v_vols[v_closes >= v_opens]))
-    down_vol = float(np.sum(v_vols[v_closes < v_opens]))
-
-    if down_vol <= 0:
-      continue
-
-    vol_ratio = up_vol / down_vol
-    if vol_ratio < MIN_UP_DOWN_VOL_RATIO:
-      continue
-
-    # Breakout close above swing high
-    if c_close >= swing_val * (1.0 + MIN_BREAK_BUFFER_PCT):
+    ok_daily, d_vol_ratio, d_avg_clv = check_daily_pullback_footprint(
+        daily_df, pb_start_dt, pb_end_dt, base_floor
+    )
+    if ok_daily:
       return (
           True,
           round(swing_val, 2),
           round(base_floor, 2),
-          test_count,
-          round(vol_ratio, 2),
-          round(clv, 2),
+          d_vol_ratio,
+          d_avg_clv,
       )
 
-  return False, None, None, 0, None, None
+  return False, None, None, None, None
 
 
 # -------------------------------------------------------------
-# 3. BACKTEST ENGINE (SIGNAL AT `i-1` CLOSE -> ENTRY AT `i` OPEN)
+# 4. BACKTEST ENGINE (NO LOOKAHEAD, CONSERVATIVE SL CHECK)
 # -------------------------------------------------------------
-def backtest_bull_base_2test(symbol):
+def backtest_monthly_daily_pullback(symbol):
   trades = []
   try:
     clean_sym = symbol.replace(".NS", "").strip().upper()
     ticker_symbol = f"{clean_sym}.NS"
 
-    df = yf.download(
+    m_df = yf.download(
         ticker_symbol,
-        start="2012-01-01",
+        start="2015-01-01",
         interval="1mo",
         auto_adjust=False,
         progress=False,
     )
-
-    if df is None or df.empty or len(df) < 18:
+    if m_df is None or m_df.empty or len(m_df) < 14:
       return trades
 
-    if isinstance(df.columns, pd.MultiIndex):
-      df.columns = df.columns.get_level_values(0)
-
-    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < 18:
+    if isinstance(m_df.columns, pd.MultiIndex):
+      m_df.columns = m_df.columns.get_level_values(0)
+    m_df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if len(m_df) < 14:
       return trades
 
-    df["SMA10"] = df["Close"].rolling(window=SMA_PERIOD).mean()
-
-    opens = df["Open"].values.astype(float)
-    highs = df["High"].values.astype(float)
-    lows = df["Low"].values.astype(float)
-    closes = df["Close"].values.astype(float)
-    volumes = (
-        df["Volume"].values.astype(float)
-        if "Volume" in df.columns
-        else np.full(len(df), np.nan)
+    d_df = yf.download(
+        ticker_symbol,
+        start="2015-01-01",
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
     )
-    sma10 = df["SMA10"].values.astype(float)
-    n = len(df)
+    if d_df is None or d_df.empty:
+      return trades
+
+    if isinstance(d_df.columns, pd.MultiIndex):
+      d_df.columns = d_df.columns.get_level_values(0)
+    d_df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    if d_df.empty:
+      return trades
+
+    # Normalize timezone-naive timestamps for safe slicing
+    m_idx = pd.to_datetime(m_df.index).tz_localize(None)
+    m_df = m_df.copy()
+    m_df.index = m_idx
+
+    d_idx = pd.to_datetime(d_df.index).tz_localize(None)
+    d_df = d_df.copy()
+    d_df.index = d_idx
+
+    opens = m_df["Open"].values.astype(float)
+    highs = m_df["High"].values.astype(float)
+    lows = m_df["Low"].values.astype(float)
+    closes = m_df["Close"].values.astype(float)
+    n = len(m_df)
 
     in_trade = False
     entry_price = 0.0
@@ -226,9 +244,8 @@ def backtest_bull_base_2test(symbol):
     pending_trade = None
     last_entry_idx = -99
 
-    start_loop = max(LOOKBACK_SWING * 2 + 5, SMA_PERIOD + 3)
-    for i in range(start_loop, n):
-      current_date = df.index[i]
+    for i in range(LOOKBACK_SWING * 2 + 4, n):
+      current_date = m_df.index[i]
       curr_open = float(opens[i])
       curr_high = float(highs[i])
       curr_low = float(lows[i])
@@ -263,9 +280,8 @@ def backtest_bull_base_2test(symbol):
                 "Entry_Open": round(entry_price, 2),
                 "Base_Floor": b_floor,
                 "Swing_High": s_high,
-                "Base_Tests": b_tests,
-                "Vol_Ratio": v_ratio,
-                "CLV": c_clv,
+                "Daily_Vol_Ratio": d_vr,
+                "Daily_Avg_CLV": d_clv,
                 "Max_Profit_%": round(max_profit_pct, 2),
                 "Result": "WIN" if is_win else "LOSS",
                 "PnL_%": round(pnl_pct, 2),
@@ -274,7 +290,7 @@ def backtest_bull_base_2test(symbol):
         continue
 
       if pending_trade is not None:
-        s_high, b_floor, b_tests, v_ratio, c_clv, sig_month_str = pending_trade
+        s_high, b_floor, d_vr, d_clv, sig_month_str = pending_trade
         pending_trade = None
 
         if curr_open > 0 and (i - last_entry_idx) >= 3:
@@ -312,9 +328,8 @@ def backtest_bull_base_2test(symbol):
                   "Entry_Open": round(entry_price, 2),
                   "Base_Floor": b_floor,
                   "Swing_High": s_high,
-                  "Base_Tests": b_tests,
-                  "Vol_Ratio": v_ratio,
-                  "CLV": c_clv,
+                  "Daily_Vol_Ratio": d_vr,
+                  "Daily_Avg_CLV": d_clv,
                   "Max_Profit_%": round(max_profit_pct, 2),
                   "Result": "WIN" if is_win else "LOSS",
                   "PnL_%": round(pnl_pct, 2),
@@ -323,19 +338,16 @@ def backtest_bull_base_2test(symbol):
         continue
 
       if i + 1 < n and (i - last_entry_idx) >= 3:
-        ok, s_high, b_floor, b_tests, v_ratio, c_clv = (
-            check_bull_base_2test_breakout(
-                opens, highs, lows, closes, volumes, sma10, i
-            )
+        ok, s_high, b_floor, d_vr, d_clv = find_monthly_swing_pullback_breakout(
+            m_df, d_df, highs, lows, closes, i
         )
         if ok:
           pending_trade = (
               s_high,
               b_floor,
-              b_tests,
-              v_ratio,
-              c_clv,
-              df.index[i].strftime("%b %Y"),
+              d_vr,
+              d_clv,
+              m_df.index[i].strftime("%b %Y"),
           )
 
     return trades
@@ -345,12 +357,12 @@ def backtest_bull_base_2test(symbol):
 
 
 # -------------------------------------------------------------
-# 4. RUN & EXPORT TO GOOGLE SHEET
+# 5. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_bull_base_2test(sym)
+    t = backtest_monthly_daily_pullback(sym)
     if t:
       all_trades.extend(t)
 
@@ -365,7 +377,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print(f"\n=======================================================")
-  print(f" BASE (>=2 TESTS) + BULL MATH RESULTS (2025-2026)")
+  print(f" MONTHLY SWING + DAILY PULLBACK FOOTPRINT (2025-2026)")
   print(f"=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {total - wins}")
@@ -373,7 +385,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print(f"=======================================================")
 
-  tab_name = "BASE_2TEST_BULL_MATH_LOG"
+  tab_name = "MONTHLY_DAILY_PULLBACK_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -382,7 +394,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BASE (>=2 TESTS) + BULL MATH LOG (2025-2026) |"
+        "MONTHLY SWING + DAILY PULLBACK FOOTPRINT LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row(list(df_res.columns))
