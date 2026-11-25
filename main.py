@@ -8,257 +8,229 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER MONTHLY SWING + COMPACT RANGE BREAKOUT ===")
-
-# Strategy Parameters
-LOOKBACK_SWING = 3
-MIN_BREAK_BUFFER_PCT = 0.01
-MAX_BREAK_EXTENSION_PCT = 0.12  # Breakout candle zyada bhagi na ho (Close vs Swing_High)
-BASE_BREAK_TOLERANCE = 0.02
-STOP_LOSS_PCT = 0.06
-TAKE_PROFIT_PCT = 0.12
-EXCLUDE_KEYWORDS = ("BEES", "ETF", "GOLD", "SILVER", "NIFTY", "SENSEX")
+print(
+    "=== CTD_SNIPER MONTHLY OPEN STRATEGY BACKTEST (NO 2% FILTER + PEAK"
+    " BEFORE SL) ==="
+)
 
 # -------------------------------------------------------------
-# 1. GOOGLE SHEETS CONNECTION & CLEAN WATCHLIST LOAD
+# 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
 # -------------------------------------------------------------
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
   raw = sh.worksheet("Watchlist").col_values(1)
-  STOCKS = []
-  for s in raw:
-    sym = s.strip().upper()
-    if (
-        sym
-        and len(sym) > 2
-        and sym not in ["STOCK", "SYMBOL"]
-        and not any(k in sym for k in EXCLUDE_KEYWORDS)
-    ):
-      STOCKS.append(sym)
-  print(f"✅ Loaded {len(STOCKS)} clean stocks from Watchlist.")
+  STOCKS = [
+      s.strip().upper()
+      for s in raw
+      if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
+  ]
+  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
 
 
 # -------------------------------------------------------------
-# 2. MONTHLY SWING + COMPACT BREAKOUT SIGNAL CHECK
+# 2. MONTHLY BACKTEST ENGINE (NO 2% BUFFER + PEAK BEFORE SL)
 # -------------------------------------------------------------
-def find_compact_monthly_breakout(highs, lows, closes, sig_idx):
-  if sig_idx < LOOKBACK_SWING * 2 + 4:
-    return False, None, None, None
-
-  c_high = float(highs[sig_idx])
-  c_low = float(lows[sig_idx])
-  c_close = float(closes[sig_idx])
-  brk_range = c_high - c_low
-
-  if brk_range <= 0:
-    return False, None, None, None
-
-  for s_idx in range(sig_idx - 2, LOOKBACK_SWING, -1):
-    swing_val = float(highs[s_idx])
-    if swing_val <= 0:
-      continue
-
-    # Clean swing high check
-    left_ok = all(
-        swing_val >= highs[k]
-        for k in range(max(0, s_idx - LOOKBACK_SWING), s_idx)
-    )
-    right_ok = all(
-        swing_val >= highs[k]
-        for k in range(s_idx + 1, min(sig_idx, s_idx + LOOKBACK_SWING + 1))
-    )
-    if not (left_ok and right_ok):
-      continue
-
-    # Swing high was not already broken before sig_idx
-    if any(highs[k] > swing_val for k in range(s_idx + 1, sig_idx)):
-      continue
-
-    # Correction/pullback phase between s_idx + 1 and sig_idx - 1
-    corr_highs = highs[s_idx + 1 : sig_idx]
-    corr_lows = lows[s_idx + 1 : sig_idx]
-    corr_closes = closes[s_idx + 1 : sig_idx]
-
-    if len(corr_closes) < 1 or not np.any(corr_closes < swing_val):
-      continue
-
-    base_floor = float(np.min(corr_lows))
-    if base_floor <= 0 or swing_val <= base_floor:
-      continue
-
-    # Correction candles' ranges
-    corr_ranges = corr_highs - corr_lows
-    if len(corr_ranges) == 0:
-      continue
-    max_corr_range = float(np.max(corr_ranges))
-
-    # Breakout candle range correction ke kisi bhi candle se badi na ho
-    if brk_range > max_corr_range:
-      continue
-
-    # Breakout confirmation + zyada bhaga hua na ho
-    if c_close < swing_val * (1.0 + MIN_BREAK_BUFFER_PCT):
-      continue
-    if c_close > swing_val * (1.0 + MAX_BREAK_EXTENSION_PCT):
-      continue
-
-    return (
-        True,
-        round(swing_val, 2),
-        round(base_floor, 2),
-        round((brk_range / max_corr_range), 2),
-    )
-
-  return False, None, None, None
-
-
-# -------------------------------------------------------------
-# 3. BACKTEST ENGINE (NO LOOKAHEAD, CONSERVATIVE SL CHECK)
-# -------------------------------------------------------------
-def backtest_compact_breakout(symbol):
+def backtest_monthly_no_2pct(
+    symbol,
+    min_consolidation_months=3,
+    stop_loss_pct=0.07,
+    take_profit_pct=0.14,
+    min_breakout_pct=0.0,
+):
   trades = []
   try:
-    clean_sym = symbol.replace(".NS", "").strip().upper()
-    ticker_symbol = f"{clean_sym}.NS"
-
+    ticker_symbol = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df = yf.download(
         ticker_symbol,
-        start="2015-01-01",
+        start="2012-01-01",
         interval="1mo",
         auto_adjust=False,
         progress=False,
     )
-    if df is None or df.empty or len(df) < 14:
+
+    if df is None or df.empty or len(df) < 30:
       return trades
 
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = df.columns.get_level_values(0)
+
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    if len(df) < 14:
+    if len(df) < min_consolidation_months * 2 + 4:
       return trades
 
-    idx = pd.to_datetime(df.index).tz_localize(None)
-    opens = df["Open"].values.astype(float)
-    highs = df["High"].values.astype(float)
-    lows = df["Low"].values.astype(float)
-    closes = df["Close"].values.astype(float)
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    opens = df["Open"].values
     n = len(df)
 
+    df["Range_Pct"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
+    ranges = df["Range_Pct"].values
+
     in_trade = False
+    pending_entry = False
     entry_price = 0.0
     stop_loss = 0.0
     take_profit = 0.0
     entry_date = None
     max_price_reached = 0.0
-    pending_trade = None
-    last_entry_idx = -99
 
-    for i in range(LOOKBACK_SWING * 2 + 4, n):
-      current_date = idx[i]
-      curr_open = float(opens[i])
+    for i in range(min_consolidation_months * 2 + 3, n):
+      current_date = df.index[i]
+      curr_close = float(closes[i])
       curr_high = float(highs[i])
       curr_low = float(lows[i])
+      curr_open = float(opens[i])
+      curr_range = float(ranges[i])
 
       if in_trade:
-        if curr_high > max_price_reached:
-          max_price_reached = curr_high
-
-        if curr_low <= stop_loss or curr_high >= take_profit:
-          if curr_low <= stop_loss and curr_high >= take_profit:
-            is_win = False
-          else:
-            is_win = curr_high >= take_profit
-
-          pnl_pct = (
-              ((take_profit - entry_price) / entry_price) * 100.0
-              if is_win
-              else ((stop_loss - entry_price) / entry_price) * 100.0
-          )
-          max_profit_pct = (
+        # SL hit hone se pehle ka peak track karein
+        if curr_low <= stop_loss:
+          # Agar SL hit hone se pehle current candle ka high SL se upar tha
+          peak_before_sl_pct = (
               ((max_price_reached - entry_price) / entry_price) * 100.0
           )
+          max_profit_pct = peak_before_sl_pct
+          pnl_pct = ((stop_loss - entry_price) / entry_price) * 100.0
 
           if entry_date.year in [2025, 2026] or current_date.year in [
               2025,
               2026,
           ]:
             trades.append({
-                "Symbol": clean_sym,
-                "Signal_Month": sig_month_str,
+                "Symbol": symbol,
                 "Entry_Date": entry_date.strftime("%b %Y"),
-                "Entry_Open": round(entry_price, 2),
-                "Base_Floor": b_floor,
-                "Swing_High": s_high,
-                "Range_Ratio": r_ratio,
+                "Entry_Price": round(entry_price, 2),
                 "Max_Profit_%": round(max_profit_pct, 2),
-                "Result": "WIN" if is_win else "LOSS",
+                "Peak_Before_SL_%": round(peak_before_sl_pct, 2),
+                "Result": "LOSS",
+                "PnL_%": round(pnl_pct, 2),
+            })
+          in_trade = False
+          continue
+
+        if curr_high > max_price_reached:
+          max_price_reached = curr_high
+
+        if curr_high >= take_profit:
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100.0
+          pnl_pct = ((take_profit - entry_price) / entry_price) * 100.0
+
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
+            trades.append({
+                "Symbol": symbol,
+                "Entry_Date": entry_date.strftime("%b %Y"),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Peak_Before_SL_%": "",
+                "Result": "WIN",
                 "PnL_%": round(pnl_pct, 2),
             })
           in_trade = False
         continue
 
-      if pending_trade is not None:
-        s_high, b_floor, r_ratio, sig_month_str = pending_trade
-        pending_trade = None
+      if pending_entry:
+        entry_price = curr_open
+        stop_loss = entry_price * (1.0 - stop_loss_pct)
+        take_profit = entry_price * (1.0 + take_profit_pct)
+        entry_date = current_date
+        max_price_reached = curr_high
+        in_trade = True
+        pending_entry = False
 
-        if curr_open > 0 and (i - last_entry_idx) >= 3:
-          entry_price = curr_open
-          stop_loss = entry_price * (1.0 - STOP_LOSS_PCT)
-          take_profit = entry_price * (1.0 + TAKE_PROFIT_PCT)
-          entry_date = current_date
-          max_price_reached = curr_high
-          in_trade = True
-          last_entry_idx = i
-
-          if curr_low <= stop_loss or curr_high >= take_profit:
-            if curr_low <= stop_loss and curr_high >= take_profit:
-              is_win = False
-            else:
-              is_win = curr_high >= take_profit
-
-            pnl_pct = (
-                ((take_profit - entry_price) / entry_price) * 100.0
-                if is_win
-                else ((stop_loss - entry_price) / entry_price) * 100.0
-            )
-            max_profit_pct = (
-                ((max_price_reached - entry_price) / entry_price) * 100.0
-            )
-
-            if entry_date.year in [2025, 2026] or current_date.year in [
-                2025,
-                2026,
-            ]:
-              trades.append({
-                  "Symbol": clean_sym,
-                  "Signal_Month": sig_month_str,
-                  "Entry_Date": entry_date.strftime("%b %Y"),
-                  "Entry_Open": round(entry_price, 2),
-                  "Base_Floor": b_floor,
-                  "Swing_High": s_high,
-                  "Range_Ratio": r_ratio,
-                  "Max_Profit_%": round(max_profit_pct, 2),
-                  "Result": "WIN" if is_win else "LOSS",
-                  "PnL_%": round(pnl_pct, 2),
-              })
-            in_trade = False
+        # Entry month mein hi SL/TP check
+        if curr_low <= stop_loss:
+          peak_before_sl_pct = (
+              ((max_price_reached - entry_price) / entry_price) * 100.0
+          )
+          pnl_pct = ((stop_loss - entry_price) / entry_price) * 100.0
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
+            trades.append({
+                "Symbol": symbol,
+                "Entry_Date": entry_date.strftime("%b %Y"),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(peak_before_sl_pct, 2),
+                "Peak_Before_SL_%": round(peak_before_sl_pct, 2),
+                "Result": "LOSS",
+                "PnL_%": round(pnl_pct, 2),
+            })
+          in_trade = False
+        elif curr_high >= take_profit:
+          max_profit_pct = (
+              (max_price_reached - entry_price) / entry_price
+          ) * 100.0
+          pnl_pct = ((take_profit - entry_price) / entry_price) * 100.0
+          if entry_date.year in [2025, 2026] or current_date.year in [
+              2025,
+              2026,
+          ]:
+            trades.append({
+                "Symbol": symbol,
+                "Entry_Date": entry_date.strftime("%b %Y"),
+                "Entry_Price": round(entry_price, 2),
+                "Max_Profit_%": round(max_profit_pct, 2),
+                "Peak_Before_SL_%": "",
+                "Result": "WIN",
+                "PnL_%": round(pnl_pct, 2),
+            })
+          in_trade = False
         continue
 
-      if i + 1 < n and (i - last_entry_idx) >= 3:
-        ok, s_high, b_floor, r_ratio = find_compact_monthly_breakout(
-            highs, lows, closes, i
-        )
-        if ok:
-          pending_trade = (
-              s_high,
-              b_floor,
-              r_ratio,
-              idx[i].strftime("%b %Y"),
-          )
+      # Find True Swing High
+      active_resistance = None
+      resistance_index = -1
+
+      for j in range(
+          i - min_consolidation_months, min_consolidation_months - 1, -1
+      ):
+        is_valid_swing = True
+        for k in range(j - min_consolidation_months, j):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        for k in range(j + 1, j + min_consolidation_months + 1):
+          if highs[j] <= highs[k]:
+            is_valid_swing = False
+            break
+        if not is_valid_swing:
+          continue
+
+        ever_broken = False
+        for k in range(j + 1, i):
+          if highs[k] > highs[j]:
+            ever_broken = True
+            break
+        if ever_broken:
+          continue
+
+        active_resistance = float(highs[j])
+        resistance_index = j
+        break
+
+      # Breakout above Swing High (without strict >= 2% filter) + Post-Swing Range Filter
+      if (
+          active_resistance is not None
+          and active_resistance > 0
+          and curr_close > active_resistance * (1.0 + min_breakout_pct)
+      ):
+        post_swing_ranges = ranges[resistance_index + 1 : i]
+        if len(post_swing_ranges) > 0 and curr_range <= post_swing_ranges.max():
+          pending_entry = True
 
     return trades
 
@@ -267,51 +239,64 @@ def backtest_compact_breakout(symbol):
 
 
 # -------------------------------------------------------------
-# 4. RUN & EXPORT TO GOOGLE SHEET
+# 3. RUN & EXPORT TO GOOGLE SHEET
 # -------------------------------------------------------------
 all_trades = []
 if len(STOCKS) > 0:
   for sym in STOCKS:
-    t = backtest_compact_breakout(sym)
+    t = backtest_monthly_no_2pct(sym)
     if t:
       all_trades.extend(t)
 
 if len(all_trades) > 0:
   df_res = pd.DataFrame(all_trades)
-  df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
-  df_res = df_res.fillna("")
-
   total = len(df_res)
   wins = len(df_res[df_res["Result"] == "WIN"])
+  loss_df = df_res[df_res["Result"] == "LOSS"]
+  losses = len(loss_df)
   win_rate = round((wins / total) * 100, 2)
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
+  peak_vals = pd.to_numeric(loss_df["Peak_Before_SL_%"], errors="coerce").dropna()
+  min_peak_before_sl = round(float(peak_vals.min()), 2) if len(peak_vals) > 0 else None
+  avg_peak_before_sl = round(float(peak_vals.mean()), 2) if len(peak_vals) > 0 else None
+
   print(f"\n=======================================================")
-  print(f" MONTHLY SWING + COMPACT BREAKOUT (2025-2026)")
+  print(f" MONTHLY NO-2% BREAKOUT + RANGE RESULTS (2025-2026)")
   print(f"=======================================================")
-  print(f" Total Trades : {total}")
-  print(f" Wins         : {wins} | Losses: {total - wins}")
-  print(f" Win Rate     : {win_rate}%")
-  print(f" Total PnL    : {total_pnl}%")
+  print(f" Total Trades       : {total}")
+  print(f" Wins               : {wins} | Losses: {losses}")
+  print(f" Win Rate           : {win_rate}%")
+  print(f" Total PnL          : {total_pnl}%")
+  print(f" Min Peak Before SL : {min_peak_before_sl}%")
+  print(f" Avg Peak Before SL : {avg_peak_before_sl}%")
   print(f"=======================================================")
 
-  tab_name = "MONTHLY_COMPACT_BREAKOUT_LOG"
+  tab_name = "MONTHLY_NO2PCT_RANGE_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 2000, 12)
+        else sh.add_worksheet(tab_name, 2000, 10)
     )
     ws.clear()
     ws.append_row([
-        "MONTHLY SWING + COMPACT BREAKOUT LOG (2025-2026) |"
+        "MONTHLY NO-2% BREAKOUT + RANGE LOG (2025-2026) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
-    ws.append_row(list(df_res.columns))
+    ws.append_row([
+        "Symbol",
+        "Entry Date",
+        "Entry Price",
+        "Max Profit %",
+        "Peak Before SL %",
+        "Result",
+        "PnL %",
+    ])
     ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
     print(f"✅ Data successfully saved to '{tab_name}' tab in Google Sheet!")
   except Exception as e:
-    print(f"❌ Sheet update error: {e}")
+    print(f"Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
+  
