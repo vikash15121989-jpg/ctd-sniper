@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER LIQUIDITY FILTER (>= 2 CR TURNOVER) + M-TO-D DZ BACKTEST ===")
+print("=== CTD_SNIPER 2-PAGE LIVE SCANNER (FRESH CROSS & CORRECTION TO DZ) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -28,22 +28,24 @@ except Exception as e:
   STOCKS = []
 
 
-def get_first_break_monthly_swings(df_m, lookback=3, max_age_days=730):
-  """Finds recent monthly swing highs and records ONLY their FIRST breakout month."""
+def get_monthly_swings_state(df_m, lookback=3, max_age_days=730):
+  """
+    Finds recent monthly swing highs and tracks their FIRST breakout:
+    - If first breakout happened in the current month or previous month -> FRESH_CROSS
+    - If first breakout happened earlier (and is the latest active swing) -> BROKEN_ACTIVE
+    """
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
   n = len(df_m)
   if n < (lookback * 2 + 2):
-    return []
+    return None, None
 
   last_dt = dates[-1]
-  swings = []
-  consumed_swing_indices = set()
+  fresh_cross = None
+  older_broken = None
 
   for j in range(lookback, n - lookback):
-    if j in consumed_swing_indices:
-      continue
     if (last_dt - dates[j]).days > max_age_days:
       continue
 
@@ -55,39 +57,39 @@ def get_first_break_monthly_swings(df_m, lookback=3, max_age_days=730):
     if not (left_ok and right_ok):
       continue
 
+    # First monthly close above swing high `val`
+    break_idx = None
     for k in range(j + 1, n):
       if float(closes[k]) > val:
-        consumed_swing_indices.add(j)
-        next_break_dt = dates[k + 1] if (k + 1) < n else None
-        swings.append({
-            "swing_idx": j,
-            "swing_date": dates[j],
-            "level": val,
-            "break_month_start": dates[k],
-            "window_end": next_break_dt,
-        })
+        break_idx = k
         break
 
-  return swings[-2:]
+    if break_idx is not None:
+      info = {
+          "swing_date": dates[j],
+          "level": val,
+          "break_idx": break_idx,
+          "break_month_start": dates[break_idx],
+      }
+      # If first breakout is in the latest 2 monthly bars (current or just-closed month)
+      if break_idx >= (n - 2):
+        fresh_cross = info
+      else:
+        older_broken = info
+
+  return fresh_cross, older_broken
 
 
-def find_post_break_demand_zone(df_d, start_dt, end_dt, level):
-  """Finds a clean post-breakout base + bullish leg-out within this single break window."""
-  if end_dt is not None:
-    sub = df_d[(df_d.index >= start_dt) & (df_d.index < end_dt)]
-  else:
-    sub = df_d[df_d.index >= start_dt]
-
-  if len(sub) < 5:
-    return None, sub
+def find_post_break_demand_zone(df_d, start_dt, level):
+  """Finds the clean post-breakout Daily Demand Zone."""
+  sub = df_d[df_d.index >= start_dt]
+  if len(sub) < 4:
+    return None
 
   opens = sub["Open"].values
   highs = sub["High"].values
   lows = sub["Low"].values
   closes = sub["Close"].values
-
-  if not any(float(closes[k]) > level for k in range(len(sub))):
-    return None, sub
 
   for i in range(1, len(sub) - 2):
     if float(closes[i]) <= level:
@@ -106,16 +108,15 @@ def find_post_break_demand_zone(df_d, start_dt, end_dt, level):
     ):
       dz_low = float(lows[i])
       dz_high = max(float(opens[i]), float(closes[i]), float(highs[i]))
-      return (dz_low, dz_high, i + 1), sub
+      return dz_low, dz_high, sub.index[i + 1]
 
-  return None, sub
+  return None
 
 
-def backtest_liquid_2cr(symbol, rr_ratio=2.0, min_turnover=20_000_000):
-  """
-    min_turnover = 20,000,000 INR (2 Crore) 20-day average daily turnover.
-    """
-  trades = []
+def scan_stock_two_pages(symbol, min_turnover=20_000_000):
+  page1_row = None
+  page2_row = None
+
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
     df_m = yf.download(
@@ -134,7 +135,7 @@ def backtest_liquid_2cr(symbol, rr_ratio=2.0, min_turnover=20_000_000):
     )
 
     if df_m is None or df_d is None or df_m.empty or df_d.empty:
-      return trades
+      return None, None
     if isinstance(df_m.columns, pd.MultiIndex):
       df_m.columns = df_m.columns.get_level_values(0)
     if isinstance(df_d.columns, pd.MultiIndex):
@@ -143,177 +144,192 @@ def backtest_liquid_2cr(symbol, rr_ratio=2.0, min_turnover=20_000_000):
     df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
     if len(df_d) < 205:
-      return trades
+      return None, None
 
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    # Quick check: skip stock entirely if its recent 20-day avg turnover is below 2 Cr
-    recent_avg_to = float(df_d["Avg_Turnover_20D"].iloc[-1])
-    if np.isnan(recent_avg_to) or recent_avg_to < min_turnover:
-      return trades
+    cmp = float(df_d["Close"].iloc[-1])
+    day_low = float(df_d["Low"].iloc[-1])
+    day_high = float(df_d["High"].iloc[-1])
+    ema200 = float(df_d["EMA200"].iloc[-1])
+    avg_to = float(df_d["Avg_Turnover_20D"].iloc[-1])
+    last_date_str = df_d.index[-1].strftime("%Y-%m-%d")
 
-    swings = get_first_break_monthly_swings(
+    if np.isnan(avg_to) or avg_to < min_turnover or cmp <= ema200:
+      return None, None
+
+    avg_to_cr = round(avg_to / 10_000_000.0, 2)
+    tv_link = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+
+    fresh_cross, older_broken = get_monthly_swings_state(
         df_m, lookback=3, max_age_days=730
     )
-    used_zones = set()
 
-    for sw in swings:
-      dz, sub = find_post_break_demand_zone(
-          df_d, sw["break_month_start"], sw["window_end"], sw["level"]
+    # ---------------------------------------------------------
+    # PAGE 1: ABHI-ABHI MONTHLY SWING HIGH CROSS KAR RAHA HAI
+    # ---------------------------------------------------------
+    if fresh_cross is not None:
+      sw_lvl = fresh_cross["level"]
+      above_swing_pct = round(((cmp - sw_lvl) / sw_lvl) * 100.0, 2)
+      dz = find_post_break_demand_zone(
+          df_d, fresh_cross["break_month_start"], sw_lvl
       )
-      if dz is None:
-        continue
+      dz_status = (
+          f"DZ Ready ({round(dz[0],2)}-{round(dz[1],2)})"
+          if dz is not None
+          else "Waiting for Daily DZ"
+      )
 
-      dz_low, dz_high, formed_pos = dz
-      zone_key = (round(dz_low, 2), round(dz_high, 2))
-      if zone_key in used_zones:
-        continue
+      page1_row = {
+          "Symbol": symbol,
+          "Date": last_date_str,
+          "Turnover_Cr": avg_to_cr,
+          "Swing_Date": fresh_cross["swing_date"].strftime("%Y-%m"),
+          "Swing_High": round(sw_lvl, 2),
+          "Break_Month": fresh_cross["break_month_start"].strftime("%Y-%m"),
+          "CMP": round(cmp, 2),
+          "Above_Swing_%": above_swing_pct,
+          "DZ_Status": dz_status,
+          "TV_Chart": tv_link,
+      }
 
-      highs = sub["High"].values
-      lows = sub["Low"].values
-      closes = sub["Close"].values
-      ema200 = sub["EMA200"].values
-      avg_to = sub["Avg_Turnover_20D"].values
-      dates = sub.index
+    # ---------------------------------------------------------
+    # PAGE 2: CROSS KAR KE CORRECTION KAR RAHA + DZ SE DOORI
+    # ---------------------------------------------------------
+    target_sw = older_broken if older_broken is not None else fresh_cross
+    if target_sw is not None:
+      sw_lvl = target_sw["level"]
+      dz = find_post_break_demand_zone(
+          df_d, target_sw["break_month_start"], sw_lvl
+      )
+      if dz is not None:
+        dz_low, dz_high, dz_dt = dz
+        sub_after_dz = df_d[df_d.index > dz_dt]
+        if len(sub_after_dz) >= 1:
+          peak_after_dz = float(sub_after_dz["High"].max())
+          # Must be correcting from post-DZ peak and still above DZ low
+          is_correcting = (cmp < peak_after_dz) and (cmp >= dz_low * 0.99)
 
-      in_trade = False
-      entry_price = 0.0
-      sl_price = 0.0
-      tp_price = 0.0
-      entry_dt = None
-      entry_to_cr = 0.0
+          if is_correcting:
+            # Distance from DZ top (`dz_high`)
+            if day_low <= dz_high and day_high >= dz_low:
+              dist_pct = 0.0
+              zone_state = "INSIDE ZONE (ENTRY READY)"
+            elif cmp > dz_high:
+              dist_pct = round(((cmp - dz_high) / cmp) * 100.0, 2)
+              zone_state = f"{dist_pct}% Above DZ"
+            else:
+              dist_pct = round(((cmp - dz_low) / dz_low) * 100.0, 2)
+              zone_state = "At DZ Bottom"
 
-      for k in range(max(formed_pos + 1, 1), len(sub)):
-        d_high = float(highs[k])
-        d_low = float(lows[k])
-        d_close = float(closes[k])
-        d_ema200 = float(ema200[k])
-        d_avg_to = float(avg_to[k])
-        curr_dt = dates[k]
+            sl_price = round(dz_low * 0.99, 2)
+            risk_pts = cmp - sl_price
+            tp_price = round(cmp + (2.0 * risk_pts), 2) if risk_pts > 0 else 0.0
 
-        if in_trade:
-          if d_low <= sl_price:
-            pnl = ((sl_price - entry_price) / entry_price) * 100.0
-            trades.append({
+            page2_row = {
                 "Symbol": symbol,
-                "Avg_Turnover_Cr": round(entry_to_cr, 2),
-                "Monthly_Swing": round(sw["level"], 2),
-                "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
+                "Date": last_date_str,
+                "Turnover_Cr": avg_to_cr,
+                "Swing_High": round(sw_lvl, 2),
+                "Break_Month": target_sw["break_month_start"].strftime("%Y-%m"),
                 "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "SL_Price": round(sl_price, 2),
-                "TP_Price": round(tp_price, 2),
-                "Result": "LOSS",
-                "PnL_%": round(pnl, 2),
-            })
-            in_trade = False
-            break
+                "CMP": round(cmp, 2),
+                "Dist_From_DZ_%": dist_pct,
+                "Zone_Status": zone_state,
+                "SL_Price": sl_price,
+                "TP_1to2": tp_price,
+                "TV_Chart": tv_link,
+            }
 
-          if d_high >= tp_price:
-            pnl = ((tp_price - entry_price) / entry_price) * 100.0
-            trades.append({
-                "Symbol": symbol,
-                "Avg_Turnover_Cr": round(entry_to_cr, 2),
-                "Monthly_Swing": round(sw["level"], 2),
-                "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
-                "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "SL_Price": round(sl_price, 2),
-                "TP_Price": round(tp_price, 2),
-                "Result": "WIN",
-                "PnL_%": round(pnl, 2),
-            })
-            in_trade = False
-            break
-          continue
-
-        if np.isnan(d_avg_to) or d_avg_to < min_turnover:
-          continue
-
-        above_200_ema = d_close > d_ema200
-        touched_dz = (d_low <= dz_high) and (d_high >= dz_low)
-
-        if above_200_ema and touched_dz:
-          cand_sl = dz_low * 0.99
-          risk_pts = d_close - cand_sl
-          if risk_pts <= 0:
-            continue
-
-          used_zones.add(zone_key)
-          entry_to_cr = d_avg_to / 10_000_000.0
-          entry_price = d_close
-          sl_price = cand_sl
-          tp_price = entry_price + (rr_ratio * risk_pts)
-          entry_dt = curr_dt
-          in_trade = True
-
-    return trades
+    return page1_row, page2_row
   except Exception:
-    return []
+    return None, None
 
 
 # -------------------------------------------------------------
-# 2. RUN BACKTEST & EXPORT TO GOOGLE SHEET
+# 2. RUN SCANNER & WRITE BOTH PAGES TO GOOGLE SHEET
 # -------------------------------------------------------------
-all_trades = []
+p1_list = []
+p2_list = []
+
 for sym in STOCKS:
-  t = backtest_liquid_2cr(sym, rr_ratio=2.0, min_turnover=20_000_000)
-  if t:
-    all_trades.extend(t)
+  r1, r2 = scan_stock_two_pages(sym, min_turnover=20_000_000)
+  if r1 is not None:
+    p1_list.append(r1)
+  if r2 is not None:
+    p2_list.append(r2)
 
-if len(all_trades) > 0:
-  df_res = pd.DataFrame(all_trades)
-  total = len(df_res)
-  wins = len(df_res[df_res["Result"] == "WIN"])
-  losses = len(df_res[df_res["Result"] == "LOSS"])
-  win_rate = round((wins / total) * 100, 2)
-  total_pnl = round(df_res["PnL_%"].sum(), 2)
+now_str = datetime.now(IST).strftime("%d-%b-%Y %I:%M %p IST")
 
-  print("\n=======================================================")
-  print(" LIQUID (>= 2 CR TURNOVER) + M-TO-D DZ RESULTS")
-  print("=======================================================")
-  print(f" Total Trades : {total}")
-  print(f" Wins         : {wins} | Losses: {losses}")
-  print(f" Win Rate     : {win_rate}%")
-  print(f" Total PnL    : {total_pnl}%")
-  print("=======================================================")
+# Write Tab 1: 1_FRESH_SWING_CROSS
+try:
+  t1 = "1_FRESH_SWING_CROSS"
+  ws1 = (
+      sh.worksheet(t1)
+      if t1 in [x.title for x in sh.worksheets()]
+      else sh.add_worksheet(t1, 500, 12)
+  )
+  ws1.clear()
+  ws1.append_row([f"PAGE 1: FRESH MONTHLY SWING CROSS | Run: {now_str}"])
+  ws1.append_row([
+      "Symbol",
+      "Date",
+      "Turnover (Cr)",
+      "Swing Date",
+      "Swing High",
+      "Break Month",
+      "CMP",
+      "Above Swing %",
+      "DZ Status",
+      "TradingView Link",
+  ])
+  if p1_list:
+    df1 = pd.DataFrame(p1_list).sort_values(by="Above_Swing_%", ascending=True)
+    ws1.append_rows(df1.values.tolist(), value_input_option="USER_ENTERED")
+    print(f"✅ Page 1 ('{t1}'): {len(df1)} stocks saved.")
+  else:
+    ws1.append_row(["No fresh monthly swing cross found today."])
+    print(f"⚠️ Page 1 ('{t1}'): 0 stocks.")
+except Exception as e:
+  print(f"❌ Page 1 Sheet Error: {e}")
 
-  tab_name = "M_DZ_LIQUID_2CR_LOG"
-  try:
-    ws = (
-        sh.worksheet(tab_name)
-        if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 3000, 13)
+# Write Tab 2: 2_BREAKOUT_CORRECTION_DZ
+try:
+  t2 = "2_BREAKOUT_CORRECTION_DZ"
+  ws2 = (
+      sh.worksheet(t2)
+      if t2 in [x.title for x in sh.worksheets()]
+      else sh.add_worksheet(t2, 500, 14)
+  )
+  ws2.clear()
+  ws2.append_row(
+      [f"PAGE 2: POST-BREAKOUT CORRECTION & DISTANCE FROM DZ | Run: {now_str}"]
+  )
+  ws2.append_row([
+      "Symbol",
+      "Date",
+      "Turnover (Cr)",
+      "Swing High",
+      "Break Month",
+      "DZ Range",
+      "CMP",
+      "Dist From DZ %",
+      "Zone Status",
+      "SL Price",
+      "Target (1:2)",
+      "TradingView Link",
+  ])
+  if p2_list:
+    df2 = pd.DataFrame(p2_list).sort_values(
+        by="Dist_From_DZ_%", ascending=True
     )
-    ws.clear()
-    ws.append_row([
-        "LIQUID (>= 2 CR TURNOVER) + FIRST-BREAK M-TO-D DZ |"
-        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
-    ])
-    ws.append_row([
-        "Symbol",
-        "Avg Turnover (Cr)",
-        "Monthly Swing",
-        "Break Month",
-        "DZ Range",
-        "Entry Date",
-        "Exit Date",
-        "Entry Price",
-        "SL Price",
-        "TP Price",
-        "Result",
-        "PnL %",
-    ])
-    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print(f"✅ Saved to '{tab_name}' tab in Google Sheet!")
-  except Exception as e:
-    print(f"❌ Sheet update error: {e}")
-else:
-  print("⚠️ Koi trade nahi mili.")
-    
+    ws2.append_rows(df2.values.tolist(), value_input_option="USER_ENTERED")
+    print(f"✅ Page 2 ('{t2}'): {len(df2)} stocks saved.")
+  else:
+    ws2.append_row(["No post-breakout correction near DZ found today."])
+    print(f"⚠️ Page 2 ('{t2}'): 0 stocks.")
+except Exception as e:
+  print(f"❌ Page 2 Sheet Error: {e}")
+  
