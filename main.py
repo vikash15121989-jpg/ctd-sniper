@@ -8,7 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER 2-PAGE LIVE SCANNER (FRESH CROSS & CORRECTION TO DZ) ===")
+print("=== CTD_SNIPER 2-PAGE LIVE SCANNER (CLICKABLE 'Chart' HYPERLINK) ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -28,11 +28,16 @@ except Exception as e:
   STOCKS = []
 
 
+def make_chart_hyperlink(symbol):
+  url = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+  return f'=HYPERLINK("{url}", "Chart")'
+
+
 def get_monthly_swings_state(df_m, lookback=3, max_age_days=730):
   """
     Finds recent monthly swing highs and tracks their FIRST breakout:
-    - If first breakout happened in the current month or previous month -> FRESH_CROSS
-    - If first breakout happened earlier (and is the latest active swing) -> BROKEN_ACTIVE
+    - If first breakout happened in the current or previous month -> FRESH_CROSS
+    - If first breakout happened earlier -> BROKEN_ACTIVE
     """
   highs = df_m["High"].values
   closes = df_m["Close"].values
@@ -57,7 +62,6 @@ def get_monthly_swings_state(df_m, lookback=3, max_age_days=730):
     if not (left_ok and right_ok):
       continue
 
-    # First monthly close above swing high `val`
     break_idx = None
     for k in range(j + 1, n):
       if float(closes[k]) > val:
@@ -71,7 +75,6 @@ def get_monthly_swings_state(df_m, lookback=3, max_age_days=730):
           "break_idx": break_idx,
           "break_month_start": dates[break_idx],
       }
-      # If first breakout is in the latest 2 monthly bars (current or just-closed month)
       if break_idx >= (n - 2):
         fresh_cross = info
       else:
@@ -161,7 +164,7 @@ def scan_stock_two_pages(symbol, min_turnover=20_000_000):
       return None, None
 
     avg_to_cr = round(avg_to / 10_000_000.0, 2)
-    tv_link = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}"
+    chart_formula = make_chart_hyperlink(symbol)
 
     fresh_cross, older_broken = get_monthly_swings_state(
         df_m, lookback=3, max_age_days=730
@@ -192,7 +195,7 @@ def scan_stock_two_pages(symbol, min_turnover=20_000_000):
           "CMP": round(cmp, 2),
           "Above_Swing_%": above_swing_pct,
           "DZ_Status": dz_status,
-          "TV_Chart": tv_link,
+          "Chart": chart_formula,
       }
 
     # ---------------------------------------------------------
@@ -209,11 +212,9 @@ def scan_stock_two_pages(symbol, min_turnover=20_000_000):
         sub_after_dz = df_d[df_d.index > dz_dt]
         if len(sub_after_dz) >= 1:
           peak_after_dz = float(sub_after_dz["High"].max())
-          # Must be correcting from post-DZ peak and still above DZ low
           is_correcting = (cmp < peak_after_dz) and (cmp >= dz_low * 0.99)
 
           if is_correcting:
-            # Distance from DZ top (`dz_high`)
             if day_low <= dz_high and day_high >= dz_low:
               dist_pct = 0.0
               zone_state = "INSIDE ZONE (ENTRY READY)"
@@ -240,7 +241,7 @@ def scan_stock_two_pages(symbol, min_turnover=20_000_000):
                 "Zone_Status": zone_state,
                 "SL_Price": sl_price,
                 "TP_1to2": tp_price,
-                "TV_Chart": tv_link,
+                "Chart": chart_formula,
             }
 
     return page1_row, page2_row
@@ -283,7 +284,7 @@ try:
       "CMP",
       "Above Swing %",
       "DZ Status",
-      "TradingView Link",
+      "Chart",
   ])
   if p1_list:
     df1 = pd.DataFrame(p1_list).sort_values(by="Above_Swing_%", ascending=True)
@@ -319,7 +320,7 @@ try:
       "Zone Status",
       "SL Price",
       "Target (1:2)",
-      "TradingView Link",
+      "Chart",
   ])
   if p2_list:
     df2 = pd.DataFrame(p2_list).sort_values(
