@@ -8,9 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print(
-    "=== CTD_SNIPER FIRST-BREAK SWING + DAILY DZ + VOLUME ENTRY BACKTEST ==="
-)
+print("=== CTD_SNIPER LIQUIDITY FILTER (>= 2 CR TURNOVER) + M-TO-D DZ BACKTEST ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -113,7 +111,10 @@ def find_post_break_demand_zone(df_d, start_dt, end_dt, level):
   return None, sub
 
 
-def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
+def backtest_liquid_2cr(symbol, rr_ratio=2.0, min_turnover=20_000_000):
+  """
+    min_turnover = 20,000,000 INR (2 Crore) 20-day average daily turnover.
+    """
   trades = []
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -145,7 +146,13 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
       return trades
 
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
-    df_d["Vol_SMA20"] = df_d["Volume"].rolling(window=vol_win).mean()
+    df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
+    df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
+
+    # Quick check: skip stock entirely if its recent 20-day avg turnover is below 2 Cr
+    recent_avg_to = float(df_d["Avg_Turnover_20D"].iloc[-1])
+    if np.isnan(recent_avg_to) or recent_avg_to < min_turnover:
+      return trades
 
     swings = get_first_break_monthly_swings(
         df_m, lookback=3, max_age_days=730
@@ -167,9 +174,8 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
       highs = sub["High"].values
       lows = sub["Low"].values
       closes = sub["Close"].values
-      volumes = sub["Volume"].values
       ema200 = sub["EMA200"].values
-      vol_sma = sub["Vol_SMA20"].values
+      avg_to = sub["Avg_Turnover_20D"].values
       dates = sub.index
 
       in_trade = False
@@ -177,15 +183,14 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
       sl_price = 0.0
       tp_price = 0.0
       entry_dt = None
-      vol_ratio_val = 0.0
+      entry_to_cr = 0.0
 
       for k in range(max(formed_pos + 1, 1), len(sub)):
         d_high = float(highs[k])
         d_low = float(lows[k])
         d_close = float(closes[k])
-        d_vol = float(volumes[k])
         d_ema200 = float(ema200[k])
-        d_vol_avg = float(vol_sma[k])
+        d_avg_to = float(avg_to[k])
         curr_dt = dates[k]
 
         if in_trade:
@@ -193,7 +198,7 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
             pnl = ((sl_price - entry_price) / entry_price) * 100.0
             trades.append({
                 "Symbol": symbol,
-                "Vol_Ratio": round(vol_ratio_val, 2),
+                "Avg_Turnover_Cr": round(entry_to_cr, 2),
                 "Monthly_Swing": round(sw["level"], 2),
                 "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
                 "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
@@ -212,7 +217,7 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
             pnl = ((tp_price - entry_price) / entry_price) * 100.0
             trades.append({
                 "Symbol": symbol,
-                "Vol_Ratio": round(vol_ratio_val, 2),
+                "Avg_Turnover_Cr": round(entry_to_cr, 2),
                 "Monthly_Swing": round(sw["level"], 2),
                 "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
                 "DZ_Range": f"{round(dz_low,2)}-{round(dz_high,2)}",
@@ -228,22 +233,20 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
             break
           continue
 
-        if np.isnan(d_vol_avg) or d_vol_avg <= 0:
+        if np.isnan(d_avg_to) or d_avg_to < min_turnover:
           continue
 
         above_200_ema = d_close > d_ema200
         touched_dz = (d_low <= dz_high) and (d_high >= dz_low)
-        good_volume = d_vol >= (vol_mult * d_vol_avg)
 
-        # Any candle near/at Demand Zone with strong volume (no Engulfing/Hammer required)
-        if above_200_ema and touched_dz and good_volume:
+        if above_200_ema and touched_dz:
           cand_sl = dz_low * 0.99
           risk_pts = d_close - cand_sl
           if risk_pts <= 0:
             continue
 
           used_zones.add(zone_key)
-          vol_ratio_val = d_vol / d_vol_avg
+          entry_to_cr = d_avg_to / 10_000_000.0
           entry_price = d_close
           sl_price = cand_sl
           tp_price = entry_price + (rr_ratio * risk_pts)
@@ -260,7 +263,7 @@ def backtest_dz_volume_entry(symbol, rr_ratio=2.0, vol_mult=1.5, vol_win=20):
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_dz_volume_entry(sym, rr_ratio=2.0, vol_mult=1.5, vol_win=20)
+  t = backtest_liquid_2cr(sym, rr_ratio=2.0, min_turnover=20_000_000)
   if t:
     all_trades.extend(t)
 
@@ -273,7 +276,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" FIRST-BREAK SWING + DAILY DZ + VOLUME ENTRY RESULTS")
+  print(" LIQUID (>= 2 CR TURNOVER) + M-TO-D DZ RESULTS")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -281,7 +284,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("=======================================================")
 
-  tab_name = "M_DZ_VOL_ENTRY_LOG"
+  tab_name = "M_DZ_LIQUID_2CR_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -290,12 +293,12 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "FIRST-BREAK SWING + DAILY DZ + VOLUME ENTRY |"
+        "LIQUID (>= 2 CR TURNOVER) + FIRST-BREAK M-TO-D DZ |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
-        "Vol Ratio",
+        "Avg Turnover (Cr)",
         "Monthly Swing",
         "Break Month",
         "DZ Range",
