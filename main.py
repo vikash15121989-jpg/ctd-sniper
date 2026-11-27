@@ -8,10 +8,7 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print(
-    "=== CTD_SNIPER BACKTEST: RECENT SWING + RUN-UP + NO >10% DROP + SWING ZONE"
-    " + BULLISH ==="
-)
+print("=== CTD_SNIPER BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH SIGNAL ===")
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -34,7 +31,7 @@ except Exception as e:
 def get_daily_bullish_signal(
     prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l, curr_c
 ):
-  """Returns bullish signal name if daily candle at/near broken swing high is bullish."""
+  """Returns bullish signal name if daily candle at/near flipped swing high is bullish."""
   total_range = curr_h - curr_l
   if total_range <= 1e-9:
     return ""
@@ -73,17 +70,17 @@ def get_daily_bullish_signal(
   return ""
 
 
-def get_most_recent_broken_swing(df_m, lookback=3, max_age_days=730):
-  """Finds the most recent monthly swing high broken by a monthly close."""
+def get_all_broken_monthly_swings(df_m, lookback=3, max_age_days=730):
+  """Returns all broken monthly swing highs within max_age_days."""
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
   n = len(df_m)
   if n < (lookback * 2 + 2):
-    return None
+    return []
 
   last_dt = dates[-1]
-  most_recent_broken = None
+  broken_list = []
 
   for j in range(lookback, n - lookback):
     if (last_dt - dates[j]).days > max_age_days:
@@ -99,25 +96,24 @@ def get_most_recent_broken_swing(df_m, lookback=3, max_age_days=730):
 
     for k in range(j + 1, n):
       if float(closes[k]) > val:
-        most_recent_broken = {
-            "swing_idx": j,
+        broken_list.append({
             "swing_date": dates[j],
             "level": val,
             "break_idx": k,
             "break_month_start": dates[k],
-        }
+        })
         break
 
-  return most_recent_broken
+  return broken_list
 
 
-def backtest_recent_swing_10pct_rule(
+def backtest_close_in_zone_strategy(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
     zone_tol_pct=1.5,
-    max_drop_below_swing_pct=10.0,
+    max_close_above_dz_pct=2.5,
 ):
   trades = []
   try:
@@ -153,130 +149,127 @@ def backtest_recent_swing_10pct_rule(
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    sw = get_most_recent_broken_swing(df_m, lookback=3, max_age_days=730)
-    if sw is None:
+    broken_swings = get_all_broken_monthly_swings(
+        df_m, lookback=3, max_age_days=730
+    )
+    if not broken_swings:
       return trades
 
-    sw_lvl = sw["level"]
-    sub = df_d[df_d.index >= sw["break_month_start"]]
-    if len(sub) < 4:
-      return trades
-
-    opens = sub["Open"].values
-    highs = sub["High"].values
-    lows = sub["Low"].values
-    closes = sub["Close"].values
-    ema200 = sub["EMA200"].values
-    avg_to = sub["Avg_Turnover_20D"].values
-    dates = sub.index
-
-    run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
-    disqualify_lvl = sw_lvl * (1.0 - max_drop_below_swing_pct / 100.0)
-    dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
-    dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
-
-    ran_up_after_break = False
-    disqualified = False
-    max_run_pct_seen = 0.0
-
-    in_trade = False
-    entry_price = 0.0
-    sl_price = 0.0
-    tp_price = 0.0
-    entry_dt = None
-    signal_name = ""
-    recorded_run_pct = 0.0
-
-    for k in range(1, len(sub)):
-      d_open = float(opens[k])
-      d_high = float(highs[k])
-      d_low = float(lows[k])
-      d_close = float(closes[k])
-      d_ema200 = float(ema200[k])
-      d_avg_to = float(avg_to[k])
-      curr_dt = dates[k]
-
-      if in_trade:
-        if d_low <= sl_price:
-          pnl = ((sl_price - entry_price) / entry_price) * 100.0
-          trades.append({
-              "Symbol": symbol,
-              "Signal": signal_name,
-              "Run_Up_%": round(recorded_run_pct, 2),
-              "Swing_DZ": round(sw_lvl, 2),
-              "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
-              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-              "Entry_Price": round(entry_price, 2),
-              "SL_Price": round(sl_price, 2),
-              "TP_Price": round(tp_price, 2),
-              "Result": "LOSS",
-              "PnL_%": round(pnl, 2),
-          })
-          in_trade = False
-          break
-
-        if d_high >= tp_price:
-          pnl = ((tp_price - entry_price) / entry_price) * 100.0
-          trades.append({
-              "Symbol": symbol,
-              "Signal": signal_name,
-              "Run_Up_%": round(recorded_run_pct, 2),
-              "Swing_DZ": round(sw_lvl, 2),
-              "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
-              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-              "Entry_Price": round(entry_price, 2),
-              "SL_Price": round(sl_price, 2),
-              "TP_Price": round(tp_price, 2),
-              "Result": "WIN",
-              "PnL_%": round(pnl, 2),
-          })
-          in_trade = False
-          break
+    # Use the active broken swing setup (most recent broken swing or active candidate)
+    for sw in broken_swings:
+      sw_lvl = sw["level"]
+      sub = df_d[df_d.index >= sw["break_month_start"]]
+      if len(sub) < 4:
         continue
 
-      curr_run_pct = ((d_high - sw_lvl) / sw_lvl) * 100.0
-      if curr_run_pct > max_run_pct_seen:
-        max_run_pct_seen = curr_run_pct
-      if d_high >= run_target_lvl:
-        ran_up_after_break = True
+      opens = sub["Open"].values
+      highs = sub["High"].values
+      lows = sub["Low"].values
+      closes = sub["Close"].values
+      ema200 = sub["EMA200"].values
+      avg_to = sub["Avg_Turnover_20D"].values
+      dates = sub.index
 
-      if d_close < disqualify_lvl or d_low < disqualify_lvl:
-        disqualified = True
+      run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
+      ran_up_after_break = False
+      max_run_pct_seen = 0.0
 
-      if disqualified or not ran_up_after_break:
-        continue
-      if np.isnan(d_avg_to) or d_avg_to < min_turnover:
-        continue
+      in_trade = False
+      entry_price = 0.0
+      sl_price = 0.0
+      tp_price = 0.0
+      entry_dt = None
+      signal_name = ""
+      recorded_run_pct = 0.0
 
-      above_200_ema = d_close > d_ema200
-      at_prev_swing_zone = (d_low <= dz_high) and (d_high >= dz_low)
+      for k in range(1, len(sub)):
+        d_open = float(opens[k])
+        d_high = float(highs[k])
+        d_low = float(lows[k])
+        d_close = float(closes[k])
+        d_ema200 = float(ema200[k])
+        d_avg_to = float(avg_to[k])
+        curr_dt = dates[k]
 
-      if above_200_ema and at_prev_swing_zone:
-        bull_sig = get_daily_bullish_signal(
-            float(opens[k - 1]),
-            float(highs[k - 1]),
-            float(lows[k - 1]),
-            float(closes[k - 1]),
-            d_open,
-            d_high,
-            d_low,
-            d_close,
-        )
-        if bull_sig:
-          cand_sl = min(d_low, sw_lvl) * 0.99
-          risk_pts = d_close - cand_sl
-          if risk_pts <= 0:
-            continue
+        if in_trade:
+          if d_low <= sl_price:
+            pnl = ((sl_price - entry_price) / entry_price) * 100.0
+            trades.append({
+                "Symbol": symbol,
+                "Signal": signal_name,
+                "Run_Up_%": round(recorded_run_pct, 2),
+                "Swing_DZ": round(sw_lvl, 2),
+                "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
+                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                "Entry_Price": round(entry_price, 2),
+                "SL_Price": round(sl_price, 2),
+                "TP_Price": round(tp_price, 2),
+                "Result": "LOSS",
+                "PnL_%": round(pnl, 2),
+            })
+            in_trade = False
+            break
 
-          signal_name = bull_sig
-          recorded_run_pct = max_run_pct_seen
-          entry_price = d_close
-          sl_price = cand_sl
-          tp_price = entry_price + (rr_ratio * risk_pts)
-          entry_dt = curr_dt
-          in_trade = True
+          if d_high >= tp_price:
+            pnl = ((tp_price - entry_price) / entry_price) * 100.0
+            trades.append({
+                "Symbol": symbol,
+                "Signal": signal_name,
+                "Run_Up_%": round(recorded_run_pct, 2),
+                "Swing_DZ": round(sw_lvl, 2),
+                "Break_Month": sw["break_month_start"].strftime("%Y-%m"),
+                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+                "Entry_Price": round(entry_price, 2),
+                "SL_Price": round(sl_price, 2),
+                "TP_Price": round(tp_price, 2),
+                "Result": "WIN",
+                "PnL_%": round(pnl, 2),
+            })
+            in_trade = False
+            break
+          continue
+
+        curr_run_pct = ((d_high - sw_lvl) / sw_lvl) * 100.0
+        if curr_run_pct > max_run_pct_seen:
+          max_run_pct_seen = curr_run_pct
+        if d_high >= run_target_lvl:
+          ran_up_after_break = True
+
+        if not ran_up_after_break:
+          continue
+        if np.isnan(d_avg_to) or d_avg_to < min_turnover:
+          continue
+
+        above_200_ema = d_close > d_ema200
+        close_vs_dz_pct = ((d_close - sw_lvl) / sw_lvl) * 100.0
+        close_in_zone = -zone_tol_pct <= close_vs_dz_pct <= max_close_above_dz_pct
+
+        if above_200_ema and close_in_zone:
+          bull_sig = get_daily_bullish_signal(
+              float(opens[k - 1]),
+              float(highs[k - 1]),
+              float(lows[k - 1]),
+              float(closes[k - 1]),
+              d_open,
+              d_high,
+              d_low,
+              d_close,
+          )
+          if bull_sig:
+            cand_sl = min(d_low, sw_lvl) * 0.99
+            risk_pts = d_close - cand_sl
+            if risk_pts <= 0:
+              continue
+
+            signal_name = bull_sig
+            recorded_run_pct = max_run_pct_seen
+            entry_price = d_close
+            sl_price = cand_sl
+            tp_price = entry_price + (rr_ratio * risk_pts)
+            entry_dt = curr_dt
+            in_trade = True
 
     return trades
   except Exception:
@@ -288,13 +281,13 @@ def backtest_recent_swing_10pct_rule(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_recent_swing_10pct_rule(
+  t = backtest_close_in_zone_strategy(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
       zone_tol_pct=1.5,
-      max_drop_below_swing_pct=10.0,
+      max_close_above_dz_pct=2.5,
   )
   if t:
     all_trades.extend(t)
@@ -308,7 +301,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" BACKTEST: RECENT SWING + RUN-UP + NO >10% DROP + ZONE")
+  print(" BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -325,7 +318,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: RECENT SWING + RUN-UP + NO >10% DROP + ZONE |"
+        "BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
