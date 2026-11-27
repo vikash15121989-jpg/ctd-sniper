@@ -8,7 +8,10 @@ import pytz
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
-print("=== CTD_SNIPER BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH SIGNAL ===")
+print(
+    "=== CTD_SNIPER BACKTEST: 51.2% CORE + FIRST TRIGGER ONLY PER BROKEN"
+    " SWING ==="
+)
 
 # -------------------------------------------------------------
 # 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
@@ -70,8 +73,8 @@ def get_daily_bullish_signal(
   return ""
 
 
-def get_all_broken_monthly_swings(df_m, lookback=3, max_age_days=730):
-  """Returns all broken monthly swing highs within max_age_days."""
+def get_monthly_swings_state(df_m, lookback=3, max_age_days=730):
+  """Finds monthly swing highs broken by a monthly close within max_age_days."""
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
@@ -80,7 +83,7 @@ def get_all_broken_monthly_swings(df_m, lookback=3, max_age_days=730):
     return []
 
   last_dt = dates[-1]
-  broken_list = []
+  broken_swings = []
 
   for j in range(lookback, n - lookback):
     if (last_dt - dates[j]).days > max_age_days:
@@ -96,7 +99,7 @@ def get_all_broken_monthly_swings(df_m, lookback=3, max_age_days=730):
 
     for k in range(j + 1, n):
       if float(closes[k]) > val:
-        broken_list.append({
+        broken_swings.append({
             "swing_date": dates[j],
             "level": val,
             "break_idx": k,
@@ -104,16 +107,15 @@ def get_all_broken_monthly_swings(df_m, lookback=3, max_age_days=730):
         })
         break
 
-  return broken_list
+  return broken_swings
 
 
-def backtest_close_in_zone_strategy(
+def backtest_first_trigger_only(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
     zone_tol_pct=1.5,
-    max_close_above_dz_pct=2.5,
 ):
   trades = []
   try:
@@ -149,13 +151,10 @@ def backtest_close_in_zone_strategy(
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    broken_swings = get_all_broken_monthly_swings(
-        df_m, lookback=3, max_age_days=730
-    )
+    broken_swings = get_monthly_swings_state(df_m, lookback=3, max_age_days=730)
     if not broken_swings:
       return trades
 
-    # Use the active broken swing setup (most recent broken swing or active candidate)
     for sw in broken_swings:
       sw_lvl = sw["level"]
       sub = df_d[df_d.index >= sw["break_month_start"]]
@@ -171,10 +170,14 @@ def backtest_close_in_zone_strategy(
       dates = sub.index
 
       run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
+      dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
+      dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
+
       ran_up_after_break = False
       max_run_pct_seen = 0.0
 
       in_trade = False
+      first_entry_taken = False
       entry_price = 0.0
       sl_price = 0.0
       tp_price = 0.0
@@ -231,6 +234,9 @@ def backtest_close_in_zone_strategy(
             break
           continue
 
+        if first_entry_taken:
+          break
+
         curr_run_pct = ((d_high - sw_lvl) / sw_lvl) * 100.0
         if curr_run_pct > max_run_pct_seen:
           max_run_pct_seen = curr_run_pct
@@ -243,10 +249,9 @@ def backtest_close_in_zone_strategy(
           continue
 
         above_200_ema = d_close > d_ema200
-        close_vs_dz_pct = ((d_close - sw_lvl) / sw_lvl) * 100.0
-        close_in_zone = -zone_tol_pct <= close_vs_dz_pct <= max_close_above_dz_pct
+        touched_or_in_dz = (d_low <= dz_high) and (d_high >= dz_low)
 
-        if above_200_ema and close_in_zone:
+        if above_200_ema and touched_or_in_dz:
           bull_sig = get_daily_bullish_signal(
               float(opens[k - 1]),
               float(highs[k - 1]),
@@ -263,6 +268,7 @@ def backtest_close_in_zone_strategy(
             if risk_pts <= 0:
               continue
 
+            first_entry_taken = True
             signal_name = bull_sig
             recorded_run_pct = max_run_pct_seen
             entry_price = d_close
@@ -281,13 +287,12 @@ def backtest_close_in_zone_strategy(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_close_in_zone_strategy(
+  t = backtest_first_trigger_only(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
       zone_tol_pct=1.5,
-      max_close_above_dz_pct=2.5,
   )
   if t:
     all_trades.extend(t)
@@ -301,7 +306,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n=======================================================")
-  print(" BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH")
+  print(" BACKTEST: 51.2% CORE + FIRST TRIGGER ONLY PER SWING")
   print("=======================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -318,7 +323,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: CLOSE-IN-ZONE (-1.5% TO +2.5%) + BULLISH |"
+        "BACKTEST: 51.2% CORE + FIRST TRIGGER ONLY |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -341,4 +346,4 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
+  
