@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: BASELINE MONTHLY SWING BREAKOUT +"
-    " PULLBACK ==="
+    "=== CTD_SNIPER BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY"
+    " SWEEP ==="
 )
 
 # -------------------------------------------------------------
@@ -109,20 +109,21 @@ def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
   return swings
 
 
-def backtest_baseline_swing_breakout(
+def backtest_swing_breakout_with_liquidity(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
     zone_tol_pct=1.5,
+    liq_lookback=5,
     first_trigger_only=True,
 ):
   """
-    Baseline Monthly Swing High Breakout + Run-Up + Flipped Swing Zone Pullback:
+    Baseline Monthly Swing High Breakout + Run-Up + Pullback + Liquidity Sweep:
     - Broken monthly swing high -> >= min_run_pct rally
     - Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA
+    - Liquidity Sweep: sweeps below recent `liq_lookback` daily low (or sw_lvl) and reclaims above
     - Bullish reversal candle -> entry at close with 1:rr_ratio RR
-    - First trigger only per broken swing
     """
   trades = []
   try:
@@ -169,7 +170,7 @@ def backtest_baseline_swing_breakout(
       dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
 
       sub = df_d[df_d.index >= sw["break_month_start"]]
-      if len(sub) < 3:
+      if len(sub) < (liq_lookback + 2):
         continue
 
       opens = sub["Open"].values
@@ -182,7 +183,7 @@ def backtest_baseline_swing_breakout(
 
       in_trade = False
       taken_for_swing = False
-      running_max_high = float(highs[0])
+      running_max_high = float(np.max(highs[:liq_lookback]))
 
       entry_price = 0.0
       sl_price = 0.0
@@ -191,7 +192,7 @@ def backtest_baseline_swing_breakout(
       signal_name = ""
       run_up_at_entry = 0.0
 
-      for k in range(1, len(sub)):
+      for k in range(liq_lookback, len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
@@ -254,8 +255,15 @@ def backtest_baseline_swing_breakout(
         if prior_max < run_target_lvl or d_close >= prior_max:
           continue
 
+        # Pullback into flipped Swing_DZ
         in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
-        if in_or_near_dz:
+
+        # Liquidity Sweep: wick takes out recent 5D low (or sw_lvl) and reclaims back above
+        recent_swing_low = float(np.min(lows[k - liq_lookback : k]))
+        liq_level = min(recent_swing_low, sw_lvl)
+        liquidity_swept = (d_low < liq_level) and (d_close >= liq_level)
+
+        if in_or_near_dz and liquidity_swept:
           bull_sig = get_bullish_signal(
               float(opens[k - 1]),
               float(highs[k - 1]),
@@ -273,7 +281,7 @@ def backtest_baseline_swing_breakout(
               continue
 
             taken_for_swing = True
-            signal_name = bull_sig
+            signal_name = f"LIQ_{bull_sig}"
             run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
             entry_price = d_close
             sl_price = cand_sl
@@ -291,12 +299,13 @@ def backtest_baseline_swing_breakout(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_baseline_swing_breakout(
+  t = backtest_swing_breakout_with_liquidity(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
       zone_tol_pct=1.5,
+      liq_lookback=5,
       first_trigger_only=True,
   )
   if t:
@@ -311,7 +320,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: BASELINE MONTHLY SWING BREAKOUT + PULLBACK")
+  print(" BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -319,7 +328,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_SWING_BREAKOUT_BASELINE_LOG"
+  tab_name = "M_SWING_BREAKOUT_LIQUIDITY_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -328,7 +337,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: BASELINE MONTHLY SWING BREAKOUT + PULLBACK |"
+        "BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY SWEEP |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
