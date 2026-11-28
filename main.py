@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING + PULLBACK"
-    " (LIQUID STOCKS ONLY) ==="
+    "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3) +"
+    " PULLBACK (LIQUID STOCKS ONLY) ==="
 )
 
 # -------------------------------------------------------------
@@ -102,10 +102,10 @@ def get_bullish_signal(
   return ""
 
 
-def get_first_recent_monthly_swing(df_m, lookback=2):
+def get_first_recent_monthly_swing(df_m, lookback=3):
   """
     Scans from right (most recent completed monthly candle) to left (older candles)
-    and returns the VERY FIRST monthly swing high found.
+    and returns the VERY FIRST monthly swing high found using `lookback` bars on both sides.
     """
   highs = df_m["High"].values
   closes = df_m["Close"].values
@@ -140,6 +140,7 @@ def get_first_recent_monthly_swing(df_m, lookback=2):
 
 def backtest_first_swing_liquid_stocks(
     symbol,
+    lookback=3,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
@@ -147,7 +148,7 @@ def backtest_first_swing_liquid_stocks(
     first_trigger_only=True,
 ):
   """
-    First recent monthly swing (right-to-left) -> Daily breakout -> >= min_run_pct rally
+    First recent monthly swing (right-to-left, lookback=3) -> Daily breakout -> >= min_run_pct rally
     -> Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA & min_turnover
     -> Bullish reversal candle -> Entry at close with 1:rr_ratio RR
     """
@@ -180,10 +181,10 @@ def backtest_first_swing_liquid_stocks(
 
     df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-    if len(df_d) < 205 or len(df_m) < 6:
+    if len(df_d) < 205 or len(df_m) < (lookback * 2 + 2):
       return trades
 
-    sw = get_first_recent_monthly_swing(df_m, lookback=2)
+    sw = get_first_recent_monthly_swing(df_m, lookback=lookback)
     if sw is None:
       return trades
 
@@ -322,6 +323,7 @@ all_trades = []
 for sym in STOCKS:
   t = backtest_first_swing_liquid_stocks(
       sym,
+      lookback=3,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
@@ -340,7 +342,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: FIRST RECENT MONTHLY SWING (LIQUID STOCKS ONLY)")
+  print(" BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3, LIQUID)")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -357,7 +359,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: FIRST RECENT MONTHLY SWING (LIQUID STOCKS ONLY) |"
+        "BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3, LIQUID STOCKS) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
