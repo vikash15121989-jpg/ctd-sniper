@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY"
-    " (STOCKS ONLY) ==="
+    "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING + PULLBACK"
+    " (LIQUID STOCKS ONLY) ==="
 )
 
 # -------------------------------------------------------------
@@ -48,8 +48,13 @@ try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
   raw = sh.worksheet("Watchlist").col_values(1)
-  STOCKS = list(dict.fromkeys([s.strip().upper() for s in raw if is_equity_stock(s)]))
-  print(f"✅ Loaded {len(STOCKS)} equity stocks (filtered out ETFs/indices/invalid).")
+  STOCKS = list(
+      dict.fromkeys([s.strip().upper() for s in raw if is_equity_stock(s)])
+  )
+  print(
+      f"✅ Loaded {len(STOCKS)} equity stocks (filtered out"
+      " ETFs/indices/invalid)."
+  )
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
@@ -133,20 +138,18 @@ def get_first_recent_monthly_swing(df_m, lookback=2):
   return None
 
 
-def backtest_first_swing_liquidity(
+def backtest_first_swing_liquid_stocks(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
     zone_tol_pct=1.5,
-    liq_lookback=5,
     first_trigger_only=True,
 ):
   """
     First recent monthly swing (right-to-left) -> Daily breakout -> >= min_run_pct rally
-    -> Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA
-    -> Liquidity sweep below recent liq_lookback low (or sw_lvl) + bullish reclaim
-    -> Entry at close with 1:rr_ratio RR
+    -> Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA & min_turnover
+    -> Bullish reversal candle -> Entry at close with 1:rr_ratio RR
     """
   trades = []
   try:
@@ -194,7 +197,7 @@ def backtest_first_swing_liquidity(
     dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
 
     sub = df_d[df_d.index >= sw["break_month_start"]]
-    if len(sub) < (liq_lookback + 2):
+    if len(sub) < 3:
       return trades
 
     opens = sub["Open"].values
@@ -207,7 +210,7 @@ def backtest_first_swing_liquidity(
 
     in_trade = False
     taken_for_swing = False
-    running_max_high = float(np.max(highs[:liq_lookback]))
+    running_max_high = float(highs[0])
 
     entry_price = 0.0
     sl_price = 0.0
@@ -216,7 +219,7 @@ def backtest_first_swing_liquidity(
     signal_name = ""
     run_up_at_entry = 0.0
 
-    for k in range(liq_lookback, len(sub)):
+    for k in range(1, len(sub)):
       d_open = float(opens[k])
       d_high = float(highs[k])
       d_low = float(lows[k])
@@ -271,6 +274,7 @@ def backtest_first_swing_liquidity(
       prior_max = running_max_high
       running_max_high = max(running_max_high, d_high)
 
+      # Liquid stock check (20-day avg turnover) + 200 EMA trend filter
       if np.isnan(d_avg_to) or d_avg_to < min_turnover:
         continue
       if d_close <= d_ema200:
@@ -280,11 +284,7 @@ def backtest_first_swing_liquidity(
         continue
 
       in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
-      recent_swing_low = float(np.min(lows[k - liq_lookback : k]))
-      liq_level = min(recent_swing_low, sw_lvl)
-      liquidity_swept = (d_low < liq_level) and (d_close >= liq_level)
-
-      if in_or_near_dz and liquidity_swept:
+      if in_or_near_dz:
         bull_sig = get_bullish_signal(
             float(opens[k - 1]),
             float(highs[k - 1]),
@@ -302,7 +302,7 @@ def backtest_first_swing_liquidity(
             continue
 
           taken_for_swing = True
-          signal_name = f"LIQ_{bull_sig}"
+          signal_name = bull_sig
           run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
           entry_price = d_close
           sl_price = cand_sl
@@ -320,13 +320,12 @@ def backtest_first_swing_liquidity(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_first_swing_liquidity(
+  t = backtest_first_swing_liquid_stocks(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
       zone_tol_pct=1.5,
-      liq_lookback=5,
       first_trigger_only=True,
   )
   if t:
@@ -341,7 +340,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY (STOCKS)")
+  print(" BACKTEST: FIRST RECENT MONTHLY SWING (LIQUID STOCKS ONLY)")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -349,7 +348,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_SWING_FIRST_LIQ_STOCKS_LOG"
+  tab_name = "M_SWING_FIRST_LIQUID_STOCKS_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -358,7 +357,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY (STOCKS ONLY) |"
+        "BACKTEST: FIRST RECENT MONTHLY SWING (LIQUID STOCKS ONLY) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -381,3 +380,4 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
+    
