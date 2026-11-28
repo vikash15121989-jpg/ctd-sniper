@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: DIRECT DAILY FVG (WITHOUT MONTHLY SWING,"
-    " LIQUID STOCKS) ==="
+    "=== CTD_SNIPER TOMORROW WATCHLIST: SWING CROSSED & PULLBACK NEAR"
+    " SWING ==="
 )
 
 # -------------------------------------------------------------
@@ -63,7 +63,7 @@ except Exception as e:
 def get_bullish_signal(
     prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l, curr_c
 ):
-  """Returns bullish reversal candle signal on pullback into FVG."""
+  """Returns bullish reversal candle signal on pullback."""
   total_range = curr_h - curr_l
   if total_range <= 1e-9 or curr_c <= 0:
     return ""
@@ -102,65 +102,69 @@ def get_bullish_signal(
   return ""
 
 
-def find_latest_daily_fvg(
-    opens, highs, lows, closes, start_idx, end_idx, min_range_window=20
-):
+def get_first_recent_monthly_swing(df_m, lookback=3):
   """
-    Finds the bullish green candle in [start_idx, end_idx) that has the LARGEST candle range
-    (comparing against recent `min_range_window` daily candles), then builds FVG from:
-    - fvg_low  = next candle's Low (idx + 1)
-    - fvg_high = previous candle's High (idx - 1)
-    Returns (fvg_low, fvg_high, idx) or None.
+    Scans from right (most recent completed monthly candle) to left (older candles)
+    and returns the VERY FIRST monthly swing high found using `lookback` bars on both sides.
     """
-  if end_idx - start_idx < 3:
+  highs = df_m["High"].values
+  closes = df_m["Close"].values
+  dates = df_m.index
+  n = len(df_m)
+
+  # Exclude the currently forming last bar (n - 1)
+  start_idx = n - 2 - lookback
+  if start_idx < lookback:
     return None
 
-  ranges = highs - lows
-  best_idx = None
-  best_range = -1.0
+  for j in range(start_idx, lookback - 1, -1):
+    val = float(highs[j])
+    left_ok = all(val > float(highs[k]) for k in range(j - lookback, j))
+    right_ok = all(
+        val > float(highs[k]) for k in range(j + 1, j + lookback + 1)
+    )
+    if left_ok and right_ok:
+      break_dt = None
+      for k in range(j + 1, n):
+        if float(closes[k]) > val:
+          break_dt = dates[k]
+          break
+      return {
+          "swing_date": dates[j],
+          "level": val,
+          "crossed_monthly": break_dt is not None,
+          "break_month_start": break_dt,
+      }
 
-  for idx in range(max(1, start_idx), min(len(closes) - 1, end_idx)):
-    if float(closes[idx]) <= float(opens[idx]):
-      continue
-
-    win_start = max(0, idx - min_range_window)
-    max_recent_range = float(np.max(ranges[win_start : idx + 1]))
-    curr_range = float(ranges[idx])
-
-    if curr_range >= max_recent_range and curr_range > best_range:
-      fvg_low = float(lows[idx + 1])
-      fvg_high = float(highs[idx - 1])
-      if fvg_high > fvg_low:
-        best_range = curr_range
-        best_idx = idx
-
-  if best_idx is None:
-    return None
-
-  return (
-      float(lows[best_idx + 1]),
-      float(highs[best_idx - 1]),
-      best_idx,
-  )
+  return None
 
 
-def backtest_direct_daily_fvg(
+def scan_tomorrow_setups(
     symbol,
+    lookback=3,
     rr_ratio=2.0,
     min_turnover=20_000_000,
-    fvg_tol_pct=1.0,
-    fvg_lookback_bars=30,
-    max_trades_per_stock=3,
+    min_run_pct=3.0,
+    zone_tol_pct=1.5,
 ):
   """
-    Direct Daily Chart FVG (No Monthly Swing):
-    Liquid stock (20D Avg Turnover >= min_turnover) + Close > EMA200
-    -> Pullback near Daily Bullish FVG (+- fvg_tol_pct) + Bullish Reversal Candle
-    -> Entry at close with 1:rr_ratio RR.
+    Returns (crossed_row, pullback_row) for tomorrow's watchlist.
+    - crossed_row  : First recent monthly swing (lookback=3) has been crossed/broken.
+    - pullback_row : Crossed + >= min_run_pct rally + pullback near Swing_DZ (+- zone_tol_pct).
     """
-  trades = []
+  crossed_row = None
+  pullback_row = None
+
   try:
     ticker = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+    df_m = yf.download(
+        ticker,
+        start="2018-01-01",
+        interval="1mo",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
     df_d = yf.download(
         ticker,
         start="2018-01-01",
@@ -170,206 +174,189 @@ def backtest_direct_daily_fvg(
         threads=False,
     )
 
-    if df_d is None or df_d.empty:
-      return trades
+    if df_m is None or df_d is None or df_m.empty or df_d.empty:
+      return None, None
+    if isinstance(df_m.columns, pd.MultiIndex):
+      df_m.columns = df_m.columns.get_level_values(0)
     if isinstance(df_d.columns, pd.MultiIndex):
       df_d.columns = df_d.columns.get_level_values(0)
 
+    df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-    if len(df_d) < 210:
-      return trades
+    if len(df_d) < 205 or len(df_m) < (lookback * 2 + 2):
+      return None, None
+
+    sw = get_first_recent_monthly_swing(df_m, lookback=lookback)
+    if sw is None:
+      return None, None
 
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    opens = df_d["Open"].values
-    highs = df_d["High"].values
-    lows = df_d["Low"].values
-    closes = df_d["Close"].values
-    ema200 = df_d["EMA200"].values
-    avg_to = df_d["Avg_Turnover_20D"].values
-    dates = df_d.index
+    sw_lvl = sw["level"]
+    dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
+    dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
+    run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
 
-    in_trade = False
-    trade_count = 0
-    last_fvg_idx_used = -1
+    last_d = df_d.iloc[-1]
+    prev_d = df_d.iloc[-2]
+    d_close = float(last_d["Close"])
+    d_high = float(last_d["High"])
+    d_low = float(last_d["Low"])
+    d_open = float(last_d["Open"])
+    d_ema200 = float(last_d["EMA200"])
+    d_avg_to = float(last_d["Avg_Turnover_20D"])
 
-    entry_price = 0.0
-    sl_price = 0.0
-    tp_price = 0.0
-    entry_dt = None
-    signal_name = ""
-    fvg_zone_str = ""
-    fvg_date_str = ""
+    if np.isnan(d_avg_to) or d_avg_to < min_turnover:
+      return None, None
+    if d_close <= d_ema200:
+      return None, None
 
-    for k in range(202, len(df_d)):
-      d_open = float(opens[k])
-      d_high = float(highs[k])
-      d_low = float(lows[k])
-      d_close = float(closes[k])
-      d_ema200 = float(ema200[k])
-      d_avg_to = float(avg_to[k])
-      curr_dt = dates[k]
+    # Check if swing high is crossed either on monthly close or on daily close/high since swing
+    post_swing_d = df_d[df_d.index > sw["swing_date"]]
+    if post_swing_d.empty:
+      return None, None
 
-      if in_trade:
-        if d_low <= sl_price:
-          pnl = ((sl_price - entry_price) / entry_price) * 100.0
-          trades.append({
-              "Symbol": symbol,
-              "Signal": signal_name,
-              "FVG_Date": fvg_date_str,
-              "FVG_Zone": fvg_zone_str,
-              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-              "Entry_Price": round(entry_price, 2),
-              "SL_Price": round(sl_price, 2),
-              "TP_Price": round(tp_price, 2),
-              "Result": "LOSS",
-              "PnL_%": round(pnl, 2),
-          })
-          in_trade = False
-          trade_count += 1
-          if trade_count >= max_trades_per_stock:
-            break
-          continue
+    max_post_high = float(post_swing_d["High"].max())
+    max_post_close = float(post_swing_d["Close"].max())
+    is_crossed = sw["crossed_monthly"] or (max_post_close > sw_lvl)
 
-        if d_high >= tp_price:
-          pnl = ((tp_price - entry_price) / entry_price) * 100.0
-          trades.append({
-              "Symbol": symbol,
-              "Signal": signal_name,
-              "FVG_Date": fvg_date_str,
-              "FVG_Zone": fvg_zone_str,
-              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-              "Entry_Price": round(entry_price, 2),
-              "SL_Price": round(sl_price, 2),
-              "TP_Price": round(tp_price, 2),
-              "Result": "WIN",
-              "PnL_%": round(pnl, 2),
-          })
-          in_trade = False
-          trade_count += 1
-          if trade_count >= max_trades_per_stock:
-            break
-          continue
-        continue
+    if not is_crossed:
+      return None, None
 
-      if np.isnan(d_avg_to) or d_avg_to < min_turnover:
-        continue
-      if d_close <= d_ema200:
-        continue
+    dist_from_swing_pct = ((d_close - sw_lvl) / sw_lvl) * 100.0
+    max_run_up_pct = ((max_post_high - sw_lvl) / sw_lvl) * 100.0
+    above_200ema_str = "YES" if d_close > d_ema200 else "NO"
 
-      search_start = max(200, k - fvg_lookback_bars)
-      fvg_info = find_latest_daily_fvg(
-          opens, highs, lows, closes, start_idx=search_start, end_idx=k
+    crossed_row = [
+        symbol,
+        sw["swing_date"].strftime("%Y-%m"),
+        round(sw_lvl, 2),
+        round(d_close, 2),
+        round(dist_from_swing_pct, 2),
+        round(max_run_up_pct, 2),
+        round(d_avg_to / 10_000_000, 2),  # Turnover in Cr
+        above_200ema_str,
+        df_d.index[-1].strftime("%Y-%m-%d"),
+    ]
+
+    # Pullback check: >= min_run_pct rally happened, price pulled back below max_post_high,
+    # and is near the flipped Swing_DZ (+- zone_tol_pct)
+    in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
+    has_pullback = (max_run_up_pct >= min_run_pct) and (d_close < max_post_high)
+
+    if has_pullback and in_or_near_dz:
+      bull_sig = get_bullish_signal(
+          float(prev_d["Open"]),
+          float(prev_d["High"]),
+          float(prev_d["Low"]),
+          float(prev_d["Close"]),
+          d_open,
+          d_high,
+          d_low,
+          d_close,
       )
-      if fvg_info is None:
-        continue
+      cand_sl = min(d_low, sw_lvl) * 0.99
+      risk_pts = d_close - cand_sl
+      tp_val = (
+          round(d_close + (rr_ratio * risk_pts), 2) if risk_pts > 0 else ""
+      )
 
-      fvg_low, fvg_high, fvg_idx = fvg_info
-      if fvg_idx == last_fvg_idx_used:
-        continue
+      pullback_row = [
+          symbol,
+          sw["swing_date"].strftime("%Y-%m"),
+          f"{round(dz_low, 2)}-{round(dz_high, 2)}",
+          round(d_close, 2),
+          round(max_run_up_pct, 2),
+          bull_sig if bull_sig else "WATCH_PULLBACK",
+          round(cand_sl, 2),
+          tp_val,
+          round(d_avg_to / 10_000_000, 2),
+          df_d.index[-1].strftime("%Y-%m-%d"),
+      ]
 
-      near_fvg_low = fvg_low * (1.0 - fvg_tol_pct / 100.0)
-      near_fvg_high = fvg_high * (1.0 + fvg_tol_pct / 100.0)
-      near_fvg = (d_low <= near_fvg_high) and (d_high >= near_fvg_low)
+    return crossed_row, pullback_row
 
-      if near_fvg:
-        bull_sig = get_bullish_signal(
-            float(opens[k - 1]),
-            float(highs[k - 1]),
-            float(lows[k - 1]),
-            float(closes[k - 1]),
-            d_open,
-            d_high,
-            d_low,
-            d_close,
-        )
-        if bull_sig:
-          cand_sl = min(d_low, fvg_low) * 0.99
-          risk_pts = d_close - cand_sl
-          if risk_pts <= 0:
-            continue
-
-          last_fvg_idx_used = fvg_idx
-          signal_name = f"D_FVG_{bull_sig}"
-          fvg_date_str = dates[fvg_idx].strftime("%Y-%m-%d")
-          fvg_zone_str = f"{round(fvg_low, 2)}-{round(fvg_high, 2)}"
-          entry_price = d_close
-          sl_price = cand_sl
-          tp_price = entry_price + (rr_ratio * risk_pts)
-          entry_dt = curr_dt
-          in_trade = True
-
-    return trades
   except Exception:
-    return []
+    return None, None
+
+
+def write_tab(sh, tab_name, title_line, headers, rows):
+  ws = (
+      sh.worksheet(tab_name)
+      if tab_name in [x.title for x in sh.worksheets()]
+      else sh.add_worksheet(tab_name, 1000, len(headers) + 2)
+  )
+  ws.clear()
+  ws.append_row([title_line])
+  ws.append_row(headers)
+  if rows:
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+  else:
+    ws.append_row(["No matching stocks found"])
 
 
 # -------------------------------------------------------------
-# 2. RUN BACKTEST & EXPORT TO GOOGLE SHEET
+# 2. RUN SCAN & UPDATE BOTH TABS FOR TOMORROW
 # -------------------------------------------------------------
-all_trades = []
+crossed_list = []
+pullback_list = []
+
 for sym in STOCKS:
-  t = backtest_direct_daily_fvg(
+  c_row, p_row = scan_tomorrow_setups(
       sym,
+      lookback=3,
       rr_ratio=2.0,
       min_turnover=20_000_000,
-      fvg_tol_pct=1.0,
-      fvg_lookback_bars=30,
-      max_trades_per_stock=3,
+      min_run_pct=3.0,
+      zone_tol_pct=1.5,
   )
-  if t:
-    all_trades.extend(t)
+  if c_row:
+    crossed_list.append(c_row)
+  if p_row:
+    pullback_list.append(p_row)
 
-if len(all_trades) > 0:
-  df_res = pd.DataFrame(all_trades)
-  total = len(df_res)
-  wins = len(df_res[df_res["Result"] == "WIN"])
-  losses = len(df_res[df_res["Result"] == "LOSS"])
-  win_rate = round((wins / total) * 100, 2)
-  total_pnl = round(df_res["PnL_%"].sum(), 2)
+run_stamp = datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
 
-  print("\n===========================================================")
-  print(" BACKTEST: DIRECT DAILY FVG (WITHOUT SWING HIGH, LIQUID)")
-  print("===========================================================")
-  print(f" Total Trades : {total}")
-  print(f" Wins         : {wins} | Losses: {losses}")
-  print(f" Win Rate     : {win_rate}%")
-  print(f" Total PnL    : {total_pnl}%")
-  print("===========================================================")
-
-  tab_name = "DAILY_FVG_NO_SWING_LOG"
-  try:
-    ws = (
-        sh.worksheet(tab_name)
-        if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 4000, 14)
-    )
-    ws.clear()
-    ws.append_row([
-        "BACKTEST: DIRECT DAILY FVG (NO SWING HIGH, LIQUID STOCKS) |"
-        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
-    ])
-    ws.append_row([
+write_tab(
+    sh,
+    "SWING_CROSSED_READY",
+    f"SWING HIGH CROSSED (LOOKBACK=3, LIQUID) | {run_stamp}",
+    [
         "Symbol",
-        "Signal",
-        "FVG Date",
-        "FVG Zone",
-        "Entry Date",
-        "Exit Date",
-        "Entry Price",
-        "SL Price",
-        "TP Price",
-        "Result",
-        "PnL %",
-    ])
-    ws.append_rows(df_res.values.tolist(), value_input_option="USER_ENTERED")
-    print(f"✅ Saved to '{tab_name}' tab in Google Sheet!")
-  except Exception as e:
-    print(f"❌ Sheet update error: {e}")
-else:
-  print("⚠️ Koi trade nahi mili.")
-    
+        "Swing Date",
+        "Swing High",
+        "LTP / Close",
+        "Diff vs Swing %",
+        "Max Run-Up %",
+        "Avg Turnover (Cr)",
+        "Above 200 EMA",
+        "As Of Date",
+    ],
+    crossed_list,
+)
+
+write_tab(
+    sh,
+    "PULLBACK_NEAR_SWING",
+    f"PULLBACK NEAR SWING ZONE (LOOKBACK=3, LIQUID) | {run_stamp}",
+    [
+        "Symbol",
+        "Swing Date",
+        "Swing Zone (±1.5%)",
+        "LTP / Close",
+        "Max Run-Up %",
+        "Candle Signal",
+        "Indicative SL",
+        "Indicative TP (1:2)",
+        "Avg Turnover (Cr)",
+        "As Of Date",
+    ],
+    pullback_list,
+)
+
+print(
+    f"✅ Updated 'SWING_CROSSED_READY' ({len(crossed_list)} stocks) & "
+    f"'PULLBACK_NEAR_SWING' ({len(pullback_list)} stocks)!"
+)
