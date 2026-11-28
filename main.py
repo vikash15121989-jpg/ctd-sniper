@@ -9,23 +9,47 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY"
-    " SWEEP ==="
+    "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY"
+    " (STOCKS ONLY) ==="
 )
 
 # -------------------------------------------------------------
-# 1. GOOGLE SHEETS CONNECTION & WATCHLIST LOAD
+# 1. GOOGLE SHEETS CONNECTION & STOCK-ONLY WATCHLIST LOAD
 # -------------------------------------------------------------
+NON_STOCK_KEYWORDS = (
+    "BEES",
+    "ETF",
+    "GOLD",
+    "SILVER",
+    "NIFTY",
+    "LIQUID",
+    "SENSEX",
+    "FINNIFTY",
+    "MIDCPNIFTY",
+    "NEXT50",
+    "MON100",
+    "MAFANG",
+)
+
+
+def is_equity_stock(symbol: str) -> bool:
+  s = symbol.strip().upper()
+  if not s or len(s) <= 2 or s in {"STOCK", "SYMBOL"}:
+    return False
+  if s.startswith(("^", "$")):
+    return False
+  clean_sym = s.replace(".NS", "").replace(".BO", "")
+  if any(kw in clean_sym for kw in NON_STOCK_KEYWORDS):
+    return False
+  return True
+
+
 try:
   gc = gspread.service_account_from_dict(json.loads(os.environ["GSHEET_KEY"]))
   sh = gc.open("CTD_Sniper")
   raw = sh.worksheet("Watchlist").col_values(1)
-  STOCKS = [
-      s.strip().upper()
-      for s in raw
-      if s and len(s.strip()) > 2 and s.upper() not in ["STOCK", "SYMBOL"]
-  ]
-  print(f"✅ Loaded {len(STOCKS)} stocks from Watchlist.")
+  STOCKS = list(dict.fromkeys([s.strip().upper() for s in raw if is_equity_stock(s)]))
+  print(f"✅ Loaded {len(STOCKS)} equity stocks (filtered out ETFs/indices/invalid).")
 except Exception as e:
   print(f"❌ Google Sheet Connection Error: {e}")
   STOCKS = []
@@ -73,43 +97,43 @@ def get_bullish_signal(
   return ""
 
 
-def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
-  """Finds monthly swing highs broken by a subsequent monthly close."""
+def get_first_recent_monthly_swing(df_m, lookback=2):
+  """
+    Scans from right (most recent completed monthly candle) to left (older candles)
+    and returns the VERY FIRST monthly swing high found.
+    """
   highs = df_m["High"].values
   closes = df_m["Close"].values
   dates = df_m.index
   n = len(df_m)
-  if n < (lookback * 2 + 2):
-    return []
 
-  last_dt = dates[-1]
-  swings = []
+  # Exclude the currently forming last bar (n - 1)
+  start_idx = n - 2 - lookback
+  if start_idx < lookback:
+    return None
 
-  for j in range(lookback, n - lookback):
-    if (last_dt - dates[j]).days > max_age_days:
-      continue
-
+  for j in range(start_idx, lookback - 1, -1):
     val = float(highs[j])
     left_ok = all(val > float(highs[k]) for k in range(j - lookback, j))
     right_ok = all(
         val > float(highs[k]) for k in range(j + 1, j + lookback + 1)
     )
-    if not (left_ok and right_ok):
-      continue
+    if left_ok and right_ok:
+      break_dt = dates[-1]
+      for k in range(j + 1, n):
+        if float(closes[k]) > val:
+          break_dt = dates[k]
+          break
+      return {
+          "swing_date": dates[j],
+          "level": val,
+          "break_month_start": break_dt,
+      }
 
-    for k in range(j + 1, n):
-      if float(closes[k]) > val:
-        swings.append({
-            "swing_date": dates[j],
-            "level": val,
-            "break_month_start": dates[k],
-        })
-        break
-
-  return swings
+  return None
 
 
-def backtest_swing_breakout_with_liquidity(
+def backtest_first_swing_liquidity(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
@@ -119,11 +143,10 @@ def backtest_swing_breakout_with_liquidity(
     first_trigger_only=True,
 ):
   """
-    Baseline Monthly Swing High Breakout + Run-Up + Pullback + Liquidity Sweep:
-    - Broken monthly swing high -> >= min_run_pct rally
-    - Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA
-    - Liquidity Sweep: sweeps below recent `liq_lookback` daily low (or sw_lvl) and reclaims above
-    - Bullish reversal candle -> entry at close with 1:rr_ratio RR
+    First recent monthly swing (right-to-left) -> Daily breakout -> >= min_run_pct rally
+    -> Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA
+    -> Liquidity sweep below recent liq_lookback low (or sw_lvl) + bullish reclaim
+    -> Entry at close with 1:rr_ratio RR
     """
   trades = []
   try:
@@ -134,6 +157,7 @@ def backtest_swing_breakout_with_liquidity(
         interval="1mo",
         auto_adjust=False,
         progress=False,
+        threads=False,
     )
     df_d = yf.download(
         ticker,
@@ -141,6 +165,7 @@ def backtest_swing_breakout_with_liquidity(
         interval="1d",
         auto_adjust=False,
         progress=False,
+        threads=False,
     )
 
     if df_m is None or df_d is None or df_m.empty or df_d.empty:
@@ -152,142 +177,138 @@ def backtest_swing_breakout_with_liquidity(
 
     df_m.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     df_d.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-    if len(df_d) < 205:
+    if len(df_d) < 205 or len(df_m) < 6:
+      return trades
+
+    sw = get_first_recent_monthly_swing(df_m, lookback=2)
+    if sw is None:
       return trades
 
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    swings = get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095)
-    if not swings:
+    sw_lvl = sw["level"]
+    run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
+    dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
+    dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
+
+    sub = df_d[df_d.index >= sw["break_month_start"]]
+    if len(sub) < (liq_lookback + 2):
       return trades
 
-    for sw in swings:
-      sw_lvl = sw["level"]
-      run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
-      dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
-      dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
+    opens = sub["Open"].values
+    highs = sub["High"].values
+    lows = sub["Low"].values
+    closes = sub["Close"].values
+    ema200 = sub["EMA200"].values
+    avg_to = sub["Avg_Turnover_20D"].values
+    dates = sub.index
 
-      sub = df_d[df_d.index >= sw["break_month_start"]]
-      if len(sub) < (liq_lookback + 2):
-        continue
+    in_trade = False
+    taken_for_swing = False
+    running_max_high = float(np.max(highs[:liq_lookback]))
 
-      opens = sub["Open"].values
-      highs = sub["High"].values
-      lows = sub["Low"].values
-      closes = sub["Close"].values
-      ema200 = sub["EMA200"].values
-      avg_to = sub["Avg_Turnover_20D"].values
-      dates = sub.index
+    entry_price = 0.0
+    sl_price = 0.0
+    tp_price = 0.0
+    entry_dt = None
+    signal_name = ""
+    run_up_at_entry = 0.0
 
-      in_trade = False
-      taken_for_swing = False
-      running_max_high = float(np.max(highs[:liq_lookback]))
+    for k in range(liq_lookback, len(sub)):
+      d_open = float(opens[k])
+      d_high = float(highs[k])
+      d_low = float(lows[k])
+      d_close = float(closes[k])
+      d_ema200 = float(ema200[k])
+      d_avg_to = float(avg_to[k])
+      curr_dt = dates[k]
 
-      entry_price = 0.0
-      sl_price = 0.0
-      tp_price = 0.0
-      entry_dt = None
-      signal_name = ""
-      run_up_at_entry = 0.0
-
-      for k in range(liq_lookback, len(sub)):
-        d_open = float(opens[k])
-        d_high = float(highs[k])
-        d_low = float(lows[k])
-        d_close = float(closes[k])
-        d_ema200 = float(ema200[k])
-        d_avg_to = float(avg_to[k])
-        curr_dt = dates[k]
-
-        if in_trade:
-          if d_low <= sl_price:
-            pnl = ((sl_price - entry_price) / entry_price) * 100.0
-            trades.append({
-                "Symbol": symbol,
-                "Signal": signal_name,
-                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
-                "Swing_DZ": round(sw_lvl, 2),
-                "Run_Up_%": round(run_up_at_entry, 2),
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "SL_Price": round(sl_price, 2),
-                "TP_Price": round(tp_price, 2),
-                "Result": "LOSS",
-                "PnL_%": round(pnl, 2),
-            })
-            in_trade = False
-            break
-
-          if d_high >= tp_price:
-            pnl = ((tp_price - entry_price) / entry_price) * 100.0
-            trades.append({
-                "Symbol": symbol,
-                "Signal": signal_name,
-                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
-                "Swing_DZ": round(sw_lvl, 2),
-                "Run_Up_%": round(run_up_at_entry, 2),
-                "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
-                "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
-                "Entry_Price": round(entry_price, 2),
-                "SL_Price": round(sl_price, 2),
-                "TP_Price": round(tp_price, 2),
-                "Result": "WIN",
-                "PnL_%": round(pnl, 2),
-            })
-            in_trade = False
-            break
-          continue
-
-        if first_trigger_only and taken_for_swing:
+      if in_trade:
+        if d_low <= sl_price:
+          pnl = ((sl_price - entry_price) / entry_price) * 100.0
+          trades.append({
+              "Symbol": symbol,
+              "Signal": signal_name,
+              "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
+              "Swing_DZ": round(sw_lvl, 2),
+              "Run_Up_%": round(run_up_at_entry, 2),
+              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+              "Entry_Price": round(entry_price, 2),
+              "SL_Price": round(sl_price, 2),
+              "TP_Price": round(tp_price, 2),
+              "Result": "LOSS",
+              "PnL_%": round(pnl, 2),
+          })
+          in_trade = False
           break
 
-        prior_max = running_max_high
-        running_max_high = max(running_max_high, d_high)
+        if d_high >= tp_price:
+          pnl = ((tp_price - entry_price) / entry_price) * 100.0
+          trades.append({
+              "Symbol": symbol,
+              "Signal": signal_name,
+              "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
+              "Swing_DZ": round(sw_lvl, 2),
+              "Run_Up_%": round(run_up_at_entry, 2),
+              "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
+              "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
+              "Entry_Price": round(entry_price, 2),
+              "SL_Price": round(sl_price, 2),
+              "TP_Price": round(tp_price, 2),
+              "Result": "WIN",
+              "PnL_%": round(pnl, 2),
+          })
+          in_trade = False
+          break
+        continue
 
-        if np.isnan(d_avg_to) or d_avg_to < min_turnover:
-          continue
-        if d_close <= d_ema200:
-          continue
+      if first_trigger_only and taken_for_swing:
+        break
 
-        if prior_max < run_target_lvl or d_close >= prior_max:
-          continue
+      prior_max = running_max_high
+      running_max_high = max(running_max_high, d_high)
 
-        # Pullback into flipped Swing_DZ
-        in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
+      if np.isnan(d_avg_to) or d_avg_to < min_turnover:
+        continue
+      if d_close <= d_ema200:
+        continue
 
-        # Liquidity Sweep: wick takes out recent 5D low (or sw_lvl) and reclaims back above
-        recent_swing_low = float(np.min(lows[k - liq_lookback : k]))
-        liq_level = min(recent_swing_low, sw_lvl)
-        liquidity_swept = (d_low < liq_level) and (d_close >= liq_level)
+      if prior_max < run_target_lvl or d_close >= prior_max:
+        continue
 
-        if in_or_near_dz and liquidity_swept:
-          bull_sig = get_bullish_signal(
-              float(opens[k - 1]),
-              float(highs[k - 1]),
-              float(lows[k - 1]),
-              float(closes[k - 1]),
-              d_open,
-              d_high,
-              d_low,
-              d_close,
-          )
-          if bull_sig:
-            cand_sl = min(d_low, sw_lvl) * 0.99
-            risk_pts = d_close - cand_sl
-            if risk_pts <= 0:
-              continue
+      in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
+      recent_swing_low = float(np.min(lows[k - liq_lookback : k]))
+      liq_level = min(recent_swing_low, sw_lvl)
+      liquidity_swept = (d_low < liq_level) and (d_close >= liq_level)
 
-            taken_for_swing = True
-            signal_name = f"LIQ_{bull_sig}"
-            run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
-            entry_price = d_close
-            sl_price = cand_sl
-            tp_price = entry_price + (rr_ratio * risk_pts)
-            entry_dt = curr_dt
-            in_trade = True
+      if in_or_near_dz and liquidity_swept:
+        bull_sig = get_bullish_signal(
+            float(opens[k - 1]),
+            float(highs[k - 1]),
+            float(lows[k - 1]),
+            float(closes[k - 1]),
+            d_open,
+            d_high,
+            d_low,
+            d_close,
+        )
+        if bull_sig:
+          cand_sl = min(d_low, sw_lvl) * 0.99
+          risk_pts = d_close - cand_sl
+          if risk_pts <= 0:
+            continue
+
+          taken_for_swing = True
+          signal_name = f"LIQ_{bull_sig}"
+          run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
+          entry_price = d_close
+          sl_price = cand_sl
+          tp_price = entry_price + (rr_ratio * risk_pts)
+          entry_dt = curr_dt
+          in_trade = True
 
     return trades
   except Exception:
@@ -299,7 +320,7 @@ def backtest_swing_breakout_with_liquidity(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_swing_breakout_with_liquidity(
+  t = backtest_first_swing_liquidity(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
@@ -320,7 +341,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY")
+  print(" BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY (STOCKS)")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -328,7 +349,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_SWING_BREAKOUT_LIQUIDITY_LOG"
+  tab_name = "M_SWING_FIRST_LIQ_STOCKS_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -337,7 +358,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: MONTHLY SWING BREAKOUT + PULLBACK + LIQUIDITY SWEEP |"
+        "BACKTEST: FIRST RECENT MONTHLY SWING + LIQUIDITY (STOCKS ONLY) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -360,4 +381,3 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
