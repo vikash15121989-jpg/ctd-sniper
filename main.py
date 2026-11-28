@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER READY FOR TOMORROW: SWING CROSSED, PULLBACK & CHARTINK"
-    " LINKS ==="
+    "=== CTD_SNIPER READY FOR TOMORROW: SWING CROSSED, PULLBACK &"
+    " TRADINGVIEW LINKS ==="
 )
 
 # -------------------------------------------------------------
@@ -55,10 +55,10 @@ def is_equity_stock(symbol: str) -> bool:
   return True
 
 
-def chartink_formula(symbol: str) -> str:
-  c = clean_symbol(symbol).lower()
-  url = f"https://chartink.com/stocks/{c}.html"
-  return f'=HYPERLINK("{url}", "Chartink: {clean_symbol(symbol)}")'
+def tradingview_formula(symbol: str) -> str:
+  c = clean_symbol(symbol)
+  url = f"https://www.tradingview.com/chart/?symbol=NSE:{c}"
+  return f'=HYPERLINK("{url}", "TV: {c}")'
 
 
 try:
@@ -162,10 +162,13 @@ def scan_tomorrow_setups(
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
-    zone_tol_pct=1.5,
+    zone_tol_pct=1.0,
+    require_bullish_candle=True,
 ):
   """
     Returns (crossed_row, pullback_row, ready_row) for tomorrow's sheet.
+    - crossed_row  : All liquid stocks above 200 EMA that crossed recent monthly swing high.
+    - pullback_row & ready_row : Only stocks with >= min_run_pct rally + pullback into Swing_DZ (+- zone_tol_pct).
     """
   crossed_row = None
   pullback_row = None
@@ -246,7 +249,7 @@ def scan_tomorrow_setups(
     as_of_str = df_d.index[-1].strftime("%Y-%m-%d")
     sw_date_str = sw["swing_date"].strftime("%Y-%m")
     avg_to_cr = round(d_avg_to / 10_000_000, 2)
-    c_link = chartink_formula(sym_clean)
+    tv_link = tradingview_formula(sym_clean)
 
     crossed_row = [
         sym_clean,
@@ -258,7 +261,7 @@ def scan_tomorrow_setups(
         avg_to_cr,
         above_200ema_str,
         as_of_str,
-        c_link,
+        tv_link,
     ]
 
     in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
@@ -275,11 +278,15 @@ def scan_tomorrow_setups(
           d_low,
           d_close,
       )
+      if require_bullish_candle and not bull_sig:
+        return crossed_row, None, None
+
       cand_sl = min(d_low, sw_lvl) * 0.99
       risk_pts = d_close - cand_sl
-      tp_val = (
-          round(d_close + (rr_ratio * risk_pts), 2) if risk_pts > 0 else ""
-      )
+      if risk_pts <= 0:
+        return crossed_row, None, None
+
+      tp_val = round(d_close + (rr_ratio * risk_pts), 2)
       sig_label = bull_sig if bull_sig else "PULLBACK_IN_ZONE"
       zone_str = f"{round(dz_low, 2)}-{round(dz_high, 2)}"
 
@@ -294,33 +301,20 @@ def scan_tomorrow_setups(
           tp_val,
           avg_to_cr,
           as_of_str,
-          c_link,
+          tv_link,
       ]
 
       ready_row = [
           sym_clean,
-          "PULLBACK_READY",
           sw_date_str,
           zone_str,
           round(d_close, 2),
+          round(max_run_up_pct, 2),
           sig_label,
           round(cand_sl, 2),
           tp_val,
           avg_to_cr,
-          c_link,
-      ]
-    else:
-      ready_row = [
-          sym_clean,
-          "SWING_CROSSED",
-          sw_date_str,
-          f"{round(dz_low, 2)}-{round(dz_high, 2)}",
-          round(d_close, 2),
-          f"RUN_UP_{round(max_run_up_pct, 1)}%",
-          "",
-          "",
-          avg_to_cr,
-          c_link,
+          tv_link,
       ]
 
     return crossed_row, pullback_row, ready_row
@@ -358,7 +352,8 @@ for sym in STOCKS:
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
-      zone_tol_pct=1.5,
+      zone_tol_pct=1.0,
+      require_bullish_candle=True,
   )
   if c_row:
     crossed_list.append(c_row)
@@ -366,9 +361,6 @@ for sym in STOCKS:
     pullback_list.append(p_row)
   if r_row:
     ready_list.append(r_row)
-
-# Sort READY_FOR_TOMORROW so PULLBACK_READY comes first
-ready_list.sort(key=lambda x: (0 if x[1] == "PULLBACK_READY" else 1, x[0]))
 
 run_stamp = datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
 
@@ -386,7 +378,7 @@ write_tab(
         "Avg Turnover (Cr)",
         "Above 200 EMA",
         "As Of Date",
-        "Chartink Chart",
+        "TradingView Chart",
     ],
     crossed_list,
 )
@@ -398,7 +390,7 @@ write_tab(
     [
         "Symbol",
         "Swing Date",
-        "Swing Zone (±1.5%)",
+        "Swing Zone (±1.0%)",
         "LTP / Close",
         "Max Run-Up %",
         "Candle Signal",
@@ -406,7 +398,7 @@ write_tab(
         "Indicative TP (1:2)",
         "Avg Turnover (Cr)",
         "As Of Date",
-        "Chartink Chart",
+        "TradingView Chart",
     ],
     pullback_list,
 )
@@ -414,18 +406,18 @@ write_tab(
 write_tab(
     sh,
     "READY_FOR_TOMORROW",
-    f"READY FOR TOMORROW (PULLBACK + CROSSED SETUPS) | {run_stamp}",
+    f"READY FOR TOMORROW (STRICT PULLBACK + BULLISH CANDLE) | {run_stamp}",
     [
         "Symbol",
-        "Setup Status",
         "Swing Date",
-        "Swing Zone (±1.5%)",
+        "Swing Zone (±1.0%)",
         "LTP / Close",
-        "Signal / Run-Up",
+        "Max Run-Up %",
+        "Candle Signal",
         "Indicative SL",
         "Indicative TP (1:2)",
         "Avg Turnover (Cr)",
-        "Chartink Chart",
+        "TradingView Chart",
     ],
     ready_list,
 )
@@ -433,5 +425,5 @@ write_tab(
 print(
     "✅ Updated 'SWING_CROSSED_READY' ("
     f"{len(crossed_list)}), 'PULLBACK_NEAR_SWING' ({len(pullback_list)}), &"
-    f" 'READY_FOR_TOMORROW' ({len(ready_list)}) with Chartink links!"
-        )
+    f" 'READY_FOR_TOMORROW' ({len(ready_list)}) with TradingView links!"
+)
