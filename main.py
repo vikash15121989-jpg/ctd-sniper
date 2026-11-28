@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: RANGE POC (SW_HIGH -> SW_LOW) + BREAK + SWIPE"
-    " + POC ==="
+    "=== CTD_SNIPER BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST +"
+    " BULLISH CANDLE ==="
 )
 
 # -------------------------------------------------------------
@@ -31,23 +31,16 @@ except Exception as e:
   STOCKS = []
 
 
-def compute_range_poc(sub_df, price_low=None, price_high=None, bins=50):
+def compute_poc(sub_df, bins=40):
   """
-    Computes Volume Profile Point of Control (POC) over a specific range
-    (like SW_High -> SW_Low range box in chart), using typical price `(H+L+C)/3`
-    weighted by `Volume`.
+    Computes Volume Profile Point of Control (POC) from daily bars
+    using typical price `(H + L + C) / 3` weighted by `Volume`.
     """
-  if sub_df is None or len(sub_df) < 3:
+  if sub_df is None or len(sub_df) < 5:
     return None
 
-  low_min = (
-      float(price_low) if price_low is not None else float(sub_df["Low"].min())
-  )
-  high_max = (
-      float(price_high)
-      if price_high is not None
-      else float(sub_df["High"].max())
-  )
+  low_min = float(sub_df["Low"].min())
+  high_max = float(sub_df["High"].max())
   if high_max <= low_min:
     return None
 
@@ -69,12 +62,25 @@ def compute_range_poc(sub_df, price_low=None, price_high=None, bins=50):
   return float(0.5 * (edges[best_bin] + edges[best_bin + 1]))
 
 
-def get_daily_bullish_signal(
-    prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l, curr_c
+def get_clean_bullish_signal(
+    prev_o,
+    prev_h,
+    prev_l,
+    prev_c,
+    curr_o,
+    curr_h,
+    curr_l,
+    curr_c,
+    min_range_pct=1.5,
 ):
-  """Returns bullish reversal candle signal."""
+  """
+    Returns strong bullish reversal candle signal while filtering out
+    tiny flat/doji candles (`total_range / curr_c >= min_range_pct / 100`).
+    """
+  if curr_c <= 0:
+    return ""
   total_range = curr_h - curr_l
-  if total_range <= 1e-9:
+  if total_range <= 1e-9 or ((total_range / curr_c) * 100.0) < min_range_pct:
     return ""
 
   body = abs(curr_c - curr_o)
@@ -94,106 +100,73 @@ def get_daily_bullish_signal(
   # 2. Hammer / Strong Lower Wick Rejection
   if (
       curr_c >= curr_o
-      and body > 1e-9
-      and lower_wick >= 1.8 * body
-      and upper_wick <= 0.4 * body
+      and (body / curr_c) >= 0.004
+      and lower_wick >= 2.0 * body
+      and upper_wick <= 0.35 * body
   ):
     return "HAMMER"
 
-  # 3. Clean Bullish Green Candle
+  # 3. Strong Bullish Green Candle
   if (
       is_green
-      and (body / total_range) >= 0.40
-      and ((curr_c - curr_l) / total_range) >= 0.60
+      and (body / total_range) >= 0.50
+      and ((curr_c - curr_l) / total_range) >= 0.75
+      and curr_c > prev_h
   ):
-    return "BULLISH_GREEN"
+    return "STRONG_BULLISH_GREEN"
 
   return ""
 
 
-def find_high_low_break_setups(df_m, lookback=2, max_age_days=1095):
-  """
-    Finds monthly structures:
-    1) Monthly Swing High (`sw_high`)
-    2) Subsequent Monthly Swing Low (`sw_low`)
-    3) Swing High break (`break_idx`)
-    """
+def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
+  """Finds monthly swing highs broken by a subsequent monthly close."""
   highs = df_m["High"].values
-  lows = df_m["Low"].values
   closes = df_m["Close"].values
   dates = df_m.index
   n = len(df_m)
-  if n < (lookback * 2 + 3):
+  if n < (lookback * 2 + 2):
     return []
 
   last_dt = dates[-1]
-  swing_highs = []
-  swing_lows = []
+  swings = []
 
   for j in range(lookback, n - lookback):
     if (last_dt - dates[j]).days > max_age_days:
       continue
 
-    hv = float(highs[j])
-    if all(hv > float(highs[k]) for k in range(j - lookback, j)) and all(
-        hv > float(highs[k]) for k in range(j + 1, j + lookback + 1)
-    ):
-      swing_highs.append({"idx": j, "date": dates[j], "price": hv})
-
-    lv = float(lows[j])
-    if all(lv < float(lows[k]) for k in range(j - lookback, j)) and all(
-        lv < float(lows[k]) for k in range(j + 1, j + lookback + 1)
-    ):
-      swing_lows.append({"idx": j, "date": dates[j], "price": lv})
-
-  setups = []
-  for sh_item in swing_highs:
-    h_idx = sh_item["idx"]
-    sw_high = sh_item["price"]
-
-    subsequent_lows = [sl for sl in swing_lows if sl["idx"] > h_idx]
-    if not subsequent_lows:
-      continue
-    sl_item = subsequent_lows[0]
-    l_idx = sl_item["idx"]
-    sw_low = sl_item["price"]
-
-    if sw_low >= sw_high * 0.98:
+    val = float(highs[j])
+    left_ok = all(val > float(highs[k]) for k in range(j - lookback, j))
+    right_ok = all(
+        val > float(highs[k]) for k in range(j + 1, j + lookback + 1)
+    )
+    if not (left_ok and right_ok):
       continue
 
-    break_idx = None
-    for k in range(h_idx + 1, n):
-      if float(closes[k]) > sw_high or float(highs[k]) > sw_high * 1.005:
-        break_idx = k
+    for k in range(j + 1, n):
+      if float(closes[k]) > val:
+        swings.append({
+            "swing_date": dates[j],
+            "level": val,
+            "break_month_start": dates[k],
+        })
         break
 
-    if break_idx is not None:
-      start_scan_idx = max(l_idx, break_idx)
-      if start_scan_idx < n:
-        setups.append({
-            "sw_high_date": sh_item["date"],
-            "sw_high": sw_high,
-            "sw_low_date": sl_item["date"],
-            "sw_low": sw_low,
-            "break_date": dates[break_idx],
-            "scan_start_date": dates[start_scan_idx],
-        })
-
-  return setups
+  return swings
 
 
-def backtest_range_poc_after_swipe(
+def backtest_breakout_poc_retest(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
-    swipe_tol_pct=0.5,
-    poc_tol_pct=2.0,
-    first_trade_only=True,
+    min_run_pct=5.0,
+    poc_tol_pct=1.5,
+    min_range_pct=1.5,
+    first_retest_only=True,
 ):
   """
-    Computes POC inside `[sw_high_date` to `sw_low_date]` range (bounded by `[sw_low, sw_high]`).
-    After `sw_high` breaks and `sw_low` liquidity swipe happens, enters when price is
-    near `POC` (`<= poc_tol_pct`) with bullish reversal signal & above 200 EMA.
+    After Monthly Swing High breakout + >=5% run-up:
+    Computes POC of the post-breakout impulse/consolidation slice,
+    and enters on the first clean bullish reversal candle retesting POC.
     """
   trades = []
   try:
@@ -229,30 +202,16 @@ def backtest_range_poc_after_swipe(
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
 
-    setups = find_high_low_break_setups(df_m, lookback=2, max_age_days=1095)
-    if not setups:
+    swings = get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095)
+    if not swings:
       return trades
 
-    for st in setups:
-      sw_high = st["sw_high"]
-      sw_low = st["sw_low"]
+    for sw in swings:
+      sw_lvl = sw["level"]
+      run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
 
-      # Range slice from SW_High month start through SW_Low month end
-      range_df = df_d[
-          (df_d.index >= st["sw_high_date"])
-          & (df_d.index < (st["sw_low_date"] + pd.offsets.MonthEnd(1)))
-      ]
-      poc_val = compute_range_poc(
-          range_df, price_low=sw_low, price_high=sw_high, bins=50
-      )
-      if poc_val is None or poc_val <= 0:
-        continue
-
-      swipe_trigger_lvl = sw_low * (1.0 + swipe_tol_pct / 100.0)
-      reclaim_min_lvl = sw_low * 0.99
-
-      sub = df_d[df_d.index >= st["scan_start_date"]]
-      if len(sub) < 3:
+      sub = df_d[df_d.index >= sw["break_month_start"]]
+      if len(sub) < 6:
         continue
 
       opens = sub["Open"].values
@@ -264,18 +223,17 @@ def backtest_range_poc_after_swipe(
       dates = sub.index
 
       in_trade = False
-      taken_for_setup = False
-      swipe_seen = False
-      swipe_bar_idx = None
-
+      taken_for_swing = False
+      running_max_high = float(highs[0])
       entry_price = 0.0
       sl_price = 0.0
       tp_price = 0.0
       entry_dt = None
       signal_name = ""
-      poc_dist_pct = 0.0
+      poc_at_entry = 0.0
+      run_up_at_entry = 0.0
 
-      for k in range(1, len(sub)):
+      for k in range(5, len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
@@ -290,11 +248,10 @@ def backtest_range_poc_after_swipe(
             trades.append({
                 "Symbol": symbol,
                 "Signal": signal_name,
-                "SW_High": round(sw_high, 2),
-                "SW_Low": round(sw_low, 2),
-                "Range_POC": round(poc_val, 2),
-                "POC_Dist_%": round(poc_dist_pct, 2),
-                "Break_Month": st["break_date"].strftime("%Y-%m"),
+                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
+                "Swing_DZ": round(sw_lvl, 2),
+                "POC": round(poc_at_entry, 2),
+                "Run_Up_%": round(run_up_at_entry, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -311,11 +268,10 @@ def backtest_range_poc_after_swipe(
             trades.append({
                 "Symbol": symbol,
                 "Signal": signal_name,
-                "SW_High": round(sw_high, 2),
-                "SW_Low": round(sw_low, 2),
-                "Range_POC": round(poc_val, 2),
-                "POC_Dist_%": round(poc_dist_pct, 2),
-                "Break_Month": st["break_date"].strftime("%Y-%m"),
+                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
+                "Swing_DZ": round(sw_lvl, 2),
+                "POC": round(poc_at_entry, 2),
+                "Run_Up_%": round(run_up_at_entry, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -328,51 +284,58 @@ def backtest_range_poc_after_swipe(
             break
           continue
 
-        if first_trade_only and taken_for_setup:
+        if first_retest_only and taken_for_swing:
           break
+
+        prior_max = running_max_high
+        running_max_high = max(running_max_high, d_high)
 
         if np.isnan(d_avg_to) or d_avg_to < min_turnover:
           continue
+        if d_close <= d_ema200 or d_close < (sw_lvl * 0.99):
+          continue
 
-        # Step 1: Liquidity swipe near SW_Low
-        swept_low = (d_low <= swipe_trigger_lvl) and (d_close >= reclaim_min_lvl)
-        if swept_low:
-          swipe_seen = True
-          swipe_bar_idx = k
+        # Must have achieved >= min_run_pct before current pullback
+        if prior_max < run_target_lvl or d_close >= prior_max:
+          continue
 
-        # Step 2: After swipe, check if price is near the Range POC + bullish candle + above 200 EMA
-        if swipe_seen and (k - swipe_bar_idx) <= 12 and d_close > d_ema200:
-          dist_from_poc = abs(d_close - poc_val) / poc_val * 100.0
-          near_poc = (dist_from_poc <= poc_tol_pct) or (
-              d_low <= poc_val * (1.0 + poc_tol_pct / 100.0)
-              and d_high >= poc_val * (1.0 - poc_tol_pct / 100.0)
+        # Compute POC from breakout month start up to current bar
+        poc_val = compute_poc(sub.iloc[: k + 1], bins=40)
+        if poc_val is None or poc_val <= 0:
+          continue
+
+        poc_upper = poc_val * (1.0 + poc_tol_pct / 100.0)
+        poc_lower = poc_val * (1.0 - poc_tol_pct / 100.0)
+
+        # Price retests POC zone and holds above lower bound
+        retested_poc = (d_low <= poc_upper) and (d_close >= poc_lower)
+        if retested_poc:
+          bull_sig = get_clean_bullish_signal(
+              float(opens[k - 1]),
+              float(highs[k - 1]),
+              float(lows[k - 1]),
+              float(closes[k - 1]),
+              d_open,
+              d_high,
+              d_low,
+              d_close,
+              min_range_pct=min_range_pct,
           )
+          if bull_sig:
+            cand_sl = min(d_low, poc_val, sw_lvl) * 0.99
+            risk_pts = d_close - cand_sl
+            if risk_pts <= 0 or ((risk_pts / d_close) * 100.0) > 6.5:
+              continue
 
-          if near_poc:
-            bull_sig = get_daily_bullish_signal(
-                float(opens[k - 1]),
-                float(highs[k - 1]),
-                float(lows[k - 1]),
-                float(closes[k - 1]),
-                d_open,
-                d_high,
-                d_low,
-                d_close,
-            )
-            if bull_sig:
-              cand_sl = min(d_low, sw_low) * 0.99
-              risk_pts = d_close - cand_sl
-              if risk_pts <= 0:
-                continue
-
-              taken_for_setup = True
-              signal_name = bull_sig
-              poc_dist_pct = dist_from_poc
-              entry_price = d_close
-              sl_price = cand_sl
-              tp_price = entry_price + (rr_ratio * risk_pts)
-              entry_dt = curr_dt
-              in_trade = True
+            taken_for_swing = True
+            signal_name = bull_sig
+            poc_at_entry = poc_val
+            run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
+            entry_price = d_close
+            sl_price = cand_sl
+            tp_price = entry_price + (rr_ratio * risk_pts)
+            entry_dt = curr_dt
+            in_trade = True
 
     return trades
   except Exception:
@@ -384,13 +347,14 @@ def backtest_range_poc_after_swipe(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_range_poc_after_swipe(
+  t = backtest_breakout_poc_retest(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
-      swipe_tol_pct=0.5,
-      poc_tol_pct=2.0,
-      first_trade_only=True,
+      min_run_pct=5.0,
+      poc_tol_pct=1.5,
+      min_range_pct=1.5,
+      first_retest_only=True,
   )
   if t:
     all_trades.extend(t)
@@ -404,7 +368,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: RANGE POC + SW HIGH BREAK + SW LOW SWIPE")
+  print(" BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -412,26 +376,25 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_RANGE_POC_SWIPE_BACKTEST_LOG"
+  tab_name = "M_BREAKOUT_RUNUP_POC_RETEST_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 3000, 15)
+        else sh.add_worksheet(tab_name, 3000, 14)
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: RANGE POC + SW HIGH BREAK + SW LOW SWIPE |"
+        "BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
         "Signal",
-        "SW High",
-        "SW Low",
-        "Range POC",
-        "POC Dist %",
-        "Break Month",
+        "Swing Date",
+        "Swing DZ",
+        "POC",
+        "Run Up %",
         "Entry Date",
         "Exit Date",
         "Entry Price",
@@ -446,4 +409,4 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-    
+      
