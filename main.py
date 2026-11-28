@@ -10,7 +10,7 @@ import yfinance as yf
 IST = pytz.timezone("Asia/Kolkata")
 print(
     "=== CTD_SNIPER BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3) +"
-    " PULLBACK (LIQUID STOCKS ONLY) ==="
+    " PULLBACK NEAR FVG (LIQUID STOCKS) ==="
 )
 
 # -------------------------------------------------------------
@@ -138,19 +138,63 @@ def get_first_recent_monthly_swing(df_m, lookback=3):
   return None
 
 
-def backtest_first_swing_liquid_stocks(
+def find_largest_bullish_fvg(
+    opens, highs, lows, closes, start_idx, end_idx, min_range_window=20
+):
+  """
+    Finds the bullish green candle in [start_idx, end_idx) that has the LARGEST candle range
+    (comparing against recent `min_range_window` candles), then builds FVG from:
+    - fvg_low  = next candle's Low (idx + 1)
+    - fvg_high = previous candle's High (idx - 1)
+    Returns (fvg_low, fvg_high, fvg_idx) or None.
+    """
+  if end_idx - start_idx < 3:
+    return None
+
+  ranges = highs - lows
+  best_idx = None
+  best_range = -1.0
+
+  for idx in range(max(1, start_idx), min(len(closes) - 1, end_idx)):
+    is_bull_green = float(closes[idx]) > float(opens[idx])
+    if not is_bull_green:
+      continue
+
+    win_start = max(0, idx - min_range_window)
+    max_recent_range = float(np.max(ranges[win_start : idx + 1]))
+    curr_range = float(ranges[idx])
+
+    if curr_range >= max_recent_range and curr_range > best_range:
+      fvg_low = float(lows[idx + 1])
+      fvg_high = float(highs[idx - 1])
+      if fvg_high > fvg_low:
+        best_range = curr_range
+        best_idx = idx
+
+  if best_idx is None:
+    return None
+
+  return (
+      float(lows[best_idx + 1]),
+      float(highs[best_idx - 1]),
+      best_idx,
+  )
+
+
+def backtest_first_swing_fvg(
     symbol,
     lookback=3,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=3.0,
     zone_tol_pct=1.5,
+    fvg_tol_pct=1.0,
     first_trigger_only=True,
 ):
   """
-    First recent monthly swing (right-to-left, lookback=3) -> Daily breakout -> >= min_run_pct rally
-    -> Pullback into flipped Swing_DZ (+- zone_tol_pct) above 200 EMA & min_turnover
-    -> Bullish reversal candle -> Entry at close with 1:rr_ratio RR
+    First recent monthly swing (lookback=3) -> Daily breakout -> >= min_run_pct rally
+    -> Pullback into flipped Swing_DZ (+- zone_tol_pct) near Bullish FVG (+- fvg_tol_pct)
+    above 200 EMA & min_turnover -> Bullish reversal candle -> Entry at close with 1:rr_ratio RR.
     """
   trades = []
   try:
@@ -198,7 +242,7 @@ def backtest_first_swing_liquid_stocks(
     dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
 
     sub = df_d[df_d.index >= sw["break_month_start"]]
-    if len(sub) < 3:
+    if len(sub) < 4:
       return trades
 
     opens = sub["Open"].values
@@ -219,8 +263,9 @@ def backtest_first_swing_liquid_stocks(
     entry_dt = None
     signal_name = ""
     run_up_at_entry = 0.0
+    fvg_zone_str = ""
 
-    for k in range(1, len(sub)):
+    for k in range(2, len(sub)):
       d_open = float(opens[k])
       d_high = float(highs[k])
       d_low = float(lows[k])
@@ -237,6 +282,7 @@ def backtest_first_swing_liquid_stocks(
               "Signal": signal_name,
               "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
               "Swing_DZ": round(sw_lvl, 2),
+              "FVG_Zone": fvg_zone_str,
               "Run_Up_%": round(run_up_at_entry, 2),
               "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
               "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
@@ -256,6 +302,7 @@ def backtest_first_swing_liquid_stocks(
               "Signal": signal_name,
               "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
               "Swing_DZ": round(sw_lvl, 2),
+              "FVG_Zone": fvg_zone_str,
               "Run_Up_%": round(run_up_at_entry, 2),
               "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
               "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
@@ -275,7 +322,6 @@ def backtest_first_swing_liquid_stocks(
       prior_max = running_max_high
       running_max_high = max(running_max_high, d_high)
 
-      # Liquid stock check (20-day avg turnover) + 200 EMA trend filter
       if np.isnan(d_avg_to) or d_avg_to < min_turnover:
         continue
       if d_close <= d_ema200:
@@ -285,7 +331,21 @@ def backtest_first_swing_liquid_stocks(
         continue
 
       in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
-      if in_or_near_dz:
+      if not in_or_near_dz:
+        continue
+
+      fvg_info = find_largest_bullish_fvg(
+          opens, highs, lows, closes, start_idx=0, end_idx=k
+      )
+      if fvg_info is None:
+        continue
+
+      fvg_low, fvg_high, _ = fvg_info
+      near_fvg_low = fvg_low * (1.0 - fvg_tol_pct / 100.0)
+      near_fvg_high = fvg_high * (1.0 + fvg_tol_pct / 100.0)
+      near_fvg = (d_low <= near_fvg_high) and (d_high >= near_fvg_low)
+
+      if near_fvg:
         bull_sig = get_bullish_signal(
             float(opens[k - 1]),
             float(highs[k - 1]),
@@ -297,13 +357,14 @@ def backtest_first_swing_liquid_stocks(
             d_close,
         )
         if bull_sig:
-          cand_sl = min(d_low, sw_lvl) * 0.99
+          cand_sl = min(d_low, sw_lvl, fvg_low) * 0.99
           risk_pts = d_close - cand_sl
           if risk_pts <= 0:
             continue
 
           taken_for_swing = True
-          signal_name = bull_sig
+          signal_name = f"FVG_{bull_sig}"
+          fvg_zone_str = f"{round(fvg_low, 2)}-{round(fvg_high, 2)}"
           run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
           entry_price = d_close
           sl_price = cand_sl
@@ -321,13 +382,14 @@ def backtest_first_swing_liquid_stocks(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_first_swing_liquid_stocks(
+  t = backtest_first_swing_fvg(
       sym,
       lookback=3,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=3.0,
       zone_tol_pct=1.5,
+      fvg_tol_pct=1.0,
       first_trigger_only=True,
   )
   if t:
@@ -342,7 +404,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3, LIQUID)")
+  print(" BACKTEST: FIRST RECENT MONTHLY SWING + NEAR FVG (LIQUID)")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -350,16 +412,16 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_SWING_FIRST_LIQUID_STOCKS_LOG"
+  tab_name = "M_SWING_FIRST_LIQ_FVG_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 3000, 14)
+        else sh.add_worksheet(tab_name, 3000, 15)
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: FIRST RECENT MONTHLY SWING (LOOKBACK=3, LIQUID STOCKS) |"
+        "BACKTEST: FIRST RECENT MONTHLY SWING + NEAR FVG (LIQUID STOCKS) |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -367,6 +429,7 @@ if len(all_trades) > 0:
         "Signal",
         "Swing Date",
         "Swing DZ",
+        "FVG Zone",
         "Run Up %",
         "Entry Date",
         "Exit Date",
