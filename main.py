@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: REFINED MONTHLY SWING BREAKOUT (WIN-RATE"
-    " BOOST) ==="
+    "=== CTD_SNIPER BACKTEST: M SWING -> D BREAK -> >=3% RUN -> RETEST SW"
+    " HIGH -> NEXT OPEN ==="
 )
 
 # -------------------------------------------------------------
@@ -31,25 +31,12 @@ except Exception as e:
   STOCKS = []
 
 
-def get_clean_bullish_signal(
-    prev_o,
-    prev_h,
-    prev_l,
-    prev_c,
-    curr_o,
-    curr_h,
-    curr_l,
-    curr_c,
-    min_range_pct=1.5,
+def get_bullish_candle(
+    prev_o, prev_h, prev_l, prev_c, curr_o, curr_h, curr_l, curr_c
 ):
-  """
-    Returns strong bullish reversal signal while filtering out
-    tiny flat/doji candles (`total_range / curr_c >= min_range_pct / 100`).
-    """
-  if curr_c <= 0:
-    return ""
+  """Returns bullish reversal candle tag on retest."""
   total_range = curr_h - curr_l
-  if total_range <= 1e-9 or ((total_range / curr_c) * 100.0) < min_range_pct:
+  if total_range <= 1e-9 or curr_c <= 0:
     return ""
 
   body = abs(curr_c - curr_o)
@@ -66,31 +53,29 @@ def get_clean_bullish_signal(
   ):
     return "BULLISH_ENGULFING"
 
-  # 2. Hammer / Strong Lower Wick Rejection
+  # 2. Hammer
   if (
       curr_c >= curr_o
-      and (body / curr_c) >= 0.004
-      and lower_wick >= 2.0 * body
-      and upper_wick <= 0.35 * body
+      and body > 1e-9
+      and lower_wick >= 1.8 * body
+      and upper_wick <= 0.4 * body
   ):
     return "HAMMER"
 
-  # 3. Strong Bullish Green Candle
+  # 3. Clean Bullish Green Candle
   if (
       is_green
-      and (body / total_range) >= 0.50
-      and ((curr_c - curr_l) / total_range) >= 0.75
-      and curr_c > prev_h
+      and (body / total_range) >= 0.45
+      and ((curr_c - curr_l) / total_range) >= 0.65
   ):
-    return "STRONG_BULLISH_GREEN"
+    return "BULLISH_GREEN"
 
   return ""
 
 
-def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
-  """Finds monthly swing highs broken by a subsequent monthly close."""
+def get_monthly_swing_highs(df_m, lookback=2, max_age_days=1095):
+  """Finds monthly swing highs."""
   highs = df_m["High"].values
-  closes = df_m["Close"].values
   dates = df_m.index
   n = len(df_m)
   if n < (lookback * 2 + 2):
@@ -108,38 +93,29 @@ def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
     right_ok = all(
         val > float(highs[k]) for k in range(j + 1, j + lookback + 1)
     )
-    if not (left_ok and right_ok):
-      continue
-
-    for k in range(j + 1, n):
-      if float(closes[k]) > val:
-        swings.append({
-            "swing_date": dates[j],
-            "level": val,
-            "break_month_start": dates[k],
-        })
-        break
+    if left_ok and right_ok:
+      swings.append({
+          "swing_date": dates[j],
+          "level": val,
+      })
 
   return swings
 
 
-def backtest_refined_swing_breakout(
+def backtest_m_swing_d_break_3run_retest_next_open(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
-    min_run_pct=5.0,
-    zone_tol_pct=1.5,
-    min_range_pct=1.5,
-    min_break_vol_mult=1.5,
-    first_pullback_only=True,
+    min_run_pct=3.0,
+    retest_tol_pct=1.0,
+    first_retest_only=True,
 ):
   """
-    Refined version of the high-performing monthly swing breakout pullback setup:
-    - Monthly swing high broken + >= min_run_pct rally
-    - Breakout/post-break volume surge >= min_break_vol_mult * 20D avg volume
-    - Pullback into flipped Swing_DZ (`+- zone_tol_pct`) above 200 EMA
-    - Clean bullish reversal candle (`>= min_range_pct` range)
-    - First pullback only per broken swing
+    1. Find monthly swing high (`sw_lvl`).
+    2. On daily candles after `swing_date`, find when `sw_lvl` breaks (`close > sw_lvl`).
+    3. Require at least `min_run_pct` run-up after break (`max_peak >= sw_lvl * (1 + min_run_pct/100)`).
+    4. Pull back to retest `sw_lvl` (`low <= sw_lvl * (1 + tol)` and `close >= sw_lvl * (1 - tol)`).
+    5. On a bullish candle at retest, enter at NEXT trading day's OPEN (`k + 1`).
     """
   trades = []
   try:
@@ -174,28 +150,19 @@ def backtest_refined_swing_breakout(
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
-    df_d["Avg_Vol_20D"] = df_d["Volume"].rolling(window=20).mean()
 
-    swings = get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095)
+    swings = get_monthly_swing_highs(df_m, lookback=2, max_age_days=1095)
     if not swings:
       return trades
 
     for sw in swings:
       sw_lvl = sw["level"]
-      run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
-      dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
-      dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
+      run_req_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
+      retest_high_lvl = sw_lvl * (1.0 + retest_tol_pct / 100.0)
+      retest_low_lvl = sw_lvl * (1.0 - retest_tol_pct / 100.0)
 
-      sub = df_d[df_d.index >= sw["break_month_start"]]
+      sub = df_d[df_d.index > sw["swing_date"]]
       if len(sub) < 4:
-        continue
-
-      # Check if breakout/post-break move had strong volume surge (>= min_break_vol_mult * 20D avg vol)
-      vol_ratios = (
-          sub["Volume"].values / np.where(sub["Avg_Vol_20D"].values > 0, sub["Avg_Vol_20D"].values, np.nan)
-      )
-      max_vol_mult = float(np.nanmax(vol_ratios)) if not np.all(np.isnan(vol_ratios)) else 0.0
-      if max_vol_mult < min_break_vol_mult:
         continue
 
       opens = sub["Open"].values
@@ -206,18 +173,29 @@ def backtest_refined_swing_breakout(
       avg_to = sub["Avg_Turnover_20D"].values
       dates = sub.index
 
+      # Step 2: Find daily candle where sw_lvl breaks
+      break_idx = None
+      for idx_b in range(len(sub)):
+        if float(closes[idx_b]) > sw_lvl:
+          break_idx = idx_b
+          break
+
+      if break_idx is None or break_idx >= len(sub) - 2:
+        continue
+
       in_trade = False
+      pending_entry = False
       taken_for_swing = False
-      running_max_high = float(highs[0])
+      run_peak = float(highs[break_idx])
 
       entry_price = 0.0
       sl_price = 0.0
       tp_price = 0.0
       entry_dt = None
       signal_name = ""
-      run_up_at_entry = 0.0
+      run_pct_val = 0.0
 
-      for k in range(1, len(sub)):
+      for k in range(break_idx + 1, len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
@@ -232,10 +210,10 @@ def backtest_refined_swing_breakout(
             trades.append({
                 "Symbol": symbol,
                 "Signal": signal_name,
-                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
-                "Swing_DZ": round(sw_lvl, 2),
-                "Run_Up_%": round(run_up_at_entry, 2),
-                "Max_Vol_Mult": round(max_vol_mult, 2),
+                "Swing_Month": sw["swing_date"].strftime("%Y-%m"),
+                "SW_High": round(sw_lvl, 2),
+                "Break_Date": dates[break_idx].strftime("%Y-%m-%d"),
+                "Run_%": round(run_pct_val, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -252,10 +230,10 @@ def backtest_refined_swing_breakout(
             trades.append({
                 "Symbol": symbol,
                 "Signal": signal_name,
-                "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
-                "Swing_DZ": round(sw_lvl, 2),
-                "Run_Up_%": round(run_up_at_entry, 2),
-                "Max_Vol_Mult": round(max_vol_mult, 2),
+                "Swing_Month": sw["swing_date"].strftime("%Y-%m"),
+                "SW_High": round(sw_lvl, 2),
+                "Break_Date": dates[break_idx].strftime("%Y-%m-%d"),
+                "Run_%": round(run_pct_val, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -268,24 +246,37 @@ def backtest_refined_swing_breakout(
             break
           continue
 
-        if first_pullback_only and taken_for_swing:
+        if pending_entry:
+          entry_price = d_open
+          risk_pts = entry_price - sl_price
+          if entry_price > 0 and risk_pts > 0:
+            tp_price = entry_price + (rr_ratio * risk_pts)
+            entry_dt = curr_dt
+            in_trade = True
+            taken_for_swing = True
+          pending_entry = False
+          continue
+
+        if first_retest_only and taken_for_swing:
           break
 
-        prior_max = running_max_high
-        running_max_high = max(running_max_high, d_high)
+        prior_peak = run_peak
+        run_peak = max(run_peak, d_high)
 
+        # Step 3: Must have at least >= 3% run-up above sw_lvl after breakout
+        if prior_peak < run_req_lvl:
+          continue
         if np.isnan(d_avg_to) or d_avg_to < min_turnover:
           continue
         if d_close <= d_ema200:
           continue
 
-        # Must have run up >= min_run_pct and now be correcting back toward flipped Swing_DZ
-        if prior_max < run_target_lvl or d_close >= prior_max:
-          continue
-
-        in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
-        if in_or_near_dz:
-          bull_sig = get_clean_bullish_signal(
+        # Step 4: Price comes back to retest previous swing high
+        retesting_sw_high = (d_low <= retest_high_lvl) and (
+            d_close >= retest_low_lvl
+        )
+        if retesting_sw_high:
+          bull_sig = get_bullish_candle(
               float(opens[k - 1]),
               float(highs[k - 1]),
               float(lows[k - 1]),
@@ -294,22 +285,15 @@ def backtest_refined_swing_breakout(
               d_high,
               d_low,
               d_close,
-              min_range_pct=min_range_pct,
           )
-          if bull_sig:
-            cand_sl = min(d_low, sw_lvl) * 0.99
-            risk_pts = d_close - cand_sl
-            if risk_pts <= 0 or ((risk_pts / d_close) * 100.0) > 6.0:
-              continue
-
-            taken_for_swing = True
-            signal_name = bull_sig
-            run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
-            entry_price = d_close
-            sl_price = cand_sl
-            tp_price = entry_price + (rr_ratio * risk_pts)
-            entry_dt = curr_dt
-            in_trade = True
+          if bull_sig and (k + 1) < len(sub):
+            cand_sl = min(d_low, retest_low_lvl) * 0.99
+            next_open = float(opens[k + 1])
+            if next_open > cand_sl:
+              signal_name = bull_sig
+              run_pct_val = ((prior_peak - sw_lvl) / sw_lvl) * 100.0
+              sl_price = cand_sl
+              pending_entry = True
 
     return trades
   except Exception:
@@ -321,15 +305,13 @@ def backtest_refined_swing_breakout(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_refined_swing_breakout(
+  t = backtest_m_swing_d_break_3run_retest_next_open(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
-      min_run_pct=5.0,
-      zone_tol_pct=1.5,
-      min_range_pct=1.5,
-      min_break_vol_mult=1.5,
-      first_pullback_only=True,
+      min_run_pct=3.0,
+      retest_tol_pct=1.0,
+      first_retest_only=True,
   )
   if t:
     all_trades.extend(t)
@@ -343,7 +325,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: REFINED MONTHLY SWING BREAKOUT PULLBACK")
+  print(" BACKTEST: M SWING -> D BREAK -> >=3% RUN -> RETEST -> NEXT OPEN")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -351,25 +333,25 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_SWING_BREAKOUT_REFINED_LOG"
+  tab_name = "M_SWING_D_BREAK_3RUN_RETEST_NEXTOPEN_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
         if tab_name in [x.title for x in sh.worksheets()]
-        else sh.add_worksheet(tab_name, 3000, 14)
+        else sh.add_worksheet(tab_name, 3000, 15)
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: REFINED MONTHLY SWING BREAKOUT PULLBACK |"
-        f" {datetime.now(IST).strftime('%d-%b-%Y')}"
+        "BACKTEST: M SWING -> D BREAK -> >=3% RUN -> RETEST SW HIGH -> NEXT"
+        f" OPEN | {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
         "Symbol",
         "Signal",
-        "Swing Date",
-        "Swing DZ",
-        "Run Up %",
-        "Max Vol Mult",
+        "Swing Month",
+        "SW High",
+        "Break Date",
+        "Run %",
         "Entry Date",
         "Exit Date",
         "Entry Price",
