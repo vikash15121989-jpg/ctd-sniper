@@ -9,8 +9,8 @@ import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
 print(
-    "=== CTD_SNIPER BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST +"
-    " BULLISH CANDLE ==="
+    "=== CTD_SNIPER BACKTEST: REFINED MONTHLY SWING BREAKOUT (WIN-RATE"
+    " BOOST) ==="
 )
 
 # -------------------------------------------------------------
@@ -31,37 +31,6 @@ except Exception as e:
   STOCKS = []
 
 
-def compute_poc(sub_df, bins=40):
-  """
-    Computes Volume Profile Point of Control (POC) from daily bars
-    using typical price `(H + L + C) / 3` weighted by `Volume`.
-    """
-  if sub_df is None or len(sub_df) < 5:
-    return None
-
-  low_min = float(sub_df["Low"].min())
-  high_max = float(sub_df["High"].max())
-  if high_max <= low_min:
-    return None
-
-  tp = ((sub_df["High"] + sub_df["Low"] + sub_df["Close"]) / 3.0).values
-  vol = sub_df["Volume"].values
-
-  edges = np.linspace(low_min, high_max, bins + 1)
-  bin_vols = np.zeros(bins, dtype=float)
-
-  idx = np.clip(np.digitize(tp, edges) - 1, 0, bins - 1)
-  for b_i, v_val in zip(idx, vol):
-    if not np.isnan(v_val) and v_val > 0:
-      bin_vols[b_i] += float(v_val)
-
-  if bin_vols.sum() <= 0:
-    return None
-
-  best_bin = int(np.argmax(bin_vols))
-  return float(0.5 * (edges[best_bin] + edges[best_bin + 1]))
-
-
 def get_clean_bullish_signal(
     prev_o,
     prev_h,
@@ -74,7 +43,7 @@ def get_clean_bullish_signal(
     min_range_pct=1.5,
 ):
   """
-    Returns strong bullish reversal candle signal while filtering out
+    Returns strong bullish reversal signal while filtering out
     tiny flat/doji candles (`total_range / curr_c >= min_range_pct / 100`).
     """
   if curr_c <= 0:
@@ -154,19 +123,23 @@ def get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095):
   return swings
 
 
-def backtest_breakout_poc_retest(
+def backtest_refined_swing_breakout(
     symbol,
     rr_ratio=2.0,
     min_turnover=20_000_000,
     min_run_pct=5.0,
-    poc_tol_pct=1.5,
+    zone_tol_pct=1.5,
     min_range_pct=1.5,
-    first_retest_only=True,
+    min_break_vol_mult=1.5,
+    first_pullback_only=True,
 ):
   """
-    After Monthly Swing High breakout + >=5% run-up:
-    Computes POC of the post-breakout impulse/consolidation slice,
-    and enters on the first clean bullish reversal candle retesting POC.
+    Refined version of the high-performing monthly swing breakout pullback setup:
+    - Monthly swing high broken + >= min_run_pct rally
+    - Breakout/post-break volume surge >= min_break_vol_mult * 20D avg volume
+    - Pullback into flipped Swing_DZ (`+- zone_tol_pct`) above 200 EMA
+    - Clean bullish reversal candle (`>= min_range_pct` range)
+    - First pullback only per broken swing
     """
   trades = []
   try:
@@ -201,6 +174,7 @@ def backtest_breakout_poc_retest(
     df_d["EMA200"] = df_d["Close"].ewm(span=200, adjust=False).mean()
     df_d["Turnover"] = df_d["Close"] * df_d["Volume"]
     df_d["Avg_Turnover_20D"] = df_d["Turnover"].rolling(window=20).mean()
+    df_d["Avg_Vol_20D"] = df_d["Volume"].rolling(window=20).mean()
 
     swings = get_broken_monthly_swings(df_m, lookback=3, max_age_days=1095)
     if not swings:
@@ -209,9 +183,19 @@ def backtest_breakout_poc_retest(
     for sw in swings:
       sw_lvl = sw["level"]
       run_target_lvl = sw_lvl * (1.0 + min_run_pct / 100.0)
+      dz_high = sw_lvl * (1.0 + zone_tol_pct / 100.0)
+      dz_low = sw_lvl * (1.0 - zone_tol_pct / 100.0)
 
       sub = df_d[df_d.index >= sw["break_month_start"]]
-      if len(sub) < 6:
+      if len(sub) < 4:
+        continue
+
+      # Check if breakout/post-break move had strong volume surge (>= min_break_vol_mult * 20D avg vol)
+      vol_ratios = (
+          sub["Volume"].values / np.where(sub["Avg_Vol_20D"].values > 0, sub["Avg_Vol_20D"].values, np.nan)
+      )
+      max_vol_mult = float(np.nanmax(vol_ratios)) if not np.all(np.isnan(vol_ratios)) else 0.0
+      if max_vol_mult < min_break_vol_mult:
         continue
 
       opens = sub["Open"].values
@@ -225,15 +209,15 @@ def backtest_breakout_poc_retest(
       in_trade = False
       taken_for_swing = False
       running_max_high = float(highs[0])
+
       entry_price = 0.0
       sl_price = 0.0
       tp_price = 0.0
       entry_dt = None
       signal_name = ""
-      poc_at_entry = 0.0
       run_up_at_entry = 0.0
 
-      for k in range(5, len(sub)):
+      for k in range(1, len(sub)):
         d_open = float(opens[k])
         d_high = float(highs[k])
         d_low = float(lows[k])
@@ -250,8 +234,8 @@ def backtest_breakout_poc_retest(
                 "Signal": signal_name,
                 "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
                 "Swing_DZ": round(sw_lvl, 2),
-                "POC": round(poc_at_entry, 2),
                 "Run_Up_%": round(run_up_at_entry, 2),
+                "Max_Vol_Mult": round(max_vol_mult, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -270,8 +254,8 @@ def backtest_breakout_poc_retest(
                 "Signal": signal_name,
                 "Swing_Date": sw["swing_date"].strftime("%Y-%m"),
                 "Swing_DZ": round(sw_lvl, 2),
-                "POC": round(poc_at_entry, 2),
                 "Run_Up_%": round(run_up_at_entry, 2),
+                "Max_Vol_Mult": round(max_vol_mult, 2),
                 "Entry_Date": entry_dt.strftime("%Y-%m-%d"),
                 "Exit_Date": curr_dt.strftime("%Y-%m-%d"),
                 "Entry_Price": round(entry_price, 2),
@@ -284,7 +268,7 @@ def backtest_breakout_poc_retest(
             break
           continue
 
-        if first_retest_only and taken_for_swing:
+        if first_pullback_only and taken_for_swing:
           break
 
         prior_max = running_max_high
@@ -292,24 +276,15 @@ def backtest_breakout_poc_retest(
 
         if np.isnan(d_avg_to) or d_avg_to < min_turnover:
           continue
-        if d_close <= d_ema200 or d_close < (sw_lvl * 0.99):
+        if d_close <= d_ema200:
           continue
 
-        # Must have achieved >= min_run_pct before current pullback
+        # Must have run up >= min_run_pct and now be correcting back toward flipped Swing_DZ
         if prior_max < run_target_lvl or d_close >= prior_max:
           continue
 
-        # Compute POC from breakout month start up to current bar
-        poc_val = compute_poc(sub.iloc[: k + 1], bins=40)
-        if poc_val is None or poc_val <= 0:
-          continue
-
-        poc_upper = poc_val * (1.0 + poc_tol_pct / 100.0)
-        poc_lower = poc_val * (1.0 - poc_tol_pct / 100.0)
-
-        # Price retests POC zone and holds above lower bound
-        retested_poc = (d_low <= poc_upper) and (d_close >= poc_lower)
-        if retested_poc:
+        in_or_near_dz = (d_low <= dz_high) and (d_close >= dz_low)
+        if in_or_near_dz:
           bull_sig = get_clean_bullish_signal(
               float(opens[k - 1]),
               float(highs[k - 1]),
@@ -322,14 +297,13 @@ def backtest_breakout_poc_retest(
               min_range_pct=min_range_pct,
           )
           if bull_sig:
-            cand_sl = min(d_low, poc_val, sw_lvl) * 0.99
+            cand_sl = min(d_low, sw_lvl) * 0.99
             risk_pts = d_close - cand_sl
-            if risk_pts <= 0 or ((risk_pts / d_close) * 100.0) > 6.5:
+            if risk_pts <= 0 or ((risk_pts / d_close) * 100.0) > 6.0:
               continue
 
             taken_for_swing = True
             signal_name = bull_sig
-            poc_at_entry = poc_val
             run_up_at_entry = ((prior_max - sw_lvl) / sw_lvl) * 100.0
             entry_price = d_close
             sl_price = cand_sl
@@ -347,14 +321,15 @@ def backtest_breakout_poc_retest(
 # -------------------------------------------------------------
 all_trades = []
 for sym in STOCKS:
-  t = backtest_breakout_poc_retest(
+  t = backtest_refined_swing_breakout(
       sym,
       rr_ratio=2.0,
       min_turnover=20_000_000,
       min_run_pct=5.0,
-      poc_tol_pct=1.5,
+      zone_tol_pct=1.5,
       min_range_pct=1.5,
-      first_retest_only=True,
+      min_break_vol_mult=1.5,
+      first_pullback_only=True,
   )
   if t:
     all_trades.extend(t)
@@ -368,7 +343,7 @@ if len(all_trades) > 0:
   total_pnl = round(df_res["PnL_%"].sum(), 2)
 
   print("\n===========================================================")
-  print(" BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST")
+  print(" BACKTEST: REFINED MONTHLY SWING BREAKOUT PULLBACK")
   print("===========================================================")
   print(f" Total Trades : {total}")
   print(f" Wins         : {wins} | Losses: {losses}")
@@ -376,7 +351,7 @@ if len(all_trades) > 0:
   print(f" Total PnL    : {total_pnl}%")
   print("===========================================================")
 
-  tab_name = "M_BREAKOUT_RUNUP_POC_RETEST_LOG"
+  tab_name = "M_SWING_BREAKOUT_REFINED_LOG"
   try:
     ws = (
         sh.worksheet(tab_name)
@@ -385,7 +360,7 @@ if len(all_trades) > 0:
     )
     ws.clear()
     ws.append_row([
-        "BACKTEST: MONTHLY BREAKOUT + RUN-UP + POC RETEST |"
+        "BACKTEST: REFINED MONTHLY SWING BREAKOUT PULLBACK |"
         f" {datetime.now(IST).strftime('%d-%b-%Y')}"
     ])
     ws.append_row([
@@ -393,8 +368,8 @@ if len(all_trades) > 0:
         "Signal",
         "Swing Date",
         "Swing DZ",
-        "POC",
         "Run Up %",
+        "Max Vol Mult",
         "Entry Date",
         "Exit Date",
         "Entry Price",
@@ -409,4 +384,4 @@ if len(all_trades) > 0:
     print(f"❌ Sheet update error: {e}")
 else:
   print("⚠️ Koi trade nahi mili.")
-      
+    
